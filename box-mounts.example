@@ -11,6 +11,16 @@
 TREE checkout rw
 
 # Examples of finer control instead of TREE:
+
+# Full repo, but .git read-only
+#  .      checkout       rw
+#  .git   checkout/.git  ro
+
+# Full repo, but .git writable (agent still unable to push, as it's missing repo credentials)
+#  .      checkout       rw
+#  .git   checkout/.git  ro
+
+# Only parts of the repo, partly read-only
 #   src           src            rw
 #   package.json  package.json   ro
 #   checkout/.git checkout/.git  ro     # expose history read-only if agents need `git diff/log`

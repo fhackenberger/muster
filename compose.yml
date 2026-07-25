@@ -1,10 +1,16 @@
 # Per-project remote claude-box stack. Copy this directory once per project (each gets its own
-# .env, box-mounts, and ./data), then `docker compose up -d`. Prereqs built once on the host:
-#   docker build -t infostars/dbtest  docker-postgre-test        # postgres + sample DB
-# The box / hub / box-broker images are built by the Jenkinsfile (claude-box, claude-box-hub,
-# claude-box-broker) and reused here by default (COMPOSE_PULL_POLICY=missing). Set
-# COMPOSE_PULL_POLICY=build in .env to build them locally from here instead, or point the
-# *_IMAGE vars at registry-qualified names + COMPOSE_PULL_POLICY=always to pull on another host.
+# .env, box-mounts, and ./data), then `docker compose up -d`.
+#
+# All images are pulled from the acoveo registry (dockerregistry.acoveo.com) by default, so the
+# stack does NOT need to run on the same host as Jenkins. The db (dbtest) and the box / hub /
+# box-broker images are built + pushed by the Jenkinsfile; here they're referenced by the *_IMAGE
+# vars in .env and pulled per COMPOSE_PULL_POLICY (default `missing`). `docker login
+# dockerregistry.acoveo.com` must have run on the host. To build hub + box-broker locally instead
+# (e.g. on the Jenkins host), set COMPOSE_PULL_POLICY=build.
+#
+# Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
+# pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
+# holder of the docker socket); they mount only what box-mounts grants and reach the hub by name.
 #
 # Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
 # pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
@@ -18,7 +24,8 @@ networks:
 
 services:
   db:
-    image: infostars/dbtest
+    image: ${DB_IMAGE:-dockerregistry.acoveo.com/infostars/dbtest:latest}
+    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     restart: unless-stopped
 
   activemq:
@@ -35,10 +42,9 @@ services:
   # The ONLY container with the docker socket. "claude-box.sh as a service": validates the request
   # (box name + box-mounts, sources confined under the checkout) then runs the modified claude-box.sh.
   box-broker:
-    # Uses the image built by the Jenkinsfile (claude-box-broker:<tag>) when present.
-    # COMPOSE_PULL_POLICY=missing (default) -> use it, build only if absent;
-    # =build -> always (re)build locally from this dir; =always -> pull from registry.
-    image: ${BOX_BROKER_IMAGE:-claude-box-broker:stable}
+    # Pulled from the acoveo registry if missing (COMPOSE_PULL_POLICY=missing). Set
+    # COMPOSE_PULL_POLICY=build to (re)build locally from this dir instead (e.g. on the Jenkins host).
+    image: ${BOX_BROKER_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-broker:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       context: .
@@ -46,7 +52,7 @@ services:
     environment:
       BROKER_TOKEN: ${BROKER_TOKEN}
       PROJECT_NAME: ${PROJECT_NAME}
-      BOX_IMAGE: ${BOX_IMAGE:-claude-box:stable}
+      BOX_IMAGE: ${BOX_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box:stable}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       PROJECT_ROOT: ${STACK_DIR}/data/checkout
       CLAUDE_HOME: ${STACK_DIR}/data/claude
@@ -64,11 +70,17 @@ services:
   # The "hosting dev environment": owns the checkout + git identity, runs backend/ng serve/pinchtab
   # on demand, hosts YOUR commit workflow. Does NOT run claude.
   hub:
-    # Same policy as box-broker: use the Jenkins-built claude-box-hub image, or build locally.
-    image: ${HUB_IMAGE:-claude-box-hub:stable}
+    # Same policy as box-broker: pulled from the acoveo registry if missing
+    image: ${HUB_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       context: hub
+      # The hub image (Dockerfile) layers the extra infostars build deps (ant) onto the
+      # project-agnostic claude-box-hub-base (Dockerfile.base). A local build (COMPOSE_PULL_POLICY=
+      # build) resolves the base from the registry by default; point this at a locally-built tag to
+      # build fully offline (build Dockerfile.base first — see README-remote.md).
+      args:
+        HUB_BASE_IMAGE: ${HUB_BASE_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub-base:stable}
     hostname: ${PROJECT_NAME}-hub
     init: true
     depends_on: [db, redis, box-broker]
@@ -97,4 +109,9 @@ services:
       - ./data/claude:/home/gradle/.claude
       - ./data/pinchtab:/home/gradle/.pinchtab
       - ./git-identity:/home/gradle/.gitidentity
+      # Jenkins' pre-populated Maven cache, mounted READ-ONLY at the hub user's default local repo
+      # (~/.m2/repository, since the hub runs as uid 1000 with HOME=/home/gradle). Maven/gradle then
+      # resolve dependencies from Jenkins' cache without re-downloading; read-only so a build can
+      # never mutate the shared cache. Host path is overridable via MAVEN_REPO_HOST in .env.
+      - ${MAVEN_REPO_HOST:-/var/jenkins_home/.m2/repository}:/home/gradle/.m2/repository:ro
     restart: unless-stopped

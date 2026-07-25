@@ -1,4 +1,4 @@
-# claude-box-hub — the per-project "hosting dev environment" for the remote/server setup.
+# claude-box-hub (infostars) — the per-project hub image for the remote/server setup.
 #
 # It owns the git checkout and runs the dev services the agent boxes use: the backend
 # (gradle bootRun), the Angular dev server (ng serve), and the pinchtab server + its
@@ -6,61 +6,17 @@
 # claude-box containers, spawned by the box-broker) do. This is where YOU review + commit
 # the edits the agents make (it holds the git identity; the boxes do not).
 #
-# Same JDK17 + gradle base as docker-gradle, plus node (for ng serve), the Chrome runtime
-# libs pinchtab's browser needs, and the pinchtab server binary. Runs as the base image's
-# non-root 'gradle' user (uid 1000), so bind-mounted files line up with a numeric owner and
-# no host account is needed.
-FROM gradle:8-jdk17-jammy
+# Everything project-agnostic (git/ssh, tmux, node, pinchtab, cbx, entrypoint, the JDK17 + gradle 8
+# jammy base) lives in claude-box-hub-base (Dockerfile.base). This layer adds ONLY the extra
+# infostars build deps on top: ant. Build the base first, then this — see README-remote.md.
+ARG HUB_BASE_IMAGE=dockerregistry.acoveo.com/acoveo/claude-box-hub-base:stable
+FROM ${HUB_BASE_IMAGE}
 
 USER root
 
-# Runtime deps. The cypress/Chrome shared-lib list mirrors docker-gradle (pinchtab downloads
-# and drives its own Chrome, so we only need the libs, not the browser package). tmux holds the
-# on-demand service windows; git clones + commits; jq/python3/procps for the helper scripts.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-		ca-certificates curl git openssh-client tmux less jq python3 procps unzip libatomic1 \
-		libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 \
-		libxss1 libasound2 libxtst6 xauth xvfb \
+# Ant — needed by the infostars build (gradle + the JDK come from the base image).
+RUN apt-get update && apt-get install -y --no-install-recommends ant \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Node + npm via fnm, pinned to the host dev versions (override with --build-arg). System-wide,
-# outside the home bind mount, symlinked onto PATH — same approach as the claude-box image.
-ARG NODE_VERSION=v26.2.0
-ARG NPM_VERSION=11.13.0
-ENV FNM_DIR=/opt/fnm
-RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
-	&& fnm install "${NODE_VERSION}" \
-	&& fnm default "${NODE_VERSION}" \
-	&& ln -s "${FNM_DIR}/node-versions/${NODE_VERSION}/installation/bin/"* /usr/local/bin/ \
-	&& npm install -g "npm@${NPM_VERSION}" \
-	&& node --version && npm --version
-
-# pinchtab SERVER (the box ships only the CLI; the hub runs the server + Chrome). The npm package
-# is a launcher that fetches a self-contained Go binary; install it in a throwaway HOME, copy the
-# binary onto PATH, drop the wrapper. Pinned to the host version.
-ARG PINCHTAB_VERSION=0.13.2
-RUN HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION}" \
-	&& cp "$(find /tmp/pt/.pinchtab -name 'pinchtab-linux-amd64' -type f | head -1)" /usr/local/bin/pinchtab \
-	&& chmod 0755 /usr/local/bin/pinchtab \
-	&& npm rm -g pinchtab \
-	&& rm -rf /tmp/pt \
-	&& pinchtab --version
-
-ENV NG_CLI_ANALYTICS=false
-
-# Git-over-SSH for the checkout, baked system-wide (applies without any per-stack gitconfig; a
-# mounted ~/.gitidentity/gitconfig can still override). The wrapper offers whatever private key(s)
-# live in the mounted identity dir (any type, not just ed25519) and trusts a provider's host key on
-# first connect. entrypoint.sh pre-seeds known_hosts for the REPO_URL host.
-COPY git-ssh /usr/local/bin/git-ssh
-RUN chmod 0755 /usr/local/bin/git-ssh \
-	&& git config --system core.sshCommand /usr/local/bin/git-ssh
-
-# Helper CLI (cbx: start/stop services, spawn/kill boxes via the broker) + entrypoint.
-COPY cbx /usr/local/bin/cbx
-COPY entrypoint.sh /usr/local/bin/hub-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/cbx /usr/local/bin/hub-entrypoint.sh
-
+# Back to the non-root hub user; WORKDIR + ENTRYPOINT are inherited from the base.
 USER 1000
-WORKDIR /home/gradle
-ENTRYPOINT ["/usr/local/bin/hub-entrypoint.sh"]

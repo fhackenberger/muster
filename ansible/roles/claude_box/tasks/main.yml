@@ -45,6 +45,17 @@
       state: link
       force: yes
     tags: [containers-claude-box-files]
+
+  - name: Claude box mounts for intostars
+    template:
+      src: templates/docker-compose/claude-box/box-mounts
+      dest: /virtual_machines/claude-box-docker/box-mounts
+      owner: root
+      group: root
+      mode: "u=rw,g=,o="
+      backup: no
+    tags: [containers-claude-box-files]
+
   # pinchtab server config for the hub (mounted at ~/.pinchtab). Holds the vault
   # token; bound to 0.0.0.0:9867 so the agent boxes reach it by name (hub:9867).
   - name: Template pinchtab config.json to the remote

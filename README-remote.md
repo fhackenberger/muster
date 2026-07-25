@@ -24,9 +24,16 @@ compose stack (cbx-<project> network)
 ## One-time host prep (per server)
 
 Docker + the sample-DB image. The **box / hub / box-broker images are built by the `Jenkinsfile`**
-(as `claude-box`, `claude-box-hub`, `claude-box-broker`, moving tag `master→stable`,
-`build/test→latest`, else `dev`) — Jenkins and the claude-box host are the same machine, so the
-stack reuses those local tags directly (no registry round-trip). No accounts, no toolchain install.
+(as `claude-box`, `claude-box-hub-base`, `claude-box-hub`, `claude-box-broker`, moving tag
+`master→stable`, `build/test→latest`, else `dev`) — Jenkins and the claude-box host are the same
+machine, so the stack reuses those local tags directly (no registry round-trip). No accounts, no
+toolchain install.
+
+The hub is built in **two layers**: `claude-box-hub-base` (`hub/Dockerfile.base`) carries the
+project-agnostic hub tooling (git/ssh, tmux, node, pinchtab + Chrome libs, cbx, entrypoint) on the
+`gradle:8-jdk17-jammy` base (JDK + gradle), and `claude-box-hub` (`hub/Dockerfile`) layers the extra
+infostars build deps (ant) on top. Jenkins must build the base **before** the hub; the hub's `FROM`
+resolves the base via the `HUB_BASE_IMAGE` build arg (default `…/claude-box-hub-base:stable`).
 
 ```sh
 # postgres + sample DB
@@ -147,6 +154,15 @@ Or, without touching `.env`, do a one-off local build (leaves the policy alone):
 ```sh
 docker compose build hub box-broker   # build just these two from this dir
 docker compose up -d                  # they now exist locally, so `missing` uses them
+```
+
+The hub build layers `hub/Dockerfile` onto `claude-box-hub-base`. Compose pulls that base from the
+registry by default, so the above just works when `docker login` has run. To build **fully offline**
+(or after editing `hub/Dockerfile.base`), build the base first and point the hub at the local tag:
+
+```sh
+docker build -t claude-box-hub-base:local -f hub/Dockerfile.base hub
+HUB_BASE_IMAGE=claude-box-hub-base:local docker compose build hub
 ```
 
 The **box image** the broker spawns is separate: set `BOX_IMAGE` in `.env` (default
