@@ -45,6 +45,17 @@
       state: link
       force: yes
     tags: [containers-claude-box-files]
+  # pinchtab server config for the hub (mounted at ~/.pinchtab). Holds the vault
+  # token; bound to 0.0.0.0:9867 so the agent boxes reach it by name (hub:9867).
+  - name: Template pinchtab config.json to the remote
+    template:
+      src: templates/docker-compose/claude-box/data/pinchtab/config.json
+      dest: /virtual_machines/claude-box-docker/data/pinchtab/config.json
+      owner: 1000
+      group: root
+      mode: "u=rw,g=,o="
+      backup: no
+    tags: [containers-claude-box-files]
 
   # ---- GitHub deploy key ----
   # Generate an SSH keypair on the remote (never checked into git) that can be
