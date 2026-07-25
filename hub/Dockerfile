@@ -9,6 +9,8 @@
 # Everything project-agnostic (git/ssh, tmux, node, pinchtab, cbx, entrypoint, the JDK17 + gradle 8
 # jammy base) lives in claude-box-hub-base (Dockerfile.base). This layer adds ONLY the extra
 # infostars build deps on top: ant. Build the base first, then this — see README-remote.md.
+#
+# If you add new requirements here, please also update infostars.git/docker-gradle/Dockerfile
 ARG HUB_BASE_IMAGE=dockerregistry.acoveo.com/acoveo/claude-box-hub-base:stable
 FROM ${HUB_BASE_IMAGE}
 
