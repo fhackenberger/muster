@@ -18,7 +18,7 @@ USER root
 # and drives its own Chrome, so we only need the libs, not the browser package). tmux holds the
 # on-demand service windows; git clones + commits; jq/python3/procps for the helper scripts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		ca-certificates curl git tmux less jq python3 procps unzip libatomic1 \
+		ca-certificates curl git openssh-client tmux less jq python3 procps unzip libatomic1 \
 		libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 \
 		libxss1 libasound2 libxtst6 xauth xvfb \
 	&& rm -rf /var/lib/apt/lists/*
@@ -47,6 +47,14 @@ RUN HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION}" \
 	&& pinchtab --version
 
 ENV NG_CLI_ANALYTICS=false
+
+# Git-over-SSH for the checkout, baked system-wide (applies without any per-stack gitconfig; a
+# mounted ~/.gitidentity/gitconfig can still override). The wrapper offers whatever private key(s)
+# live in the mounted identity dir (any type, not just ed25519) and trusts a provider's host key on
+# first connect. entrypoint.sh pre-seeds known_hosts for the REPO_URL host.
+COPY git-ssh /usr/local/bin/git-ssh
+RUN chmod 0755 /usr/local/bin/git-ssh \
+	&& git config --system core.sshCommand /usr/local/bin/git-ssh
 
 # Helper CLI (cbx: start/stop services, spawn/kill boxes via the broker) + entrypoint.
 COPY cbx /usr/local/bin/cbx

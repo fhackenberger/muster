@@ -1,0 +1,33 @@
+#!/bin/sh
+# git core.sshCommand wrapper (baked into the hub image; see hub/Dockerfile).
+#
+# Lets the hub clone/fetch/push over SSH using WHATEVER private key(s) live in the mounted identity
+# dir (~/.gitidentity) — any type (ed25519 / rsa / ecdsa), not a hard-coded filename — and trust a
+# provider's host key on first connect so a non-interactive clone never stalls on a prompt.
+#
+# git invokes this as:  git-ssh [ssh-options...] <host> <remote-command>
+set -eu
+
+IDENTITY_DIR="${GIT_IDENTITY_DIR:-$HOME/.gitidentity}"
+KNOWN_HOSTS="$IDENTITY_DIR/known_hosts"
+mkdir -p "$IDENTITY_DIR"
+
+# Collect an -i for every private key in the identity dir (skip public keys and support files).
+keyopts=""
+for f in "$IDENTITY_DIR"/*; do
+	[ -f "$f" ] || continue
+	case "${f##*/}" in
+		*.pub|known_hosts|gitconfig|config|git-credentials) continue ;;
+	esac
+	if head -n1 "$f" 2>/dev/null | grep -q 'PRIVATE KEY'; then
+		keyopts="$keyopts -i $f"
+	fi
+done
+
+# keyopts is intentionally word-split ($IDENTITY_DIR paths carry no spaces). IdentitiesOnly limits
+# ssh to just these keys; accept-new auto-trusts an unseen host the first time, for ANY provider.
+# shellcheck disable=SC2086
+exec ssh -o IdentitiesOnly=yes \
+         -o StrictHostKeyChecking=accept-new \
+         -o UserKnownHostsFile="$KNOWN_HOSTS" \
+         $keyopts "$@"

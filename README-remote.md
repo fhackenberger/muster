@@ -15,14 +15,28 @@ compose stack (cbx-<project> network)
                                        box-<project>-<name>  (claude, uid 1000, no .git, no socket)
 ```
 
+> **Ansible-managed on the acoveo host.** For the `infostars` stack, everything below is
+> automated by `tasks/containers-claude-box.yml` (rsync of this dir to
+> `/virtual_machines/claude-box-docker`, the templated `infostars.conf` → `.env` symlink, the
+> pinchtab `config.json`, and the GitHub deploy key). The manual steps here document the model and
+> apply to a hand-rolled stack.
+
 ## One-time host prep (per server)
 
-Docker + the two prebuilt images. No accounts, no toolchain install.
+Docker + the sample-DB image. The **box / hub / box-broker images are built by the `Jenkinsfile`**
+(as `claude-box`, `claude-box-hub`, `claude-box-broker`, moving tag `master→stable`,
+`build/test→latest`, else `dev`) — Jenkins and the claude-box host are the same machine, so the
+stack reuses those local tags directly (no registry round-trip). No accounts, no toolchain install.
 
 ```sh
 # postgres + sample DB
 docker build -t infostars/dbtest  path/to/infostars/docker-postgre-test
-# the box image (build.sh only needs the versions, not node installed)
+```
+
+Trigger the **claude-box images** Jenkins job to build them (or, to build the box image by hand
+without Jenkins):
+
+```sh
 NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 \
   path/to/infostars/docker-claude/build.sh
 ```
@@ -51,9 +65,15 @@ e.g.:
 ```
 
 and put an HTTPS token in `git-identity/git-credentials` (`https://user:token@github.com`) — or
-drop an SSH key in `git-identity/` and use a `git@` `REPO_URL`. pinchtab needs its server bound to
-`0.0.0.0` with `PT_TOKEN`: drop a `data/pinchtab/config.json` (copy your laptop's, set
-`server.bind=0.0.0.0`, `server.port=9867`, `server.token=<PT_TOKEN>`).
+drop an SSH key in `git-identity/` and use a `git@` `REPO_URL` (see the deploy-key section below).
+
+The **image source** is env-driven in `.env`: `COMPOSE_PULL_POLICY=missing` (default) reuses the
+Jenkins-built `claude-box-hub` / `claude-box-broker` images; `=build` rebuilds them locally from
+this dir; `=always` pulls (point `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified
+names for a different host). pinchtab needs its server bound to `0.0.0.0:9867` with `PT_TOKEN`:
+drop a `data/pinchtab/config.json` (copy your laptop's, set `server.bind=0.0.0.0`,
+`server.port=9867`, `server.token=<PT_TOKEN>`). Under Ansible this file is templated from
+`templates/docker-compose/claude-box/data/pinchtab/config.json` with the vault token.
 
 ### GitHub deploy key (SSH)
 
@@ -72,6 +92,24 @@ Register the **public** key on the repo: **Settings → Deploy keys → Add depl
 `ssh-ed25519 …` line, and tick *Allow write access* only if the hub needs to push. Then use an
 SSH-form `REPO_URL` (`git@github.com:owner/repo.git`) so the hub authenticates with this key.
 
+**Wiring the key into git — baked into the image, nothing to configure.** The hub's first-boot
+clone runs non-interactively, so git must know (a) which key to use and (b) that the provider's host
+is trusted — otherwise it fails with `Host key verification failed` or `Permission denied
+(publickey)`. Both are handled by the hub image, generically:
+
+- `hub/git-ssh` is set as `core.sshCommand` (`git config --system`) and offers **every private key**
+  in `~/.gitidentity` — any type (ed25519 / rsa / ecdsa), not a hard-coded filename — with
+  `IdentitiesOnly=yes` and `StrictHostKeyChecking=accept-new` (trusts an unseen host on first use).
+- `hub/entrypoint.sh` derives the host from `REPO_URL` (any provider — GitHub, Bitbucket, GitLab, a
+  self-hosted `ssh://…:port/…`) and `ssh-keyscan`s it into `~/.gitidentity/known_hosts` before the
+  clone, so host-key trust is deterministic.
+
+So you only need to drop a private key into `git-identity/` (the Ansible deploy-key task does this)
+and register its public half. Verify from inside the hub with, e.g.,
+`ssh -o IdentitiesOnly=yes -i ~/.gitidentity/id_ed25519 -T git@github.com` (expect a "successfully
+authenticated" greeting). A mounted `~/.gitidentity/gitconfig` can still override `core.sshCommand`
+if a stack needs something bespoke.
+
 **Protect the default branch** so the key can't push over it — GitHub deploy keys have no branch
 scope of their own, so this is done with a **ruleset**: **Settings → Rules → Rulesets → New branch
 ruleset**, enforcement *Active*, target the default branch, enable *Restrict updates* / *Restrict
@@ -83,47 +121,115 @@ register the key read-only instead.
 Then:
 
 ```sh
-docker compose build          # hub + box-broker
 docker compose up -d          # db, activemq, redis, box-broker, hub (clones the repo on first boot)
+                              # reuses the Jenkins-built images by default (see escape hatch below)
 ```
+
+### Escape hatch: build the images locally
+
+By default (`COMPOSE_PULL_POLICY=missing`) the stack **reuses the Jenkins-built** `claude-box-hub`
+and `claude-box-broker` images and never rebuilds them. If you'd rather build from this directory —
+e.g. you changed a `Dockerfile`, or Jenkins hasn't run yet — flip the policy in `.env`:
+
+```sh
+# in .env
+COMPOSE_PULL_POLICY=build     # always (re)build hub + box-broker locally, ignoring prebuilt images
+```
+
+Then recreate:
+
+```sh
+docker compose up -d --build  # rebuild + restart hub + box-broker
+```
+
+Or, without touching `.env`, do a one-off local build (leaves the policy alone):
+
+```sh
+docker compose build hub box-broker   # build just these two from this dir
+docker compose up -d                  # they now exist locally, so `missing` uses them
+```
+
+The **box image** the broker spawns is separate: set `BOX_IMAGE` in `.env` (default
+`claude-box:stable`), or build it locally with `build.sh` (see host prep). To go the other way and
+pull from the registry on a *different* host, set `COMPOSE_PULL_POLICY=always` and point
+`HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified names.
+
+## Laptop aliases
+
+Everything is driven through `cbx` inside the hub. Rather than typing the full
+`ssh … docker exec …` each time, drop these into your `~/.bashrc`. Set the two variables to your
+server and the stack's `PROJECT_NAME`; the hub container is resolved by its compose labels at call
+time (so it survives compose's `-1` suffix and renames):
+
+```sh
+CBX_SERVER=root@your-server      # the claude-box host, e.g. root@hetzner1.acoveo.com
+CBX_PROJECT=myproject            # PROJECT_NAME of the stack, e.g. infostars
+
+# run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1
+alias cbx='ssh -t "$CBX_SERVER" "docker exec -it \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub) cbx"'
+# drop into a shell inside the hub to look around / debug (add -u root before \$( … ) for root):
+alias cbxhub='ssh -t "$CBX_SERVER" "docker exec -it \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub) bash -l"'
+```
+
+The `\$(…)` is escaped so the container lookup runs on the server at call time, not when bash loads
+the alias; trailing args (`up backend`) are appended to the remote `cbx` automatically.
 
 ## Daily use
 
-Everything is driven through `cbx` inside the hub:
+Start dev services on demand and manage boxes — all via the `cbx` alias:
 
 ```sh
-H=myproject-hub
-docker exec -it $H cbx up backend        # start dev services on demand
-docker exec -it $H cbx up frontend
-docker exec -it $H cbx up pinchtab
-docker exec -it $H cbx box work1         # spawn an agent box (mounts per box-mounts)
-docker exec -it $H cbx ls                # services + boxes
+cbx up backend        # start dev services on demand
+cbx up frontend
+cbx up pinchtab
+cbx logs backend      # attach that service's tmux window to watch logs (Ctrl-b d to detach)
+cbx box work1         # spawn an agent box (mounts per box-mounts)
+cbx ls                # services + boxes
 ```
 
-Attach / detach a box (from the host shell where your SSH tty lands):
+### Viewing service logs
+
+Each service (`backend` / `frontend` / `pinchtab`) runs in its own hub tmux window. `cbx logs`
+**attaches** that window — it's a live, streaming view, not a one-shot dump:
 
 ```sh
-ssh -t root@server docker exec -it box-myproject-work1 tmux attach -t main   # Ctrl-b d to detach
+cbx logs backend      # attach the backend window and watch it live
+```
+
+- **Detach with `Ctrl-b d`** — this leaves the service running. Do **not** press `Ctrl-c`; that
+  would kill the process inside the window.
+- The window is kept alive even after the process exits (it shows `[cbx] <svc> exited …`), so
+  `cbx logs` still works to read the output of a service that crashed on startup — exactly when you
+  need it.
+- `cbx logs` needs a TTY to attach tmux; the `cbx` alias already provides one (`ssh -t` +
+  `docker exec -it`), so it just works.
+
+Attach / detach a box (a box is a separate container, not reached through the hub):
+
+```sh
+ssh -t "$CBX_SERVER" docker exec -it "box-${CBX_PROJECT}-work1" tmux attach -t main   # Ctrl-b d to detach
 ```
 
 Curate what boxes see (per project, from the hub); recreate the box to apply:
 
 ```sh
-docker exec -it $H cbx expose src src rw
-docker exec -it $H cbx hide  package.json
-docker exec -it $H cbx kill work1 && docker exec -it $H cbx box work1
+cbx expose src src rw
+cbx hide  package.json
+cbx kill work1 && cbx box work1
 ```
 
-Commit the agents' edits from the hub (it has `.git` + your identity; boxes don't):
+Commit the agents' edits from the hub (it has `.git` + your identity; boxes don't) — hop in with
+`cbxhub`:
 
 ```sh
-docker exec -it $H bash -lc 'cd /work/checkout && git status && git add -A && git commit'
+cbxhub                                   # then, inside the hub:
+#   cd /work/checkout && git status && git add -A && git commit
 ```
 
 Watch the UI yourself: SSH-tunnel the hub's dev server, then open your laptop browser:
 
 ```sh
-ssh -L 4200:$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' myproject-hub):4200 root@server
+ssh -L 4200:$(ssh "$CBX_SERVER" "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub)"):4200 "$CBX_SERVER"
 ```
 
 ## Notes
@@ -134,6 +240,10 @@ ssh -L 4200:$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress
 - **Broker policy:** the hub passes a box name + the manifest; the broker fixes image/uid/network/
   privileges and confines every mount source under the checkout. It is the only socket holder.
 - **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are env-overridable in `.env`
-  if the defaults don't match your dev loop.
+  if the defaults don't match your dev loop. Each service runs in its own hub tmux window that
+  stays alive after the process exits, so `cbx logs <svc>` can always attach to read the output.
+- **Images** are built by the `Jenkinsfile` (box / hub / box-broker); the stack reuses them by
+  default and only builds locally when `COMPOSE_PULL_POLICY=build`. Flip `PUSH_TO_REGISTRY` in the
+  Jenkins job to also publish them for pulling on another host.
 - The laptop `claude-box.sh` flow is unchanged — the server behavior is all env-gated
   (`CLAUDEBOX_HEADLESS` etc.), off by default.
