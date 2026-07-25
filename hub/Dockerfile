@@ -18,7 +18,7 @@ USER root
 # and drives its own Chrome, so we only need the libs, not the browser package). tmux holds the
 # on-demand service windows; git clones + commits; jq/python3/procps for the helper scripts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		ca-certificates curl git tmux less jq python3 procps unzip \
+		ca-certificates curl git tmux less jq python3 procps unzip libatomic1 \
 		libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 \
 		libxss1 libasound2 libxtst6 xauth xvfb \
 	&& rm -rf /var/lib/apt/lists/*

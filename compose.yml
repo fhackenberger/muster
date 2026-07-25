@@ -1,8 +1,10 @@
 # Per-project remote claude-box stack. Copy this directory once per project (each gets its own
 # .env, box-mounts, and ./data), then `docker compose up -d`. Prereqs built once on the host:
 #   docker build -t infostars/dbtest  docker-postgre-test        # postgres + sample DB
-#   NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 docker-claude/build.sh   # claude-box (box image)
-# The hub + box-broker images build from here via `docker compose build`.
+# The box / hub / box-broker images are built by the Jenkinsfile (claude-box, claude-box-hub,
+# claude-box-broker) and reused here by default (COMPOSE_PULL_POLICY=missing). Set
+# COMPOSE_PULL_POLICY=build in .env to build them locally from here instead, or point the
+# *_IMAGE vars at registry-qualified names + COMPOSE_PULL_POLICY=always to pull on another host.
 #
 # Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
 # pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
@@ -33,13 +35,18 @@ services:
   # The ONLY container with the docker socket. "claude-box.sh as a service": validates the request
   # (box name + box-mounts, sources confined under the checkout) then runs the modified claude-box.sh.
   box-broker:
+    # Uses the image built by the Jenkinsfile (claude-box-broker:<tag>) when present.
+    # COMPOSE_PULL_POLICY=missing (default) -> use it, build only if absent;
+    # =build -> always (re)build locally from this dir; =always -> pull from registry.
+    image: ${BOX_BROKER_IMAGE:-claude-box-broker:stable}
+    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       context: .
       dockerfile: box-broker/Dockerfile
     environment:
       BROKER_TOKEN: ${BROKER_TOKEN}
       PROJECT_NAME: ${PROJECT_NAME}
-      BOX_IMAGE: ${BOX_IMAGE:-claude-box}
+      BOX_IMAGE: ${BOX_IMAGE:-claude-box:stable}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       PROJECT_ROOT: ${STACK_DIR}/data/checkout
       CLAUDE_HOME: ${STACK_DIR}/data/claude
@@ -57,6 +64,9 @@ services:
   # The "hosting dev environment": owns the checkout + git identity, runs backend/ng serve/pinchtab
   # on demand, hosts YOUR commit workflow. Does NOT run claude.
   hub:
+    # Same policy as box-broker: use the Jenkins-built claude-box-hub image, or build locally.
+    image: ${HUB_IMAGE:-claude-box-hub:stable}
+    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       context: hub
     hostname: ${PROJECT_NAME}-hub
