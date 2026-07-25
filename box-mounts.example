@@ -1,0 +1,16 @@
+# box-mounts — what the agent boxes can see, decided per project (edit from the hub with
+# `cbx expose` / `cbx hide`, or by hand). All sources are confined under the checkout by the
+# broker. Recreate a box (cbx kill + cbx box) to apply changes.
+#
+# Grammar (whitespace-separated; '#'/blank ignored):
+#   TREE <dst> <ro|rw>     mount the WHOLE checkout at /home/dev/<dst>, with <dst>/.git shadowed
+#                          (agents edit everything but never see .git); also sets the box workdir
+#   <src> <dst> <ro|rw>    mount checkout/<src> at /home/dev/<dst>
+#
+# Default: whole working tree, writable, .git hidden — only the hub can git/commit/push.
+TREE checkout rw
+
+# Examples of finer control instead of TREE:
+#   src           src            rw
+#   package.json  package.json   ro
+#   checkout/.git checkout/.git  ro     # expose history read-only if agents need `git diff/log`

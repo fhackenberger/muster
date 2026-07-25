@@ -1,0 +1,129 @@
+# ==== claude-box docker compose containers ====
+- block:
+  - name: Create claude-box container config
+    file: path={{ item }} state=directory owner=root group=root mode="u=rwx,g=rx,o=rx"
+    with_items:
+      - /virtual_machines/claude-box-docker/
+  - name: Sync files for compose
+    synchronize:
+      src: docker-compose/claude-box/
+      dest: /virtual_machines/claude-box-docker/
+      recursive: yes
+      archive: no
+      links: yes
+      perms: yes
+      rsync_opts:
+        - "--exclude=.*.swp"
+    tags: [containers-claude-box-files]
+  # Take care of setting special permissions: boxes + hub run as uid 1000
+  - name: Take care of special permissions
+    file: path={{ item }} state=directory owner=1000 group=root mode="u=rwx,g=rx,o="
+    with_items:
+      - /virtual_machines/claude-box-docker/data/
+      - /virtual_machines/claude-box-docker/data/checkout/
+      - /virtual_machines/claude-box-docker/data/claude/
+      - /virtual_machines/claude-box-docker/data/boxes/
+      - /virtual_machines/claude-box-docker/data/pinchtab/
+    tags: [containers-claude-box-files]
+
+  # ---- compose env file ----
+  # Templated env (holds the vault-backed tokens/API keys), with .env symlinked
+  # to it so `docker compose` picks it up automatically from the project dir.
+  - name: Template infostars.conf (compose env) to the remote
+    template:
+      src: templates/docker-compose/claude-box/infostars.conf
+      dest: /virtual_machines/claude-box-docker/infostars.conf
+      owner: root
+      group: root
+      mode: "u=rw,g=,o="
+      backup: no
+    tags: [containers-claude-box-files]
+  - name: Symlink .env to infostars.conf so docker compose picks it up
+    file:
+      path: /virtual_machines/claude-box-docker/.env
+      src: infostars.conf
+      state: link
+      force: yes
+    tags: [containers-claude-box-files]
+
+  # ---- GitHub deploy key ----
+  # Generate an SSH keypair on the remote (never checked into git) that can be
+  # registered as a GitHub deploy key for the repo the hub clones on first boot.
+  # Lives in ./git-identity, which compose mounts into the hub as ~/.gitidentity.
+  - name: Ensure git-identity directory exists (holds the deploy key)
+    file:
+      path: /virtual_machines/claude-box-docker/git-identity/
+      state: directory
+      owner: 1000
+      group: root
+      mode: "u=rwx,g=,o="
+    tags: [containers-claude-box-deploy-key]
+  - name: Generate GitHub deploy key on the remote
+    command: >
+      ssh-keygen -t ed25519 -N ''
+      -C 'claude-box-deploy-key@{{ inventory_hostname }}'
+      -f /virtual_machines/claude-box-docker/git-identity/id_ed25519
+    args:
+      creates: /virtual_machines/claude-box-docker/git-identity/id_ed25519
+    tags: [containers-claude-box-deploy-key]
+  - name: Fix ownership/permissions on the deploy key
+    file:
+      path: "{{ item.path }}"
+      owner: 1000
+      group: root
+      mode: "{{ item.mode }}"
+    with_items:
+      - { path: /virtual_machines/claude-box-docker/git-identity/id_ed25519, mode: "u=rw,g=,o=" }
+      - { path: /virtual_machines/claude-box-docker/git-identity/id_ed25519.pub, mode: "u=rw,g=r,o=r" }
+    tags: [containers-claude-box-deploy-key]
+  - name: Read the deploy public key
+    slurp:
+      src: /virtual_machines/claude-box-docker/git-identity/id_ed25519.pub
+    register: claude_box_deploy_pubkey
+    tags: [containers-claude-box-deploy-key]
+  - name: Show the deploy public key and how to register it on GitHub
+    # msg is a list so the default stdout callback prints one line per element
+    # (a single multi-line string would be shown with literal \n escapes).
+    debug:
+      msg:
+        - "===================== GitHub deploy key ====================="
+        - "Copy the public key line below and add it as a deploy key:"
+        - ""
+        - "  {{ claude_box_deploy_pubkey.content | b64decode | trim }}"
+        - ""
+        - "How to register it on github.com:"
+        - "  1. Open your repository on github.com"
+        - "  2. Settings -> Deploy keys -> Add deploy key"
+        - "  3. Title:  claude-box @ {{ inventory_hostname }}"
+        - "  4. Key:    paste the exact line above (starts with 'ssh-ed25519')"
+        - "  5. Tick \"Allow write access\" only if the hub needs to push"
+        - "  6. Click \"Add key\""
+        - ""
+        - "Then use an SSH-form REPO_URL (git@github.com:owner/repo.git) so the"
+        - "hub authenticates with this key."
+        - ""
+        - "----- Protect the default branch (ruleset) -----"
+        - "Prevent the deploy key (and everyone else) from pushing to the"
+        - "default branch, while still letting the repo owner through:"
+        - "  1. Settings -> Rules -> Rulesets -> New branch ruleset"
+        - "  2. Name:   protect-default-branch"
+        - "  3. Enforcement status:  Active"
+        - "  4. Bypass list -> Add bypass -> Repository admin (Role)"
+        - "       (or add the owner's account explicitly; org repos only)"
+        - "  5. Target branches -> Add target -> Include default branch"
+        - "  6. Enable rules:"
+        - "       - Restrict updates   (blocks direct pushes)"
+        - "       - Restrict deletions"
+        - "       - Block force pushes"
+        - "       - (optional) Require a pull request before merging"
+        - "  7. Create"
+        - "The deploy key is not in the bypass list, so it cannot push to the"
+        - "default branch; the owner still can."
+        - "============================================================="
+    tags: [containers-claude-box-deploy-key]
+
+#- name: Define claude-box docker compose containers
+#  docker_compose: project_src=/virtual_machines/claude-box-docker state=present
+#  vars:
+#    ansible_python_interpreter: /opt/docker-python/bin/python
+

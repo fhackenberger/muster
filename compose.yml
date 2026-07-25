@@ -1,0 +1,90 @@
+# Per-project remote claude-box stack. Copy this directory once per project (each gets its own
+# .env, box-mounts, and ./data), then `docker compose up -d`. Prereqs built once on the host:
+#   docker build -t infostars/dbtest  docker-postgre-test        # postgres + sample DB
+#   NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 docker-claude/build.sh   # claude-box (box image)
+# The hub + box-broker images build from here via `docker compose build`.
+#
+# Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
+# pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
+# holder of the docker socket); they mount only what box-mounts grants and reach the hub by name.
+
+name: ${PROJECT_NAME}
+
+networks:
+  default:
+    name: cbx-${PROJECT_NAME}
+
+services:
+  db:
+    image: infostars/dbtest
+    restart: unless-stopped
+
+  activemq:
+    image: apache/activemq-artemis:latest
+    environment:
+      ARTEMIS_USER: artemis
+      ARTEMIS_PASSWORD: artemis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+  # The ONLY container with the docker socket. "claude-box.sh as a service": validates the request
+  # (box name + box-mounts, sources confined under the checkout) then runs the modified claude-box.sh.
+  box-broker:
+    build:
+      context: .
+      dockerfile: box-broker/Dockerfile
+    environment:
+      BROKER_TOKEN: ${BROKER_TOKEN}
+      PROJECT_NAME: ${PROJECT_NAME}
+      BOX_IMAGE: ${BOX_IMAGE:-claude-box}
+      BOX_NETWORK: cbx-${PROJECT_NAME}
+      PROJECT_ROOT: ${STACK_DIR}/data/checkout
+      CLAUDE_HOME: ${STACK_DIR}/data/claude
+      BOXROOT: ${STACK_DIR}/data/boxes
+      BOX_MOUNTS: ${STACK_DIR}/box-mounts
+      PINCHTAB_SERVER: http://hub:9867
+      PINCHTAB_TOKEN: ${PT_TOKEN}
+      DEV_URL: http://hub:4200
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # host paths must resolve identically inside the broker so the boxes' -v binds land on the host
+      - ${STACK_DIR}:${STACK_DIR}
+    restart: unless-stopped
+
+  # The "hosting dev environment": owns the checkout + git identity, runs backend/ng serve/pinchtab
+  # on demand, hosts YOUR commit workflow. Does NOT run claude.
+  hub:
+    build:
+      context: hub
+    hostname: ${PROJECT_NAME}-hub
+    init: true
+    depends_on: [db, redis, box-broker]
+    environment:
+      CHECKOUT: /work/checkout
+      REPO_URL: ${REPO_URL}
+      BROKER_URL: http://box-broker:8099
+      BROKER_TOKEN: ${BROKER_TOKEN}
+      BOX_MOUNTS: /work/box-mounts
+      GIT_CONFIG_GLOBAL: /home/gradle/.gitidentity/gitconfig
+      # backend wiring (confirmed keys; env overrides the baked-in config.properties defaults)
+      DB_INFOSTARS_PSQL_URL: jdbc:postgresql://db:5432/infotrack_dev
+      DB_INFOSTARS_PSQL_USER: infostars_u
+      DB_INFOSTARS_PSQL_PASSWORD: test
+      DB_LIQUIBASE_UPGRADE_DISABLED: "true"
+      LIVE_JMSURI: tcp://activemq:61616
+      ACTIVEMQ_ENABLE: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      FRONTEND_GOOGLE_MAPS_API_KEY: ${FRONTEND_GOOGLE_MAPS_API_KEY}
+      GEOSERVICEGOOGLE_APIKEY: ${GEOSERVICEGOOGLE_APIKEY}
+      GEOSERVICELOCATIONIQ_APIKEY: ${GEOSERVICELOCATIONIQ_APIKEY}
+    volumes:
+      - ./data/checkout:/work/checkout
+      - ./box-mounts:/work/box-mounts
+      - ./data/claude:/home/gradle/.claude
+      - ./data/pinchtab:/home/gradle/.pinchtab
+      - ./git-identity:/home/gradle/.gitidentity
+    restart: unless-stopped

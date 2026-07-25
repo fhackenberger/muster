@@ -1,0 +1,111 @@
+#!/bin/bash
+set -euo pipefail
+
+# cbx — hub-side control CLI. Two jobs:
+#   * start/stop the on-demand dev services in the hub's tmux (backend / frontend / pinchtab)
+#   * spawn/kill/list agent boxes via the box-broker (the hub itself never touches the docker socket)
+#
+# Usage:
+#   cbx up   backend|frontend|pinchtab      # start a service in its tmux window
+#   cbx down backend|frontend|pinchtab      # stop it
+#   cbx box  [name]                         # spawn an agent box (mounts per box-mounts)
+#   cbx kill <name>                         # remove an agent box
+#   cbx ls                                  # list services (tmux) + boxes (broker)
+#   cbx expose <src> [dst] [ro]             # add a repo path to box-mounts (dst defaults to src)
+#   cbx hide   <src>                        # remove it
+#   cbx logs backend|frontend|pinchtab      # attach that service window (Ctrl-b d to detach)
+
+CHECKOUT="${CHECKOUT:-/work/checkout}"
+MANIFEST="${BOX_MOUNTS:-/work/box-mounts}"
+TMUX_SESSION="${TMUX_SESSION:-services}"
+BROKER_URL="${BROKER_URL:-http://box-broker:8099}"
+BROKER_TOKEN="${BROKER_TOKEN:-}"
+
+# Service commands (override in the stack .env). Wrapped so the tmux window survives the process
+# exiting, and so backgrounding dev scripts still leave a live window to read logs from.
+BACKEND_CMD="${BACKEND_CMD:-gradle --project-dir '$CHECKOUT/infostars/' -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default'}"
+FRONTEND_CMD="${FRONTEND_CMD:-'$CHECKOUT/infostarsFrontend/scripts/frontend-dev-restart.sh' && tail -f /tmp/infostarsFrontend-dev.log}"
+PINCHTAB_CMD="${PINCHTAB_CMD:-pinchtab server}"
+
+die() { echo "cbx: $*" >&2; exit 1; }
+
+svc_cmd() {
+	case "$1" in
+		backend)  printf '%s' "$BACKEND_CMD" ;;
+		frontend) printf '%s' "$FRONTEND_CMD" ;;
+		pinchtab) printf '%s' "$PINCHTAB_CMD" ;;
+		*) die "unknown service '$1' (backend|frontend|pinchtab)" ;;
+	esac
+}
+
+svc_up() {
+	local svc="$1" cmd; cmd="$(svc_cmd "$svc")"
+	if tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$svc"; then
+		echo "cbx: $svc already running (cbx logs $svc to view)"; return 0
+	fi
+	# keep the window alive after the command exits so failures stay readable
+	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$CHECKOUT" \
+		"bash -lc $(printf '%q' "$cmd; echo; echo '[cbx] $svc exited — press enter to close'; read _")"
+	echo "cbx: started $svc (cbx logs $svc to view)"
+}
+
+svc_down() {
+	local svc="$1"
+	tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null && echo "cbx: stopped $svc" \
+		|| echo "cbx: $svc not running"
+}
+
+svc_logs() {
+	exec tmux attach -t "${TMUX_SESSION}" \; select-window -t "${TMUX_SESSION}:$1"
+}
+
+broker() {
+	local method="$1" path="$2"; shift 2
+	curl -fsS -X "$method" -H "X-Broker-Token: $BROKER_TOKEN" "$@" "${BROKER_URL}${path}"
+}
+
+box_new() {
+	local name="${1:-$(cut -c1-6 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)}"
+	broker POST "/box/$name" && echo "cbx: box '$name' up — attach from the host:" \
+		&& echo "  docker exec -it box-\${PROJECT}-$name tmux attach -t main"
+}
+
+box_kill() { [ $# -ge 1 ] || die "kill needs a box name"; broker DELETE "/box/$1" && echo "cbx: killed box '$1'"; }
+
+box_ls() {
+	echo "== services (tmux) =="
+	tmux list-windows -t "$TMUX_SESSION" -F '  #W' 2>/dev/null || echo "  (none)"
+	echo "== boxes (broker) =="
+	broker GET "/box" 2>/dev/null || echo "  (broker unreachable)"
+}
+
+expose() {
+	[ $# -ge 1 ] || die "expose needs a repo path"
+	local src="$1" dst mode
+	if [ "${2:-}" = ro ] || [ "${2:-}" = rw ]; then
+		dst="$src"; mode="$2"          # cbx expose <src> <ro|rw>
+	else
+		dst="${2:-$src}"; mode="${3:-rw}"   # cbx expose <src> [dst] [ro|rw]
+	fi
+	printf '%s %s %s\n' "$src" "$dst" "$mode" >> "$MANIFEST"
+	echo "cbx: exposed $src -> $dst ($mode). Recreate boxes to apply (cbx kill + cbx box)."
+}
+
+hide() {
+	[ $# -ge 1 ] || die "hide needs a repo path"
+	grep -vE "^[[:space:]]*$1[[:space:]]" "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+	echo "cbx: hid $1. Recreate boxes to apply."
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+	up)     [ $# -ge 1 ] || die "up needs a service"; svc_up "$1" ;;
+	down)   [ $# -ge 1 ] || die "down needs a service"; svc_down "$1" ;;
+	logs)   [ $# -ge 1 ] || die "logs needs a service"; svc_logs "$1" ;;
+	box)    box_new "$@" ;;
+	kill)   box_kill "$@" ;;
+	ls)     box_ls ;;
+	expose) expose "$@" ;;
+	hide)   hide "$@" ;;
+	*) sed -n '4,18p' "$0" | sed 's/^# \?//'; exit 1 ;;
+esac
