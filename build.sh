@@ -1,10 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# Builds the claude-box image. The clip UID is NOT baked in — it's applied at container start
-# from the settings file — so this is a plain build and you only need to rebuild when the
-# Dockerfile/entrypoint change, not when you change the UID. docker is elevated automatically
-# if the daemon needs it.
+# Builds the claude-box image LOCALLY. This is now the dev-only escape hatch: by default claude-box.sh
+# runs the centrally-built image from the acoveo registry (Jenkins builds + pushes it), so you only
+# need this when hacking on the image itself. After building, run the box against your local build by
+# setting CLAUDEBOX_IMAGE=claude-box in ~/.config/claude-box/config (or exporting it).
+#
+# The clip UID is NOT baked in — it's applied at container start from the settings file — so this is
+# a plain build and you only need to rebuild when the Dockerfile/entrypoint change, not when you
+# change the UID. docker is elevated automatically if the daemon needs it.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/config"
 # shellcheck source=/dev/null

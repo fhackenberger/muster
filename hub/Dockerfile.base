@@ -9,41 +9,34 @@
 # split), so JAVA_HOME, the gradle install, and the non-root 'gradle' user (uid/gid 1000, home
 # /home/gradle) all come from the base image — every bind mount (/home/gradle/.claude, .pinchtab,
 # .gitidentity, .m2/repository) and all uid-1000 file ownership line up exactly as before.
+#
+# BUILD CONTEXT = the claude-box dir (NOT hub/), so this can COPY the shared common-setup.sh at its
+# root; the hub's own files are therefore referenced as hub/<file>. Build it with, e.g.:
+#   docker build -f hub/Dockerfile.base -t claude-box-hub-base .
 FROM gradle:8-jdk17-jammy
 
 USER root
 
-# Runtime deps. The cypress/Chrome shared-lib list mirrors docker-gradle (pinchtab downloads
-# and drives its own Chrome, so we only need the libs, not the browser package). tmux holds the
-# on-demand service windows; git clones + commits; jq/python3/procps for the helper scripts.
+# Shared tooling (base utils, Node + npm via fnm, the pinchtab binary) — installed by common-setup.sh,
+# the SAME script the claude-box image uses, so the toolchain is defined in one place. Version pins
+# come from build args (the Jenkins pipeline passes them explicitly).
+ARG NODE_VERSION=v26.2.0
+ARG NPM_VERSION=11.13.0
+ARG PINCHTAB_VERSION=0.13.2
+ENV FNM_DIR=/opt/fnm
+COPY common-setup.sh /tmp/common-setup.sh
+RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION="${PINCHTAB_VERSION}" \
+		sh /tmp/common-setup.sh \
+	&& rm /tmp/common-setup.sh
+
+# Hub-specific runtime deps (the shared ones came from common-setup.sh above). openssh-client clones
+# + commits; tmux holds the on-demand service windows; the cypress/Chrome shared-lib list mirrors
+# docker-gradle (pinchtab downloads and drives its own Chrome, so we only need the libs) plus xauth/xvfb.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		ca-certificates curl git openssh-client tmux less jq python3 procps unzip libatomic1 \
+		openssh-client tmux \
 		libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 \
 		libxss1 libasound2 libxtst6 xauth xvfb \
 	&& rm -rf /var/lib/apt/lists/*
-
-# Node + npm via fnm, pinned to the host dev versions (override with --build-arg). System-wide,
-# outside the home bind mount, symlinked onto PATH — same approach as the claude-box image.
-ARG NODE_VERSION=v26.2.0
-ARG NPM_VERSION=11.13.0
-ENV FNM_DIR=/opt/fnm
-RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
-	&& fnm install "${NODE_VERSION}" \
-	&& fnm default "${NODE_VERSION}" \
-	&& ln -s "${FNM_DIR}/node-versions/${NODE_VERSION}/installation/bin/"* /usr/local/bin/ \
-	&& npm install -g "npm@${NPM_VERSION}" \
-	&& node --version && npm --version
-
-# pinchtab SERVER (the box ships only the CLI; the hub runs the server + Chrome). The npm package
-# is a launcher that fetches a self-contained Go binary; install it in a throwaway HOME, copy the
-# binary onto PATH, drop the wrapper. Pinned to the host version.
-ARG PINCHTAB_VERSION=0.13.2
-RUN HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION}" \
-	&& cp "$(find /tmp/pt/.pinchtab -name 'pinchtab-linux-amd64' -type f | head -1)" /usr/local/bin/pinchtab \
-	&& chmod 0755 /usr/local/bin/pinchtab \
-	&& npm rm -g pinchtab \
-	&& rm -rf /tmp/pt \
-	&& pinchtab --version
 
 ENV NG_CLI_ANALYTICS=false
 
@@ -51,13 +44,13 @@ ENV NG_CLI_ANALYTICS=false
 # mounted ~/.gitidentity/gitconfig can still override). The wrapper offers whatever private key(s)
 # live in the mounted identity dir (any type, not just ed25519) and trusts a provider's host key on
 # first connect. entrypoint.sh pre-seeds known_hosts for the REPO_URL host.
-COPY git-ssh /usr/local/bin/git-ssh
+COPY hub/git-ssh /usr/local/bin/git-ssh
 RUN chmod 0755 /usr/local/bin/git-ssh \
 	&& git config --system core.sshCommand /usr/local/bin/git-ssh
 
 # Helper CLI (cbx: start/stop services, spawn/kill boxes via the broker) + entrypoint.
-COPY cbx /usr/local/bin/cbx
-COPY entrypoint.sh /usr/local/bin/hub-entrypoint.sh
+COPY hub/cbx /usr/local/bin/cbx
+COPY hub/entrypoint.sh /usr/local/bin/hub-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/cbx /usr/local/bin/hub-entrypoint.sh
 
 USER 1000

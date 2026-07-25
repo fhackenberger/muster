@@ -17,8 +17,11 @@ set -euo pipefail
 #   claude-box.sh -- <args...>     # run claude with those flags, e.g. -- --resume <id>
 #   claude-box.sh <cmd> [args...]  # run any explicit command in the container verbatim
 #
-# Build the image first with build.sh. Settings (clip-proxy UID, shared dir, image name)
-# live in ~/.config/claude-box/config — created with defaults on first run.
+# By default the box runs the centrally-built image from the acoveo registry, pulled on first use
+# (so a laptop needs only `docker login dockerregistry.acoveo.com` + this script — no local build).
+# build.sh is only for hacking on the image locally. Set CLAUDEBOX_PULL=1 to refresh to the latest
+# pushed build. Settings (clip-proxy UID, shared dir, image name) live in ~/.config/claude-box/config
+# — created with defaults on first run.
 #
 # The host is reachable within the container on the hostname: host.docker.internal
 # for e.g. connecting to a backend service while running the frontend for testing
@@ -70,6 +73,8 @@ CLIP_UID=60001
 # Optional overrides (uncomment to use):
 #CLIP_USER=claude-box-clip
 #CLAUDEBOX_SHARED="$HOME/claudebox"
+# Image to run. Default: the centrally-built image from the acoveo registry, pulled on first use.
+# To hack on the image locally, build it with build.sh and switch to the local tag:
 #CLAUDEBOX_IMAGE=claude-box
 EOF
 	echo "claude-box: wrote default settings to $CONFIG_FILE" >&2
@@ -89,7 +94,7 @@ DETACH="${CLAUDEBOX_DETACH:-0}"
 #       -> appears in the container at /home/<user>/projects/x
 # In server mode the broker instead passes the curated content via CLAUDEBOX_EXTRA_MOUNTS.
 SHARED_DIR="${CLAUDEBOX_SHARED:-$HOME/claudebox}"
-IMAGE="${CLAUDEBOX_IMAGE:-claude-box}"
+IMAGE="${CLAUDEBOX_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box:stable}"
 
 # Identity materialized inside the container. Defaults to the invoking host user (laptop); the
 # broker overrides these to a synthetic non-root uid (e.g. dev/1000/1000) so Claude never runs as
@@ -349,6 +354,24 @@ WORKDIR="$ORIG_PWD"
 
 DOCKER="docker"
 docker info >/dev/null 2>&1 || DOCKER="sudo docker"
+
+# Ensure the image is present. The default IMAGE is the centrally-built acoveo-registry image, so
+# pull it when it's missing locally (or when CLAUDEBOX_PULL=1 forces a refresh to the latest push).
+# A local-only tag that's already present (e.g. build.sh's 'claude-box') skips the pull.
+if [ "${CLAUDEBOX_PULL:-0}" = 1 ] || ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
+	echo "claude-box: pulling $IMAGE ..." >&2
+	if ! $DOCKER pull "$IMAGE"; then
+		if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
+			echo "claude-box: pull failed — using the local copy of $IMAGE." >&2
+		else
+			echo "claude-box: cannot pull $IMAGE and no local copy exists." >&2
+			echo "claude-box:   - for the acoveo registry, run: docker login dockerregistry.acoveo.com" >&2
+			echo "claude-box:   - or build locally with build.sh and set CLAUDEBOX_IMAGE=claude-box in $CONFIG_FILE" >&2
+			exit 1
+		fi
+	fi
+fi
+
 $DOCKER run "${RUN_FLAGS[@]}" \
 	--hostname "${CLAUDEBOX_NAME:-claudebox}" \
 	--add-host=host.docker.internal:host-gateway \

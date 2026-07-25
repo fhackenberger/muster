@@ -1,11 +1,11 @@
 FROM debian:bookworm-slim
 
-# Minimal runtime + sudo (drives the unprivileged clipboard proxy) + clipboard tools.
-# (setpriv, used by the entrypoint to drop privileges, ships with util-linux in the base.)
-# We add procps for pgrep (used in dev loop scripts) and jq & python3 for claude.
+# Minimal deps needed just to install Claude below (ca-certificates + curl). The rest of the shared
+# runtime (git, node/npm, pinchtab, base utils) is installed later by common-setup.sh — see below.
+# Claude is installed EARLY (before common-setup) because its layer is the slow one: keeping it above
+# the version-pinned toolchain means bumping NODE_VERSION/pinchtab doesn't bust the Claude cache.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		ca-certificates curl git xclip xsel less sudo unzip libatomic1 \
-		procps jq python3 \
+		ca-certificates curl \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Install the native Claude binary SYSTEM-WIDE (survives the home bind-mount) and disable the
@@ -41,32 +41,28 @@ RUN printf '%s\n' 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="
 		> /etc/profile.d/00-local-bin.sh \
 	&& chmod 0644 /etc/profile.d/00-local-bin.sh
 
-# Node + npm via fnm, pinned to the versions the host dev box is currently using (captured by
-# build.sh and passed in as build args) so the container's toolchain matches the host exactly.
-# fnm and the node install live OUTSIDE the home bind mount (system-wide, like the claude binary
-# below), and node/npm/npx are symlinked onto PATH so no per-shell fnm hook is needed at runtime.
+# Shared tooling (base utils, Node + npm via fnm, the pinchtab CLI) — installed by common-setup.sh,
+# the SAME script the hub base uses, so the toolchain is defined in one place. Version pins come from
+# build args (build.sh captures them from the host; the Jenkins pipeline passes them explicitly).
 ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
+ARG PINCHTAB_VERSION=0.13.2
 ENV FNM_DIR=/opt/fnm
-RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
-	&& fnm install "${NODE_VERSION}" \
-	&& fnm default "${NODE_VERSION}" \
-	&& ln -s "${FNM_DIR}/node-versions/${NODE_VERSION}/installation/bin/"* /usr/local/bin/ \
-	&& npm install -g "npm@${NPM_VERSION}" \
-	&& node --version && npm --version
+COPY common-setup.sh /tmp/common-setup.sh
+RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION="${PINCHTAB_VERSION}" \
+		sh /tmp/common-setup.sh \
+	&& rm /tmp/common-setup.sh
 
-# pinchtab CLI ONLY (no Chrome) — the box is a thin client that drives the pinchtab server +
-# Chrome running on the HOST (reached via host.docker.internal; wired up in claude-box.sh). The
-# npm package is just a launcher that downloads a self-contained Go binary; we run its installer
-# in a throwaway HOME, copy that binary onto PATH system-wide (survives the home bind-mount, like
-# the claude binary), and drop the wrapper. Pinned to the host version (captured by build.sh).
-ARG PINCHTAB_VERSION=0.11.0
-RUN HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION}" \
-	&& cp "$(find /tmp/pt/.pinchtab -name 'pinchtab-linux-amd64' -type f | head -1)" /usr/local/bin/pinchtab \
-	&& chmod 0755 /usr/local/bin/pinchtab \
-	&& npm rm -g pinchtab \
-	&& rm -rf /tmp/pt \
-	&& pinchtab --version
+# Box-specific: the clipboard bridge (xclip/xsel) + sudo, which drives the unprivileged clip proxy.
+# Everything else the box shares with the hub came from common-setup.sh above.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		xclip xsel sudo \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Disable Angular CLI analytics + its first-run "share usage data?" prompt. The CLI normally
+# persists this in ~/.config/angular, but the container's home is bind-mounted so that wouldn't
+# survive — the env var lives in the image and suppresses the prompt for every run.
+ENV NG_CLI_ANALYTICS=false
 
 # Unprivileged identity that is the ONLY X client authorized to touch the clipboard. The UID
 # here is just a placeholder — the entrypoint resets it at startup to the runtime CLIP_UID,
@@ -94,11 +90,6 @@ RUN for t in xclip xsel; do \
 		printf '#!/bin/sh\nexec sudo -n -u %s /usr/bin/%s "$@"\n' "${CLIP_USER}" "$t" > /usr/local/bin/$t \
 		&& chmod 0755 /usr/local/bin/$t; \
 	done
-
-# Disable Angular CLI analytics + its first-run "share usage data?" prompt. The CLI normally
-# persists this in ~/.config/angular, but the container's home is bind-mounted so that wouldn't
-# survive — the env var lives in the image and suppresses the prompt for every run.
-ENV NG_CLI_ANALYTICS=false
 
 # Root entrypoint: materialize the runtime user from HOST_USER/UID/GID, then drop privileges.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

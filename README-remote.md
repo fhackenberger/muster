@@ -161,7 +161,7 @@ registry by default, so the above just works when `docker login` has run. To bui
 (or after editing `hub/Dockerfile.base`), build the base first and point the hub at the local tag:
 
 ```sh
-docker build -t claude-box-hub-base:local -f hub/Dockerfile.base hub
+docker build -t claude-box-hub-base:local -f hub/Dockerfile.base .   # context = the claude-box dir
 HUB_BASE_IMAGE=claude-box-hub-base:local docker compose build hub
 ```
 
