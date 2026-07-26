@@ -18,11 +18,21 @@ export FNM_DIR
 
 # Base utilities common to both images. procps=pgrep (dev-loop scripts), jq + python3 for claude,
 # tmux for the box's detached session (the broker runs claude inside `tmux new-session`) and the
-# hub's on-demand service windows.
+# hub's on-demand service windows, ncurses-bin for tic/tput/clear (+ compiling the terminfo below),
+# bash-completion for git (and other) tab-completion in interactive login shells.
 apt-get update
 apt-get install -y --no-install-recommends \
-	ca-certificates curl git tmux less unzip libatomic1 procps jq python3
+	ca-certificates curl git bash-completion tmux less unzip libatomic1 procps jq python3 ncurses-bin
 rm -rf /var/lib/apt/lists/*
+
+# Ghostty terminfo — the real xterm-ghostty entry (`infocmp -x xterm-ghostty` from a ghostty install,
+# shipped as terminfo-ghostty and COPYd to /tmp by the Dockerfile). bookworm/jammy ncurses predate the
+# upstream entry, so compile it into /etc/terminfo (on the ncurses search path); attaching with a
+# native TERM=xterm-ghostty then works with no -e TERM override. Refresh by re-running that infocmp.
+if [ -f /tmp/terminfo-ghostty ]; then
+	tic -x -o /etc/terminfo /tmp/terminfo-ghostty
+	rm -f /tmp/terminfo-ghostty
+fi
 
 # Node + npm via fnm, pinned to the host dev versions. fnm and the node install live OUTSIDE the
 # home bind mount (system-wide) and node/npm/npx are symlinked onto PATH, so no per-shell fnm hook

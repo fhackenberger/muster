@@ -10,6 +10,7 @@ set -euo pipefail
 #   cbx down backend|frontend|pinchtab      # stop it
 #   cbx box  [name]                         # spawn an agent box (mounts per box-mounts)
 #   cbx kill <name>                         # remove an agent box
+#   cbx recreate <name>|all                 # pull newest image + respawn (resumes the box's session)
 #   cbx ls                                  # list services (tmux) + boxes (broker)
 #   cbx expose <src> [dst] [ro]             # add a repo path to box-mounts (dst defaults to src)
 #   cbx hide   <src>                        # remove it
@@ -76,9 +77,10 @@ box_new() {
 	container="$(printf '%s' "$resp" | jq -r '.container // empty' 2>/dev/null)" || container=""
 	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 	echo "cbx: box '$name' up as container '$container'. Attach from the host with:"
-	# -u dev: claude (and its tmux session) runs under the box's 'dev' user, not root.
-	# -e TERM=xterm-256color: force a TERM the slim box's terminfo knows (your native TERM may not be).
-	echo "  docker exec -it -u dev -e TERM=xterm-256color $container tmux attach -t main    # Ctrl-b d to detach"
+	# -u dev: claude (and its tmux session) runs under the box's 'dev' user, not root. The box carries
+	# an xterm-ghostty terminfo entry, so your native TERM works; for a terminal it doesn't know, add
+	# '-e TERM=xterm-256color'.
+	echo "  docker exec -it -u dev $container tmux attach -t main      # Ctrl-b d to detach"
 }
 
 box_kill() {
@@ -86,6 +88,23 @@ box_kill() {
 	local resp
 	resp="$(broker DELETE "/box/$1")" || die "killing box '$1' failed: $resp"
 	echo "cbx: killed box '$1'"
+}
+
+box_recreate() {
+	[ $# -ge 1 ] || die "recreate needs a box name (or 'all')"
+	local resp
+	if [ "$1" = all ]; then
+		echo "cbx: pulling newest image + recreating all boxes (each resumes its own session)..."
+		resp="$(broker POST "/recreate")" || die "recreate all failed: $resp"
+		echo "cbx: recreated: $(printf '%s' "$resp" | jq -r '.recreated | join(", ")' 2>/dev/null || printf '%s' "$resp")"
+	else
+		echo "cbx: pulling newest image + recreating box '$1' (resuming its session)..."
+		resp="$(broker POST "/recreate/$1")" || die "recreate '$1' failed: $resp"
+		local container
+		container="$(printf '%s' "$resp" | jq -r '.container // empty' 2>/dev/null)"
+		echo "cbx: box '$1' recreated as '${container:-box-?-$1}'. Attach from the host with:"
+		echo "  docker exec -it -u dev ${container:-<container>} tmux attach -t main"
+	fi
 }
 
 box_ls() {
@@ -109,13 +128,13 @@ expose() {
 		dst="${2:-$src}"; mode="${3:-rw}"   # cbx expose <src> [dst] [ro|rw]
 	fi
 	printf '%s %s %s\n' "$src" "$dst" "$mode" >> "$MANIFEST"
-	echo "cbx: exposed $src -> $dst ($mode). Recreate boxes to apply (cbx kill + cbx box)."
+	echo "cbx: exposed $src -> $dst ($mode). Apply with: cbx recreate <box>|all (keeps the session)."
 }
 
 hide() {
 	[ $# -ge 1 ] || die "hide needs a repo path"
 	grep -vE "^[[:space:]]*$1[[:space:]]" "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
-	echo "cbx: hid $1. Recreate boxes to apply."
+	echo "cbx: hid $1. Apply with: cbx recreate <box>|all (keeps the session)."
 }
 
 cmd="${1:-}"; shift || true
@@ -123,9 +142,10 @@ case "$cmd" in
 	up)     [ $# -ge 1 ] || die "up needs a service"; svc_up "$1" ;;
 	down)   [ $# -ge 1 ] || die "down needs a service"; svc_down "$1" ;;
 	logs)   [ $# -ge 1 ] || die "logs needs a service"; svc_logs "$1" ;;
-	box)    box_new "$@" ;;
-	kill)   box_kill "$@" ;;
-	ls)     box_ls ;;
+	box)      box_new "$@" ;;
+	kill)     box_kill "$@" ;;
+	recreate) box_recreate "$@" ;;
+	ls)       box_ls ;;
 	expose) expose "$@" ;;
 	hide)   hide "$@" ;;
 	*) sed -n '4,18p' "$0" | sed 's/^# \?//'; exit 1 ;;

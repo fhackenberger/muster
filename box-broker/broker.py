@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = os.environ.get("BROKER_TOKEN", "")
@@ -118,14 +119,31 @@ def parse_manifest():
 	return mounts, tmpfs, workdir or HOME_IN
 
 
-def create_box(name):
+def create_box(name, resume=False):
 	container = box_container(name)
-	anchor = os.path.join(BOXROOT, name, "home")
+	box_dir = os.path.join(BOXROOT, name)
+	anchor = os.path.join(box_dir, "home")
 	os.makedirs(anchor, exist_ok=True)
 	os.chown(anchor, int(BOX_UID), int(BOX_GID))
 	if CLAUDE_HOME:
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
+	# Per-box claude session. All boxes share CLAUDE_HOME + the same cwd, so `claude --continue` would
+	# be ambiguous across boxes; instead we pin a stable session id per box (stored in the box dir) and
+	# resume THAT. A fresh spawn gets a new --session-id (recorded); a recreate reuses it via --resume,
+	# so the box picks up exactly where it left off.
+	session_file = os.path.join(box_dir, "session-id")
+	claude_args = ""
+	if resume and os.path.exists(session_file):
+		with open(session_file) as fh:
+			sid = fh.read().strip()
+		if sid:
+			claude_args = f"--resume {sid}"
+	if not claude_args:
+		sid = str(uuid.uuid4())
+		with open(session_file, "w") as fh:
+			fh.write(sid)
+		claude_args = f"--session-id {sid}"
 	mounts, tmpfs, workdir = parse_manifest()
 	env = dict(os.environ)
 	env.update(
@@ -140,6 +158,7 @@ def create_box(name):
 		CLAUDEBOX_SHARED=anchor,
 		CLAUDEBOX_CLAUDE_DIR=CLAUDE_HOME,
 		CLAUDEBOX_WORKDIR=workdir,
+		CLAUDEBOX_CLAUDE_ARGS=claude_args,
 		CLAUDEBOX_PINCHTAB_SERVER=PT_SERVER,
 		CLAUDEBOX_PINCHTAB_TOKEN=PT_TOKEN,
 		CLAUDEBOX_DEV_URL=DEV_URL,
@@ -150,7 +169,7 @@ def create_box(name):
 	proc = subprocess.run([CLAUDEBOX_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude-box.sh failed")
-	return {"box": name, "container": container, "workdir": workdir, "mounts": mounts, "tmpfs": tmpfs}
+	return {"box": name, "container": container, "workdir": workdir, "session": claude_args, "mounts": mounts, "tmpfs": tmpfs}
 
 
 def kill_box(name):
@@ -167,14 +186,14 @@ def list_boxes():
 	return {"boxes": rows}
 
 
-def pull_box_image():
-	"""Pull BOX_IMAGE so spawns use a recent image. Best-effort + coalesced: a bare local tag or a
-	pull already in flight is skipped, and failures are logged (not raised) — a spawn then just uses
-	the cached image via claude-box.sh."""
+def pull_box_image(wait=False):
+	"""Pull BOX_IMAGE so spawns use a recent image. Best-effort + coalesced: a bare local tag is
+	skipped and failures are logged (not raised). wait=False (spawns) skips if a pull is already in
+	flight; wait=True (recreate) blocks for it then pulls, so the new box gets the newest image."""
 	if "/" not in BOX_IMAGE:
 		return  # bare local tag (e.g. build.sh's 'claude-box') — nothing to pull
-	if not _pull_lock.acquire(blocking=False):
-		return  # a pull is already running
+	if not _pull_lock.acquire(blocking=wait):
+		return  # a pull is already running (and we're not waiting)
 	try:
 		r = subprocess.run(["docker", "pull", BOX_IMAGE], capture_output=True, text=True)
 		if r.returncode == 0:
@@ -188,6 +207,29 @@ def pull_box_image():
 def pull_box_image_async():
 	"""Run pull_box_image() in a daemon thread so it never blocks a spawn response or startup."""
 	threading.Thread(target=pull_box_image, daemon=True).start()
+
+
+def _box_name_of(container):
+	prefix = f"box-{PROJECT}-"
+	return container[len(prefix):] if container.startswith(prefix) else container
+
+
+def recreate_box(name):
+	"""Pull the newest image, drop the old container, and respawn the box resuming ITS session."""
+	pull_box_image(wait=True)
+	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True)
+	return create_box(name, resume=True)
+
+
+def recreate_all():
+	"""Recreate every box (newest image, each resuming its own session). Pulls once for all."""
+	pull_box_image(wait=True)
+	done = []
+	for r in list_boxes()["boxes"]:
+		name = _box_name_of(r["container"])
+		subprocess.run(["docker", "rm", "-f", r["container"]], capture_output=True, text=True)
+		done.append(create_box(name, resume=True)["box"])
+	return {"recreated": done}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -222,6 +264,21 @@ class Handler(BaseHTTPRequestHandler):
 	def do_POST(self):
 		if not self._authed():
 			return
+		# Recreate (newest image + respawn resuming each box's session). /recreate = every box.
+		if self.path.rstrip("/") == "/recreate":
+			try:
+				return self._reply(200, recreate_all())
+			except Exception as e:  # noqa: BLE001
+				return self._reply(500, {"error": str(e)})
+		if self.path.startswith("/recreate/"):
+			rname = self.path[len("/recreate/"):].strip("/")
+			if not NAME_RE.match(rname):
+				return self._reply(400, {"error": "bad box name"})
+			try:
+				return self._reply(200, recreate_box(rname))
+			except Exception as e:  # noqa: BLE001
+				return self._reply(500, {"error": str(e)})
+		# Default: spawn a fresh box.
 		name = self._box_name()
 		if not self.path.startswith("/box/") or not NAME_RE.match(name):
 			return self._reply(400, {"error": "bad box name"})

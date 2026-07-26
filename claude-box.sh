@@ -52,6 +52,7 @@ set -euo pipefail
 #   CLAUDEBOX_WORKDIR                container workdir (default: cwd; headless: the home anchor)
 #   CLAUDEBOX_PINCHTAB_SERVER/_TOKEN point the box's pinchtab CLI straight at a server (no relay)
 #   CLAUDEBOX_DEV_URL                the dev-server URL to expose to the box
+#   CLAUDEBOX_CLAUDE_ARGS            extra args appended to the detached `claude` (e.g. --resume <id>)
 #   CLAUDEBOX_EXTRA_MOUNTS           newline-separated src:dst[:ro] binds (broker-validated)
 
 # Settings live in one simple shell file shared with build.sh, so the clip UID (which must
@@ -317,9 +318,12 @@ fi
 # explicitly removed (cbx kill). Overrides the command chosen above (the broker passes no args).
 # claude runs in the named session 'main'; when it exits (you quit it, or it crashes) the window
 # drops to a login shell instead of the session vanishing — so you can just type `claude` to
-# relaunch, and a crash leaves a readable shell rather than "no sessions".
+# relaunch, and a crash leaves a readable shell rather than "no sessions". CLAUDEBOX_CLAUDE_ARGS is
+# appended to the claude command (the broker passes --session-id/--resume so each box keeps its own
+# conversation across recreates); empty on the laptop, so the command is unchanged there.
 if [ "$DETACH" = 1 ]; then
-	RUN_CMD=(bash -lc 'tmux new-session -d -s main -n claude "claude; echo; echo claude exited - type claude to relaunch; exec bash -l"; exec sleep infinity')
+	_claude="claude${CLAUDEBOX_CLAUDE_ARGS:+ ${CLAUDEBOX_CLAUDE_ARGS}}"
+	RUN_CMD=(bash -lc "tmux new-session -d -s main -n claude \"${_claude}; echo; echo claude exited - type claude to relaunch; exec bash -l\"; exec sleep infinity")
 fi
 
 # Single cleanup on any exit (normal or signal): revoke the X-server grant (laptop only) and tear
