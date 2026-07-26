@@ -20,9 +20,12 @@ export FNM_DIR
 # tmux for the box's detached session (the broker runs claude inside `tmux new-session`) and the
 # hub's on-demand service windows, ncurses-bin for tic/tput/clear (+ compiling the terminfo below),
 # bash-completion for git (and other) tab-completion in interactive login shells.
+# Vim  		useful for editing code
+# Delta		for git diffs
 apt-get update
 apt-get install -y --no-install-recommends \
-	ca-certificates curl git bash-completion tmux less unzip libatomic1 procps jq python3 ncurses-bin
+	ca-certificates curl git bash-completion tmux less unzip libatomic1 procps jq python3 ncurses-bin \
+	vim delta
 rm -rf /var/lib/apt/lists/*
 
 # Ghostty terminfo — the real xterm-ghostty entry (`infocmp -x xterm-ghostty` from a ghostty install,

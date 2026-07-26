@@ -17,9 +17,7 @@ FROM ${HUB_BASE_IMAGE}
 USER root
 
 # Ant  		needed by the infostars build (gradle + the JDK come from the base image).
-# Vim  		useful for editing code
-# Delta		for git diffs
-RUN apt-get update && apt-get install -y --no-install-recommends ant vim delta \
+RUN apt-get update && apt-get install -y --no-install-recommends ant \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Back to the non-root hub user; WORKDIR + ENTRYPOINT are inherited from the base.
