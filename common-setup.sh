@@ -34,6 +34,14 @@ if [ -f /tmp/terminfo-ghostty ]; then
 	rm -f /tmp/terminfo-ghostty
 fi
 
+# tmux config: install the shipped tmux.conf (COPYd to /tmp by the Dockerfile) to /etc/tmux.conf —
+# the SYSTEM config, read by tmux for every user. The box's /home is a bind-mount so a per-user
+# ~/.tmux.conf would be shadowed. Add settings by editing tmux.conf, not here.
+if [ -f /tmp/tmux.conf ]; then
+	cp /tmp/tmux.conf /etc/tmux.conf
+	rm -f /tmp/tmux.conf
+fi
+
 # Node + npm via fnm, pinned to the host dev versions. fnm and the node install live OUTSIDE the
 # home bind mount (system-wide) and node/npm/npx are symlinked onto PATH, so no per-shell fnm hook
 # is needed at runtime.

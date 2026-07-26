@@ -1,8 +1,8 @@
 # claude-box-hub-base — the PROJECT-AGNOSTIC hub base image.
 #
 # Everything a claude-box "hub" needs regardless of the project it hosts: git + ssh for the
-# checkout, tmux for the on-demand service windows, node/npm, the pinchtab server + the Chrome
-# runtime libs its browser needs, and the cbx helper + entrypoint. A per-project image builds ON
+# checkout, tmux for the on-demand service windows, node/npm, the pinchtab server + Google Chrome
+# (the real browser pinchtab drives), and the cbx helper + entrypoint. A per-project image builds ON
 # TOP of this (see Dockerfile) to add that project's extra build deps (e.g. ant).
 #
 # JDK17 + gradle 8 on jammy is the base OS (the same gradle:8-jdk17-jammy the hub used before the
@@ -24,18 +24,24 @@ ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
 ARG PINCHTAB_VERSION=0.13.2
 ENV FNM_DIR=/opt/fnm
-COPY common-setup.sh terminfo-ghostty /tmp/
+COPY common-setup.sh terminfo-ghostty tmux.conf /tmp/
 RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION="${PINCHTAB_VERSION}" \
 		sh /tmp/common-setup.sh \
 	&& rm /tmp/common-setup.sh
 
 # Hub-specific runtime deps (the shared ones — incl. tmux — came from common-setup.sh above).
-# openssh-client clones + commits; the cypress/Chrome shared-lib list mirrors docker-gradle
-# (pinchtab downloads and drives its own Chrome, so we only need the libs) plus xauth/xvfb.
+# openssh-client clones + commits. Google Chrome is for the pinchtab SERVER: pinchtab drives a REAL
+# system browser (it has no download-your-own-Chrome step — browser.binary defaults to auto-detect),
+# so the hub must ship one. google-chrome-stable's .deb pulls in ALL the Chrome runtime libs, so we
+# no longer hand-maintain that list; xauth/xvfb remain for the headless X plumbing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		openssh-client \
-		libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 \
-		libxss1 libasound2 libxtst6 xauth xvfb \
+		openssh-client xauth xvfb gnupg \
+	&& curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+		| gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+	&& echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
+		> /etc/apt/sources.list.d/google-chrome.list \
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends google-chrome-stable \
 	&& rm -rf /var/lib/apt/lists/*
 
 ENV NG_CLI_ANALYTICS=false
