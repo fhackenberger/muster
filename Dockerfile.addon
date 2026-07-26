@@ -9,7 +9,8 @@ FROM ${BASE_IMAGE}
 
 USER root
 
-ARG GRADLE_VERSION=8.10.2
+# GRADLE_VERSION empty (the default) -> build-setup.sh installs the latest 8.x; set it to pin a version.
+ARG GRADLE_VERSION=
 COPY build-setup.sh /tmp/build-setup.sh
 RUN GRADLE_VERSION="${GRADLE_VERSION}" sh /tmp/build-setup.sh \
 	&& rm /tmp/build-setup.sh
