@@ -76,7 +76,9 @@ box_new() {
 	container="$(printf '%s' "$resp" | jq -r '.container // empty' 2>/dev/null)" || container=""
 	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 	echo "cbx: box '$name' up as container '$container'. Attach from the host with:"
-	echo "  docker exec -it $container tmux attach -t main      # Ctrl-b d to detach"
+	# -u dev: claude (and its tmux session) runs under the box's 'dev' user, not root.
+	# -e TERM=xterm-256color: force a TERM the slim box's terminfo knows (your native TERM may not be).
+	echo "  docker exec -it -u dev -e TERM=xterm-256color $container tmux attach -t main    # Ctrl-b d to detach"
 }
 
 box_kill() {

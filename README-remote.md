@@ -185,6 +185,12 @@ CBX_PROJECT=myproject            # PROJECT_NAME of the stack, e.g. infostars
 alias cbx='ssh -t "$CBX_SERVER" "docker exec -it \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub) cbx"'
 # drop into a shell inside the hub to look around / debug (add -u root before \$( … ) for root):
 alias cbxhub='ssh -t "$CBX_SERVER" "docker exec -it \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub) bash -l"'
+# attach to an agent box by name (Ctrl-b d to detach):  cbxbox work1
+# a function, not an alias — the name lands in the MIDDLE of the command (box-<project>-<name>),
+# which a plain alias (trailing args only) can't do. -u dev: claude's tmux session runs under the
+# box's 'dev' user, not root (root's tmux socket is empty → "no sessions"). -e TERM=xterm-256color:
+# force a TERM the slim box's terminfo knows (a native kitty/ghostty/… TERM gives "does not support clear").
+cbxbox() { ssh -t "$CBX_SERVER" docker exec -it -u dev -e TERM=xterm-256color "box-${CBX_PROJECT}-$1" tmux attach -t main; }
 ```
 
 The `\$(…)` is escaped so the container lookup runs on the server at call time, not when bash loads
@@ -220,10 +226,12 @@ cbx logs backend      # attach the backend window and watch it live
 - `cbx logs` needs a TTY to attach tmux; the `cbx` alias already provides one (`ssh -t` +
   `docker exec -it`), so it just works.
 
-Attach / detach a box (a box is a separate container, not reached through the hub):
+Attach / detach a box (a box is a separate container, not reached through the hub) — via the
+`cbxbox` helper from the aliases above, or the raw command:
 
 ```sh
-ssh -t "$CBX_SERVER" docker exec -it "box-${CBX_PROJECT}-work1" tmux attach -t main   # Ctrl-b d to detach
+cbxbox work1                                                                                                     # Ctrl-b d to detach
+ssh -t "$CBX_SERVER" docker exec -it -u dev -e TERM=xterm-256color "box-${CBX_PROJECT}-work1" tmux attach -t main   # equivalent, raw
 ```
 
 Curate what boxes see (per project, from the hub); recreate the box to apply:

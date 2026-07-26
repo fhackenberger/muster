@@ -315,8 +315,11 @@ fi
 # Detached/server box: run in the background with a tmux session holding claude, so you reattach
 # with `docker exec -it <name> tmux attach`. No --rm, so the box survives detach until it is
 # explicitly removed (cbx kill). Overrides the command chosen above (the broker passes no args).
+# claude runs in the named session 'main'; when it exits (you quit it, or it crashes) the window
+# drops to a login shell instead of the session vanishing — so you can just type `claude` to
+# relaunch, and a crash leaves a readable shell rather than "no sessions".
 if [ "$DETACH" = 1 ]; then
-	RUN_CMD=(bash -lc 'tmux new-session -d -s main claude; exec sleep infinity')
+	RUN_CMD=(bash -lc 'tmux new-session -d -s main -n claude "claude; echo; echo claude exited - type claude to relaunch; exec bash -l"; exec sleep infinity')
 fi
 
 # Single cleanup on any exit (normal or signal): revoke the X-server grant (laptop only) and tear
