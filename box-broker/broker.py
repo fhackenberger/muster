@@ -8,6 +8,9 @@ image, uid, network, privileges and the socket are the broker's. Every curated m
 resolved and confined under the project root, so a compromised hub can expose project files to a
 box but can never mount host paths or gain privilege.
 
+To keep spawns fast AND current, the broker pulls BOX_IMAGE in the background at startup and after
+each spawn — so a new box uses a recent image without ever waiting on a `docker pull`.
+
 Config (env, from compose):
   BROKER_TOKEN        shared secret; required in the X-Broker-Token header
   BROKER_PORT         listen port (default 8099; not published to the LAN)
@@ -27,6 +30,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = os.environ.get("BROKER_TOKEN", "")
@@ -47,6 +51,9 @@ CLAUDEBOX_SCRIPT = os.environ.get("CLAUDEBOX_SCRIPT", "/usr/local/bin/claude-box
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 HOME_IN = "/home/dev"
+
+# Serializes the background `docker pull` of BOX_IMAGE so concurrent spawns don't each start one.
+_pull_lock = threading.Lock()
 
 
 def box_container(name):
@@ -160,6 +167,29 @@ def list_boxes():
 	return {"boxes": rows}
 
 
+def pull_box_image():
+	"""Pull BOX_IMAGE so spawns use a recent image. Best-effort + coalesced: a bare local tag or a
+	pull already in flight is skipped, and failures are logged (not raised) — a spawn then just uses
+	the cached image via claude-box.sh."""
+	if "/" not in BOX_IMAGE:
+		return  # bare local tag (e.g. build.sh's 'claude-box') — nothing to pull
+	if not _pull_lock.acquire(blocking=False):
+		return  # a pull is already running
+	try:
+		r = subprocess.run(["docker", "pull", BOX_IMAGE], capture_output=True, text=True)
+		if r.returncode == 0:
+			print(f"box-broker: refreshed {BOX_IMAGE}", flush=True)
+		else:
+			print(f"box-broker: pull of {BOX_IMAGE} failed: {r.stderr.strip()}", flush=True)
+	finally:
+		_pull_lock.release()
+
+
+def pull_box_image_async():
+	"""Run pull_box_image() in a daemon thread so it never blocks a spawn response or startup."""
+	threading.Thread(target=pull_box_image, daemon=True).start()
+
+
 class Handler(BaseHTTPRequestHandler):
 	def _reply(self, code, obj):
 		body = json.dumps(obj).encode()
@@ -196,9 +226,13 @@ class Handler(BaseHTTPRequestHandler):
 		if not self.path.startswith("/box/") or not NAME_RE.match(name):
 			return self._reply(400, {"error": "bad box name"})
 		try:
-			self._reply(201, create_box(name))
+			result = create_box(name)
 		except Exception as e:  # noqa: BLE001
-			self._reply(500, {"error": str(e)})
+			return self._reply(500, {"error": str(e)})
+		self._reply(201, result)
+		# Refresh the image in the background for the NEXT spawn — AFTER replying, so this spawn's
+		# response isn't delayed by the pull (this spawn already used the current cached image).
+		pull_box_image_async()
 
 	def do_DELETE(self):
 		if not self._authed():
@@ -218,6 +252,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
 	if not TOKEN:
 		raise SystemExit("box-broker: BROKER_TOKEN is required")
+	# Warm the image cache at startup so the first spawn doesn't pay the pull cost.
+	pull_box_image_async()
 	ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
