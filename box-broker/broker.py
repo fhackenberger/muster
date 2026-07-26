@@ -61,6 +61,73 @@ def box_container(name):
 	return f"box-{PROJECT}-{name}"
 
 
+def fwd_container(name):
+	return f"{box_container(name)}-fwd"
+
+
+def hub_container():
+	"""The hub container id (via its compose labels), or None. Needed as the netns for the forwarder."""
+	r = subprocess.run(
+		["docker", "ps", "-q", "-f", f"label=com.docker.compose.project={PROJECT}",
+		 "-f", "label=com.docker.compose.service=hub"],
+		capture_output=True, text=True,
+	)
+	ids = r.stdout.split()
+	return ids[0] if ids else None
+
+
+def alloc_dev_port(box_dir):
+	"""Stable per-box hub-loopback port for the frontend forwarder, persisted in the box dir so a
+	recreate keeps the same URL. Picks the lowest free port in 4300-4399 across all boxes."""
+	pf = os.path.join(box_dir, "dev-port")
+	if os.path.exists(pf):
+		try:
+			return int(open(pf).read().strip())
+		except ValueError:
+			pass
+	used = set()
+	if BOXROOT and os.path.isdir(BOXROOT):
+		for d in os.listdir(BOXROOT):
+			f = os.path.join(BOXROOT, d, "dev-port")
+			if os.path.exists(f):
+				try:
+					used.add(int(open(f).read().strip()))
+				except ValueError:
+					pass
+	for port in range(4300, 4400):
+		if port not in used:
+			with open(pf, "w") as fh:
+				fh.write(str(port))
+			return port
+	raise RuntimeError("no free frontend-forwarder port in 4300-4399")
+
+
+def start_forwarder(name, port):
+	"""Publish the box's ng serve (0.0.0.0:4200) onto the HUB's loopback at 127.0.0.1:<port>, so the
+	hub's pinchtab browser loads it as http://localhost:<port> — allowlisted by default, and the Host
+	header stays 'localhost' so ng serve's host-check passes (no per-box allowlist / no --disable-host-
+	check). socat runs FROM the box image in the hub's netns (--network container:<hub>), so bind=
+	127.0.0.1 is the hub's loopback and the box name resolves via the hub's cbx-network DNS."""
+	hub = hub_container()
+	if not hub:
+		print(f"box-broker: no hub container found — skipping frontend forwarder for {name}", flush=True)
+		return
+	fwd = fwd_container(name)
+	subprocess.run(["docker", "rm", "-f", fwd], capture_output=True, text=True)
+	r = subprocess.run(
+		["docker", "run", "-d", "--name", fwd, "--network", f"container:{hub}",
+		 "--entrypoint", "socat", BOX_IMAGE,
+		 f"TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr", f"TCP:{box_container(name)}:4200"],
+		capture_output=True, text=True,
+	)
+	if r.returncode != 0:
+		print(f"box-broker: frontend forwarder for {name} failed: {r.stderr.strip()}", flush=True)
+
+
+def stop_forwarder(name):
+	subprocess.run(["docker", "rm", "-f", fwd_container(name)], capture_output=True, text=True)
+
+
 def safe_dst(dst):
 	"""Container-side destination under HOME_IN; reject absolute / traversal."""
 	dst = dst.strip().lstrip("/")
@@ -144,6 +211,7 @@ def create_box(name, resume=False):
 		with open(session_file, "w") as fh:
 			fh.write(sid)
 		claude_args = f"--session-id {sid}"
+	dev_port = alloc_dev_port(box_dir)
 	mounts, tmpfs, workdir = parse_manifest()
 	env = dict(os.environ)
 	env.update(
@@ -161,7 +229,11 @@ def create_box(name, resume=False):
 		CLAUDEBOX_CLAUDE_ARGS=claude_args,
 		CLAUDEBOX_PINCHTAB_SERVER=PT_SERVER,
 		CLAUDEBOX_PINCHTAB_TOKEN=PT_TOKEN,
-		CLAUDEBOX_DEV_URL=DEV_URL,
+		# The box runs its OWN ng serve (0.0.0.0:4200 via FRONTEND_DEV_HOST). The hub's pinchtab browser
+		# can't use the box name (pinchtab's IDPI allowlist has no wildcard) nor loopback (different
+		# netns), so start_forwarder() below publishes it onto the hub's 127.0.0.1:<dev_port>; the box
+		# is told to point pinchtab at that localhost URL (allowlisted by default; Host stays localhost).
+		CLAUDEBOX_DEV_URL=f"http://localhost:{dev_port}",
 		CLAUDEBOX_EXTRA_MOUNTS="\n".join(mounts),
 		CLAUDEBOX_EXTRA_TMPFS="\n".join(tmpfs),
 		HOME="/tmp",
@@ -169,10 +241,13 @@ def create_box(name, resume=False):
 	proc = subprocess.run([CLAUDEBOX_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude-box.sh failed")
-	return {"box": name, "container": container, "workdir": workdir, "session": claude_args, "mounts": mounts, "tmpfs": tmpfs}
+	start_forwarder(name, dev_port)  # publish the box's frontend onto the hub's 127.0.0.1:<dev_port>
+	return {"box": name, "container": container, "workdir": workdir, "session": claude_args,
+	        "dev_url": f"http://localhost:{dev_port}", "mounts": mounts, "tmpfs": tmpfs}
 
 
 def kill_box(name):
+	stop_forwarder(name)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True, check=True)
 	return {"killed": name}
 
@@ -182,7 +257,9 @@ def list_boxes():
 		["docker", "ps", "-a", "--filter", f"name=^box-{PROJECT}-", "--format", "{{.Names}}\t{{.Status}}"],
 		capture_output=True, text=True, check=True,
 	).stdout.strip()
-	rows = [dict(zip(("container", "status"), ln.split("\t", 1))) for ln in out.splitlines() if ln]
+	# Exclude the '-fwd' frontend-forwarder sidecars — they share the box name prefix but aren't boxes.
+	rows = [dict(zip(("container", "status"), ln.split("\t", 1))) for ln in out.splitlines()
+	        if ln and not ln.split("\t", 1)[0].endswith("-fwd")]
 	return {"boxes": rows}
 
 

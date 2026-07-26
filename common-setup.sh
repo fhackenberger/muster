@@ -22,10 +22,13 @@ export FNM_DIR
 # bash-completion for git (and other) tab-completion in interactive login shells.
 # Vim  		useful for editing code
 # Delta		for git diffs
+# socat		the broker runs it FROM the box image (--entrypoint socat) as each box's frontend
+#       	forwarder: it lives in the hub's netns and maps hub 127.0.0.1:<port> -> box:4200 so the
+#       	hub pinchtab browser can load the box's dev server as http://localhost:<port>.
 apt-get update
 apt-get install -y --no-install-recommends \
 	ca-certificates curl git bash-completion tmux less unzip libatomic1 procps jq python3 ncurses-bin \
-	vim delta
+	vim delta socat
 rm -rf /var/lib/apt/lists/*
 
 # Ghostty terminfo — the real xterm-ghostty entry (`infocmp -x xterm-ghostty` from a ghostty install,

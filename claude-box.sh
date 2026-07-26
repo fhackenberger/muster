@@ -266,8 +266,11 @@ else
 fi
 
 # pinchtab data channel. Laptop: publish the container's Angular dev server (4200) to the next
-# free host loopback port so the host Chrome can load it. Server: the dev server + Chrome live in
-# the hub, so we only pass the URL the broker gave us (Chrome loads it directly on the network).
+# free host loopback port so the host Chrome can load it. Server: Chrome lives in the HUB but the box
+# runs its OWN ng serve (bound 0.0.0.0:4200 via FRONTEND_DEV_HOST); the broker runs a per-box socat
+# forwarder in the hub's netns mapping hub 127.0.0.1:<port> -> box:4200 and sets CLAUDEBOX_DEV_URL=
+# http://localhost:<port>, so the hub Chrome loads it as localhost (allowlisted; Host stays localhost).
+# (Backend REST stays http://localhost:8080 — the hub browser and backend co-locate on the hub.)
 pick_free_port() {
 	local base=8930 p
 	for p in $(seq "$base" $((base+99))); do

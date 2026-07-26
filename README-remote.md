@@ -264,6 +264,16 @@ ssh -L 4200:$(ssh "$CBX_SERVER" "docker inspect -f '{{range .NetworkSettings.Net
   shared surface is the network (`hub:8080/4200/9867`).
 - **Broker policy:** the hub passes a box name + the manifest; the broker fixes image/uid/network/
   privileges and confines every mount source under the checkout. It is the only socket holder.
+- **pinchtab browser networking:** the pinchtab server + Chrome run on the **hub**, but each agent
+  runs its **own `ng serve` inside its box** (bound `0.0.0.0:4200`). pinchtab's IDPI allowlist has no
+  wildcard, and the browser is in a different netns, so the box name / loopback don't work directly.
+  Instead the broker runs a tiny **socat forwarder per box** (from the box image, `--entrypoint socat`,
+  in the hub's netns) mapping the hub's `127.0.0.1:<port>` → `box-<project>-<name>:4200`, and sets
+  `CLAUDEBOX_DEV_URL=http://localhost:<port>`. So `pinchtab nav "$CLAUDEBOX_DEV_URL"` loads the agent's
+  own dev loop as **localhost** — allowlisted by default, and the `Host: localhost` header keeps ng
+  serve's host-check happy (no allowlist edits, no `--disable-host-check`). The port is stable per box
+  (`data/boxes/<name>/dev-port`), reused across `cbx recreate`. Backend REST stays
+  `http://localhost:8080` (browser + backend both on the hub), so `environment.ts` needs no change.
 - **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are env-overridable in `.env`
   if the defaults don't match your dev loop. Each service runs in its own hub tmux window that
   stays alive after the process exits, so `cbx logs <svc>` can always attach to read the output.
