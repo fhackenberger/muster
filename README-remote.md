@@ -29,11 +29,14 @@ Docker + the sample-DB image. The **box / hub / box-broker images are built by t
 machine, so the stack reuses those local tags directly (no registry round-trip). No accounts, no
 toolchain install.
 
-The hub is built in **two layers**: `claude-box-hub-base` (`hub/Dockerfile.base`) carries the
-project-agnostic hub tooling (git/ssh, tmux, node, pinchtab + Chrome libs, cbx, entrypoint) on the
-`gradle:8-jdk17-jammy` base (JDK + gradle), and `claude-box-hub` (`hub/Dockerfile`) layers the extra
-infostars build deps (ant) on top. Jenkins must build the base **before** the hub; the hub's `FROM`
-resolves the base via the `HUB_BASE_IMAGE` build arg (default `…/claude-box-hub-base:stable`).
+Both the box and the hub are a lean **base** on `debian:trixie-slim` + a project **add-on**:
+`claude-box-hub-base` (`hub/Dockerfile.base`) carries the project-agnostic hub tooling (git/ssh, tmux,
+node, pinchtab + Google Chrome, cbx, entrypoint, and the uid-1000 `dev` user), and `claude-box-hub`
+layers the infostars build toolchain (JDK + gradle + ant) via the **shared `Dockerfile.addon`**
+(`--build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000`). The box mirrors this:
+`claude-box` (base) + `claude-box-infostars` (same `Dockerfile.addon`, `BASE_IMAGE=claude-box`) — the
+latter is what the broker spawns. The toolchain lives once in `build-setup.sh`; the add-on Dockerfile
+is written once. Jenkins builds each base **before** its add-on.
 
 ```sh
 # postgres + sample DB
@@ -68,7 +71,7 @@ e.g.:
     name = You
     email = you@example.com
 [credential]
-    helper = store --file=/home/gradle/.gitidentity/git-credentials
+    helper = store --file=/home/dev/.gitidentity/git-credentials
 ```
 
 and put an HTTPS token in `git-identity/git-credentials` (`https://user:token@github.com`) — or
@@ -156,7 +159,7 @@ docker compose build hub box-broker   # build just these two from this dir
 docker compose up -d                  # they now exist locally, so `missing` uses them
 ```
 
-The hub build layers `hub/Dockerfile` onto `claude-box-hub-base`. Compose pulls that base from the
+The hub build layers `Dockerfile.addon` onto `claude-box-hub-base`. Compose pulls that base from the
 registry by default, so the above just works when `docker login` has run. To build **fully offline**
 (or after editing `hub/Dockerfile.base`), build the base first and point the hub at the local tag:
 
@@ -264,16 +267,26 @@ ssh -L 4200:$(ssh "$CBX_SERVER" "docker inspect -f '{{range .NetworkSettings.Net
   shared surface is the network (`hub:8080/4200/9867`).
 - **Broker policy:** the hub passes a box name + the manifest; the broker fixes image/uid/network/
   privileges and confines every mount source under the checkout. It is the only socket holder.
-- **pinchtab browser networking:** the pinchtab server + Chrome run on the **hub**, but each agent
-  runs its **own `ng serve` inside its box** (bound `0.0.0.0:4200`). pinchtab's IDPI allowlist has no
-  wildcard, and the browser is in a different netns, so the box name / loopback don't work directly.
-  Instead the broker runs a tiny **socat forwarder per box** (from the box image, `--entrypoint socat`,
-  in the hub's netns) mapping the hub's `127.0.0.1:<port>` → `box-<project>-<name>:4200`, and sets
-  `CLAUDEBOX_DEV_URL=http://localhost:<port>`. So `pinchtab nav "$CLAUDEBOX_DEV_URL"` loads the agent's
-  own dev loop as **localhost** — allowlisted by default, and the `Host: localhost` header keeps ng
-  serve's host-check happy (no allowlist edits, no `--disable-host-check`). The port is stable per box
-  (`data/boxes/<name>/dev-port`), reused across `cbx recreate`. Backend REST stays
-  `http://localhost:8080` (browser + backend both on the hub), so `environment.ts` needs no change.
+- **Shared caches:** the hub and every box mount the SAME `data/npm-cache` and `data/gradle-cache`
+  (rw) at `~/.npm` and `~/.gradle`, so node/gradle artifacts are downloaded once — no per-box
+  duplication on the host. uid 1000 owns them (the `dev`/`gradle` users share it), and npm/gradle
+  both lock the cache for concurrent access. (The `~/.m2` Maven cache is separate: read-only from
+  Jenkins.)
+- **Port forwards (pinchtab browser + own-backend dev loops):** the pinchtab server + Chrome run on
+  the **hub**, but each agent runs its OWN dev services inside its box (`ng serve`, and optionally its
+  own backend). pinchtab's IDPI allowlist has no wildcard and the browser is in a different netns, so
+  the box name / box loopback don't work directly. Instead the **`port-forwards`** manifest (grammar
+  `NAME BOX_PORT HUB_BASE_PORT`, like `box-mounts`) tells the broker to publish each box's services on
+  the **hub's loopback**: a box in slot N gets a socat (in the hub's netns, run from the box image)
+  mapping hub `127.0.0.1:(HUB_BASE_PORT + N)` → `box:BOX_PORT`. The box receives `PORT_FORWARDS` +
+  `PORT_FORWARD_<NAME>_FROM`/`_TO_HUB`, and the **project's own scripts** turn those into e.g.
+  `CLAUDEBOX_DEV_URL=http://localhost:$PORT_FORWARD_FRONTEND_TO_HUB` (pinchtab loads the frontend) and
+  the frontend's backend URL `http://localhost:$PORT_FORWARD_BACKEND_TO_HUB` (so an agent's frontend
+  hits its OWN backend). Everything is `localhost` from the hub browser — allowlisted by default, and
+  `Host: localhost` passes ng serve's host-check. Concurrency is bounded by `PORT_FORWARD_SLOTS`
+  (default 16); the broker refuses to spawn once slots are exhausted. The slot is stable per box
+  (`data/boxes/<name>/slot`), reused across `cbx recreate`. (Project scripts must also bind those
+  services to `0.0.0.0` in the box so the forwarder can reach them.)
 - **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are env-overridable in `.env`
   if the defaults don't match your dev loop. Each service runs in its own hub tmux window that
   stays alive after the process exits, so `cbx logs <svc>` can always attach to read the output.

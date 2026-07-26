@@ -52,15 +52,22 @@ services:
     environment:
       BROKER_TOKEN: ${BROKER_TOKEN}
       PROJECT_NAME: ${PROJECT_NAME}
-      BOX_IMAGE: ${BOX_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box:stable}
+      BOX_IMAGE: ${BOX_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-infostars:stable}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       PROJECT_ROOT: ${STACK_DIR}/data/checkout
       CLAUDE_HOME: ${STACK_DIR}/data/claude
+      # Shared package caches mounted rw into every box (and the hub) at ~/.npm and ~/.gradle, so
+      # node/gradle artifacts are downloaded once instead of duplicated per box.
+      NPM_CACHE: ${STACK_DIR}/data/npm-cache
+      GRADLE_CACHE: ${STACK_DIR}/data/gradle-cache
       BOXROOT: ${STACK_DIR}/data/boxes
       BOX_MOUNTS: ${STACK_DIR}/box-mounts
       PINCHTAB_SERVER: http://hub:9867
       PINCHTAB_TOKEN: ${PT_TOKEN}
-      DEV_URL: http://hub:4200
+      # Per-project port forwards (like box-mounts): NAME BOX_PORT HUB_BASE_PORT per line. Each box
+      # gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
+      PORT_FORWARDS_FILE: ${STACK_DIR}/port-forwards
+      PORT_FORWARD_SLOTS: ${PORT_FORWARD_SLOTS:-16}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # host paths must resolve identically inside the broker so the boxes' -v binds land on the host
@@ -74,13 +81,16 @@ services:
     image: ${HUB_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
-      context: hub
-      # The hub image (Dockerfile) layers the extra infostars build deps (ant) onto the
-      # project-agnostic claude-box-hub-base (Dockerfile.base). A local build (COMPOSE_PULL_POLICY=
-      # build) resolves the base from the registry by default; point this at a locally-built tag to
-      # build fully offline (build Dockerfile.base first — see README-remote.md).
+      # The hub image = the shared Dockerfile.addon (JDK/gradle/ant via build-setup.sh) layered onto
+      # claude-box-hub-base (hub/Dockerfile.base). Same add-on file the box uses; FINAL_USER=1000 keeps
+      # the hub running as its uid-1000 'dev' user. A local build (COMPOSE_PULL_POLICY=build) resolves
+      # the base from the registry by default; point BASE_IMAGE at a locally-built tag to build offline
+      # (build hub/Dockerfile.base first — see README-remote.md).
+      context: .
+      dockerfile: Dockerfile.addon
       args:
-        HUB_BASE_IMAGE: ${HUB_BASE_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub-base:stable}
+        BASE_IMAGE: ${HUB_BASE_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub-base:stable}
+        FINAL_USER: "1000"
     hostname: ${PROJECT_NAME}-hub
     init: true
     depends_on: [db, redis, box-broker]
@@ -90,7 +100,7 @@ services:
       BROKER_URL: http://box-broker:8099
       BROKER_TOKEN: ${BROKER_TOKEN}
       BOX_MOUNTS: /work/box-mounts
-      GIT_CONFIG_GLOBAL: /home/gradle/.gitidentity/gitconfig
+      GIT_CONFIG_GLOBAL: /home/dev/.gitidentity/gitconfig
       # backend wiring (confirmed keys; env overrides the baked-in config.properties defaults)
       DB_INFOSTARS_PSQL_URL: jdbc:postgresql://db:5432/infotrack_dev
       DB_INFOSTARS_PSQL_USER: infostars_u
@@ -106,12 +116,16 @@ services:
     volumes:
       - ./data/checkout:/work/checkout
       - ./box-mounts:/work/box-mounts
-      - ./data/claude:/home/gradle/.claude
-      - ./data/pinchtab:/home/gradle/.pinchtab
-      - ./git-identity:/home/gradle/.gitidentity
+      - ./data/claude:/home/dev/.claude
+      - ./data/pinchtab:/home/dev/.pinchtab
+      - ./git-identity:/home/dev/.gitidentity
+      # Shared package caches — the SAME dirs the broker mounts into every box (~/.npm, ~/.gradle) —
+      # so the hub and all boxes download node/gradle artifacts once instead of duplicating them.
+      - ./data/npm-cache:/home/dev/.npm
+      - ./data/gradle-cache:/home/dev/.gradle
       # Jenkins' pre-populated Maven cache, mounted READ-ONLY at the hub user's default local repo
-      # (~/.m2/repository, since the hub runs as uid 1000 with HOME=/home/gradle). Maven/gradle then
+      # (~/.m2/repository, since the hub runs as uid 1000 with HOME=/home/dev). Maven/gradle then
       # resolve dependencies from Jenkins' cache without re-downloading; read-only so a build can
       # never mutate the shared cache. Host path is overridable via MAVEN_REPO_HOST in .env.
-      - ${MAVEN_REPO_HOST:-/var/jenkins_home/.m2/repository}:/home/gradle/.m2/repository:ro
+      - ${MAVEN_REPO_HOST:-/var/jenkins_home/.m2/repository}:/home/dev/.m2/repository:ro
     restart: unless-stopped

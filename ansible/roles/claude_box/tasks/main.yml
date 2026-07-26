@@ -24,6 +24,9 @@
       - /virtual_machines/claude-box-docker/data/claude/
       - /virtual_machines/claude-box-docker/data/boxes/
       - /virtual_machines/claude-box-docker/data/pinchtab/
+      # Shared npm + gradle caches (mounted rw into the hub + every box at ~/.npm and ~/.gradle)
+      - /virtual_machines/claude-box-docker/data/npm-cache/
+      - /virtual_machines/claude-box-docker/data/gradle-cache/
     tags: [containers-claude-box-files]
 
   # ---- compose env file ----
@@ -50,6 +53,16 @@
     template:
       src: templates/docker-compose/claude-box/box-mounts
       dest: /virtual_machines/claude-box-docker/box-mounts
+      owner: root
+      group: root
+      mode: "u=rw,g=,o="
+      backup: no
+    tags: [containers-claude-box-files]
+
+  - name: Claude box port-forwards for infostars
+    template:
+      src: templates/docker-compose/claude-box/port-forwards
+      dest: /virtual_machines/claude-box-docker/port-forwards
       owner: root
       group: root
       mode: "u=rw,g=,o="

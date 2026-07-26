@@ -1,5 +1,5 @@
 #!/bin/sh
-# git core.sshCommand wrapper (baked into the hub image; see hub/Dockerfile).
+# git core.sshCommand wrapper (baked into the hub image; see hub/Dockerfile.base).
 #
 # Lets the hub clone/fetch/push over SSH using WHATEVER private key(s) live in the mounted identity
 # dir (~/.gitidentity) — any type (ed25519 / rsa / ecdsa), not a hard-coded filename — and trust a

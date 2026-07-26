@@ -265,12 +265,12 @@ else
 	fi
 fi
 
-# pinchtab data channel. Laptop: publish the container's Angular dev server (4200) to the next
-# free host loopback port so the host Chrome can load it. Server: Chrome lives in the HUB but the box
-# runs its OWN ng serve (bound 0.0.0.0:4200 via FRONTEND_DEV_HOST); the broker runs a per-box socat
-# forwarder in the hub's netns mapping hub 127.0.0.1:<port> -> box:4200 and sets CLAUDEBOX_DEV_URL=
-# http://localhost:<port>, so the hub Chrome loads it as localhost (allowlisted; Host stays localhost).
-# (Backend REST stays http://localhost:8080 — the hub browser and backend co-locate on the hub.)
+# pinchtab data channel. Laptop: publish the container's Angular dev server (4200) to the next free
+# host loopback port so the host Chrome can load it. Server: Chrome lives in the HUB and each box runs
+# its own dev services; the broker publishes them on the hub's loopback per the project's port-forwards
+# manifest and passes the box PORT_FORWARDS / PORT_FORWARD_<NAME>_* (forwarded into the box as PF_ENV
+# below). The project's own scripts turn those into CLAUDEBOX_DEV_URL etc. — all http://localhost:<hub
+# port>, which pinchtab loads (allowlisted; Host stays localhost).
 pick_free_port() {
 	local base=8930 p
 	for p in $(seq "$base" $((base+99))); do
@@ -281,6 +281,12 @@ pick_free_port() {
 }
 DEV_ENV=(); DEV_PUBLISH=()
 if [ "$HEADLESS" = 1 ]; then
+	# Default CLAUDEBOX_DEV_URL from the FRONTEND port-forward (the box's own ng serve, published on the
+	# hub loopback as localhost:<hub port>) unless the project already set it. FRONTEND_DEV_HOST=0.0.0.0
+	# makes ng serve bind all interfaces so the hub-netns forwarder can reach it. Other forwards (e.g. a
+	# BACKEND) stay in PORT_FORWARD_* for the project's own scripts to wire.
+	[ -z "${CLAUDEBOX_DEV_URL:-}" ] && [ -n "${PORT_FORWARD_FRONTEND_TO_HUB:-}" ] \
+		&& CLAUDEBOX_DEV_URL="http://localhost:${PORT_FORWARD_FRONTEND_TO_HUB}"
 	[ -n "${CLAUDEBOX_DEV_URL:-}" ] && DEV_ENV=(-e FRONTEND_DEV_HOST=0.0.0.0 -e CLAUDEBOX_DEV_URL="$CLAUDEBOX_DEV_URL")
 elif DEV_PORT="$(pick_free_port)"; then
 	DEV_PUBLISH=(-p "127.0.0.1:${DEV_PORT}:4200")
@@ -359,6 +365,16 @@ NAME_NET=()
 DISPLAY_ENV=()
 [ "$HEADLESS" != 1 ] && DISPLAY_ENV=(-e DISPLAY="$DISPLAY")
 
+# Forward the broker's PORT_FORWARDS / PORT_FORWARD_<NAME>_FROM/_TO_HUB env into the box (server mode).
+# The project's OWN scripts inside the box read these to wire e.g. CLAUDEBOX_DEV_URL and the frontend's
+# backend URL to the matching hub ports. `-e NAME` (no value) passes the current value from this env.
+PF_ENV=()
+while IFS='=' read -r _pf_name _; do
+	case "$_pf_name" in
+		PORT_FORWARDS|PORT_FORWARD_*) PF_ENV+=(-e "$_pf_name") ;;
+	esac
+done < <(env)
+
 WORKDIR="$ORIG_PWD"
 [ "$HEADLESS" = 1 ] && WORKDIR="${CLAUDEBOX_WORKDIR:-$HOME_IN}"
 
@@ -399,6 +415,7 @@ $DOCKER run "${RUN_FLAGS[@]}" \
 	"${PT_ENV[@]}" \
 	"${DEV_ENV[@]}" \
 	"${DEV_PUBLISH[@]}" \
+	"${PF_ENV[@]}" \
 	"${MOUNTS[@]}" \
 	"${TMPFS_ARGS[@]}" \
 	-w "$WORKDIR" \

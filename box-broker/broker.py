@@ -22,7 +22,8 @@ Config (env, from compose):
   BOXROOT             HOST path whose <name>/home subdir is each box's empty home anchor
   BOX_MOUNTS          HOST path of the box-mounts manifest
   PINCHTAB_SERVER     e.g. http://hub:9867     PINCHTAB_TOKEN  the pinchtab token
-  DEV_URL             e.g. http://hub:4200
+  PORT_FORWARDS_FILE  HOST path of the port-forwards manifest (NAME BOX_PORT HUB_BASE_PORT per line)
+  PORT_FORWARD_SLOTS  max concurrent boxes with forwards; each box's slot N -> hub port BASE+N (dflt 16)
   BOX_UID/BOX_GID     synthetic non-root identity inside the box (default 1000/1000)
   CLAUDEBOX_SCRIPT    path to claude-box.sh (default /usr/local/bin/claude-box.sh)
 """
@@ -41,11 +42,19 @@ BOX_IMAGE = os.environ.get("BOX_IMAGE", "claude-box")
 BOX_NETWORK = os.environ.get("BOX_NETWORK", "")
 PROJECT_ROOT = os.path.realpath(os.environ.get("PROJECT_ROOT", "/work/checkout"))
 CLAUDE_HOME = os.environ.get("CLAUDE_HOME", "")
+# Shared package caches mounted (rw) into every box AND the hub at ~/.npm and ~/.gradle, so node/gradle
+# artifacts are downloaded once, not duplicated per box. uid 1000 (dev/gradle) owns them; npm + gradle
+# both handle concurrent access to a shared cache via their own file locks.
+NPM_CACHE = os.environ.get("NPM_CACHE", "")
+GRADLE_CACHE = os.environ.get("GRADLE_CACHE", "")
 BOXROOT = os.environ.get("BOXROOT", "")
 BOX_MOUNTS = os.environ.get("BOX_MOUNTS", "")
 PT_SERVER = os.environ.get("PINCHTAB_SERVER", "")
 PT_TOKEN = os.environ.get("PINCHTAB_TOKEN", "")
-DEV_URL = os.environ.get("DEV_URL", "")
+# Per-project port forwards (like box-mounts). File grammar: 'NAME BOX_PORT HUB_BASE_PORT' per line;
+# each box gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
+PORT_FORWARDS_FILE = os.environ.get("PORT_FORWARDS_FILE", "")
+PORT_FORWARD_SLOTS = int(os.environ.get("PORT_FORWARD_SLOTS", "16"))
 BOX_UID = os.environ.get("BOX_UID", "1000")
 BOX_GID = os.environ.get("BOX_GID", "1000")
 CLAUDEBOX_SCRIPT = os.environ.get("CLAUDEBOX_SCRIPT", "/usr/local/bin/claude-box.sh")
@@ -61,12 +70,13 @@ def box_container(name):
 	return f"box-{PROJECT}-{name}"
 
 
-def fwd_container(name):
-	return f"{box_container(name)}-fwd"
+def pf_container(name, fwd_name):
+	# Distinct prefix (pf-, not box-) so these sidecars don't match the box listing filter.
+	return f"pf-{PROJECT}-{name}-{fwd_name.lower()}"
 
 
 def hub_container():
-	"""The hub container id (via its compose labels), or None. Needed as the netns for the forwarder."""
+	"""The hub container id (via its compose labels), or None. It is the netns the forwarders join."""
 	r = subprocess.run(
 		["docker", "ps", "-q", "-f", f"label=com.docker.compose.project={PROJECT}",
 		 "-f", "label=com.docker.compose.service=hub"],
@@ -76,56 +86,85 @@ def hub_container():
 	return ids[0] if ids else None
 
 
-def alloc_dev_port(box_dir):
-	"""Stable per-box hub-loopback port for the frontend forwarder, persisted in the box dir so a
-	recreate keeps the same URL. Picks the lowest free port in 4300-4399 across all boxes."""
-	pf = os.path.join(box_dir, "dev-port")
-	if os.path.exists(pf):
+def parse_port_forwards():
+	"""Per-project forwards from PORT_FORWARDS_FILE (like box-mounts). One line each:
+	    NAME BOX_PORT HUB_BASE_PORT      e.g. 'FRONTEND 4200 4300'
+	Returns [(name, box_port, hub_base)]. For a box in slot N, the hub publishes NAME on
+	127.0.0.1:(HUB_BASE_PORT + N). '#'/blank lines ignored; empty/missing file -> no forwards."""
+	fwds = []
+	if not PORT_FORWARDS_FILE or not os.path.exists(PORT_FORWARDS_FILE):
+		return fwds
+	with open(PORT_FORWARDS_FILE) as fh:
+		for raw in fh:
+			line = raw.strip()
+			if not line or line.startswith("#"):
+				continue
+			parts = line.split()
+			if len(parts) != 3:
+				raise ValueError(f"bad port-forwards line {raw.strip()!r} (want: NAME BOX_PORT HUB_BASE_PORT)")
+			fwds.append((parts[0], int(parts[1]), int(parts[2])))
+	return fwds
+
+
+def alloc_slot(box_dir):
+	"""Stable per-box slot index (0..PORT_FORWARD_SLOTS-1), persisted so a recreate keeps the same hub
+	ports. Raises when every slot is taken (refuse to spawn — we're out of forward ports)."""
+	sf = os.path.join(box_dir, "slot")
+	if os.path.exists(sf):
 		try:
-			return int(open(pf).read().strip())
+			return int(open(sf).read().strip())
 		except ValueError:
 			pass
 	used = set()
 	if BOXROOT and os.path.isdir(BOXROOT):
 		for d in os.listdir(BOXROOT):
-			f = os.path.join(BOXROOT, d, "dev-port")
+			f = os.path.join(BOXROOT, d, "slot")
 			if os.path.exists(f):
 				try:
 					used.add(int(open(f).read().strip()))
 				except ValueError:
 					pass
-	for port in range(4300, 4400):
-		if port not in used:
-			with open(pf, "w") as fh:
-				fh.write(str(port))
-			return port
-	raise RuntimeError("no free frontend-forwarder port in 4300-4399")
+	for slot in range(PORT_FORWARD_SLOTS):
+		if slot not in used:
+			with open(sf, "w") as fh:
+				fh.write(str(slot))
+			return slot
+	raise RuntimeError(f"out of port-forward slots (max {PORT_FORWARD_SLOTS} concurrent boxes) — kill a box first")
 
 
-def start_forwarder(name, port):
-	"""Publish the box's ng serve (0.0.0.0:4200) onto the HUB's loopback at 127.0.0.1:<port>, so the
-	hub's pinchtab browser loads it as http://localhost:<port> — allowlisted by default, and the Host
-	header stays 'localhost' so ng serve's host-check passes (no per-box allowlist / no --disable-host-
-	check). socat runs FROM the box image in the hub's netns (--network container:<hub>), so bind=
-	127.0.0.1 is the hub's loopback and the box name resolves via the hub's cbx-network DNS."""
+def start_forwarders(name, slot, forwards):
+	"""One socat per forward, in the HUB's netns, mapping hub 127.0.0.1:(base+slot) -> box:box_port. So
+	the hub browser (and anything on the hub) reaches each box service as http://localhost:<hub_port> —
+	allowlisted by default, Host stays localhost. socat runs FROM the box image (--entrypoint socat) in
+	the hub's netns (--network container:<hub>), so bind=127.0.0.1 is the hub loopback and the box name
+	resolves via the hub's cbx-network DNS."""
+	if not forwards:
+		return
 	hub = hub_container()
 	if not hub:
-		print(f"box-broker: no hub container found — skipping frontend forwarder for {name}", flush=True)
+		print(f"box-broker: no hub container found — skipping port-forwards for {name}", flush=True)
 		return
-	fwd = fwd_container(name)
-	subprocess.run(["docker", "rm", "-f", fwd], capture_output=True, text=True)
-	r = subprocess.run(
-		["docker", "run", "-d", "--name", fwd, "--network", f"container:{hub}",
-		 "--entrypoint", "socat", BOX_IMAGE,
-		 f"TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr", f"TCP:{box_container(name)}:4200"],
+	for fwd_name, box_port, hub_base in forwards:
+		hub_port = hub_base + slot
+		c = pf_container(name, fwd_name)
+		subprocess.run(["docker", "rm", "-f", c], capture_output=True, text=True)
+		r = subprocess.run(
+			["docker", "run", "-d", "--name", c, "--network", f"container:{hub}",
+			 "--entrypoint", "socat", BOX_IMAGE,
+			 f"TCP-LISTEN:{hub_port},bind=127.0.0.1,fork,reuseaddr", f"TCP:{box_container(name)}:{box_port}"],
+			capture_output=True, text=True,
+		)
+		if r.returncode != 0:
+			print(f"box-broker: forward {fwd_name} ({name}) failed: {r.stderr.strip()}", flush=True)
+
+
+def stop_forwarders(name):
+	ids = subprocess.run(
+		["docker", "ps", "-aq", "-f", f"name=^pf-{PROJECT}-{name}-"],
 		capture_output=True, text=True,
-	)
-	if r.returncode != 0:
-		print(f"box-broker: frontend forwarder for {name} failed: {r.stderr.strip()}", flush=True)
-
-
-def stop_forwarder(name):
-	subprocess.run(["docker", "rm", "-f", fwd_container(name)], capture_output=True, text=True)
+	).stdout.split()
+	if ids:
+		subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, text=True)
 
 
 def safe_dst(dst):
@@ -211,8 +250,20 @@ def create_box(name, resume=False):
 		with open(session_file, "w") as fh:
 			fh.write(sid)
 		claude_args = f"--session-id {sid}"
-	dev_port = alloc_dev_port(box_dir)
+	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at
+	# 127.0.0.1:(HUB_BASE_PORT + slot). The box gets PORT_FORWARDS + PORT_FORWARD_<NAME>_FROM/_TO_HUB so
+	# the project's own scripts can wire e.g. CLAUDEBOX_DEV_URL and the frontend's backend URL. Running
+	# out of slots refuses the spawn (alloc_slot raises).
+	forwards = parse_port_forwards()
+	slot = alloc_slot(box_dir) if forwards else None
 	mounts, tmpfs, workdir = parse_manifest()
+	# Shared package caches (rw) at ~/.npm and ~/.gradle — one copy across the hub + all boxes, so
+	# node/gradle don't re-download per box. The dirs are created + chowned to the box uid here.
+	for cache_host, cache_dst in ((NPM_CACHE, f"{HOME_IN}/.npm"), (GRADLE_CACHE, f"{HOME_IN}/.gradle")):
+		if cache_host:
+			os.makedirs(cache_host, exist_ok=True)
+			os.chown(cache_host, int(BOX_UID), int(BOX_GID))
+			mounts.append(f"{cache_host}:{cache_dst}")
 	env = dict(os.environ)
 	env.update(
 		CLAUDEBOX_HEADLESS="1",
@@ -229,25 +280,28 @@ def create_box(name, resume=False):
 		CLAUDEBOX_CLAUDE_ARGS=claude_args,
 		CLAUDEBOX_PINCHTAB_SERVER=PT_SERVER,
 		CLAUDEBOX_PINCHTAB_TOKEN=PT_TOKEN,
-		# The box runs its OWN ng serve (0.0.0.0:4200 via FRONTEND_DEV_HOST). The hub's pinchtab browser
-		# can't use the box name (pinchtab's IDPI allowlist has no wildcard) nor loopback (different
-		# netns), so start_forwarder() below publishes it onto the hub's 127.0.0.1:<dev_port>; the box
-		# is told to point pinchtab at that localhost URL (allowlisted by default; Host stays localhost).
-		CLAUDEBOX_DEV_URL=f"http://localhost:{dev_port}",
 		CLAUDEBOX_EXTRA_MOUNTS="\n".join(mounts),
 		CLAUDEBOX_EXTRA_TMPFS="\n".join(tmpfs),
 		HOME="/tmp",
 	)
+	forward_ports = {}
+	if forwards:
+		env["PORT_FORWARDS"] = ",".join(f[0] for f in forwards)
+		for fwd_name, box_port, hub_base in forwards:
+			hub_port = hub_base + slot
+			forward_ports[fwd_name] = hub_port
+			env[f"PORT_FORWARD_{fwd_name}_FROM"] = str(box_port)
+			env[f"PORT_FORWARD_{fwd_name}_TO_HUB"] = str(hub_port)
 	proc = subprocess.run([CLAUDEBOX_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude-box.sh failed")
-	start_forwarder(name, dev_port)  # publish the box's frontend onto the hub's 127.0.0.1:<dev_port>
+	start_forwarders(name, slot, forwards)  # after the box exists
 	return {"box": name, "container": container, "workdir": workdir, "session": claude_args,
-	        "dev_url": f"http://localhost:{dev_port}", "mounts": mounts, "tmpfs": tmpfs}
+	        "slot": slot, "forwards": forward_ports, "mounts": mounts, "tmpfs": tmpfs}
 
 
 def kill_box(name):
-	stop_forwarder(name)
+	stop_forwarders(name)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True, check=True)
 	return {"killed": name}
 
@@ -257,9 +311,7 @@ def list_boxes():
 		["docker", "ps", "-a", "--filter", f"name=^box-{PROJECT}-", "--format", "{{.Names}}\t{{.Status}}"],
 		capture_output=True, text=True, check=True,
 	).stdout.strip()
-	# Exclude the '-fwd' frontend-forwarder sidecars — they share the box name prefix but aren't boxes.
-	rows = [dict(zip(("container", "status"), ln.split("\t", 1))) for ln in out.splitlines()
-	        if ln and not ln.split("\t", 1)[0].endswith("-fwd")]
+	rows = [dict(zip(("container", "status"), ln.split("\t", 1))) for ln in out.splitlines() if ln]
 	return {"boxes": rows}
 
 

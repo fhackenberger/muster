@@ -1,25 +1,25 @@
 # claude-box-hub-base — the PROJECT-AGNOSTIC hub base image.
 #
-# Everything a claude-box "hub" needs regardless of the project it hosts: git + ssh for the
-# checkout, tmux for the on-demand service windows, node/npm, the pinchtab server + Google Chrome
-# (the real browser pinchtab drives), and the cbx helper + entrypoint. A per-project image builds ON
-# TOP of this (see Dockerfile) to add that project's extra build deps (e.g. ant).
+# debian:trixie-slim + common-setup.sh (the same generic runtime the box uses) + the hub-only tooling:
+# openssh, Google Chrome (for the pinchtab server), git-ssh, cbx, and the hub entrypoint. No JDK/gradle
+# — the infostars build toolchain layers on top via Dockerfile.addon (-> claude-box-hub).
 #
-# JDK17 + gradle 8 on jammy is the base OS (the same gradle:8-jdk17-jammy the hub used before the
-# split), so JAVA_HOME, the gradle install, and the non-root 'gradle' user (uid/gid 1000, home
-# /home/gradle) all come from the base image — every bind mount (/home/gradle/.claude, .pinchtab,
-# .gitidentity, .m2/repository) and all uid-1000 file ownership line up exactly as before.
+# The hub runs headless as a single uid-1000 user 'dev' with home /home/dev — the SAME identity the
+# boxes use on the server — so every bind mount (/home/dev/.claude, .pinchtab, .gitidentity, .npm,
+# .gradle, .m2) and the shared caches land at one path everywhere. (The box materializes its user
+# dynamically at runtime; the hub's is created here.)
 #
 # BUILD CONTEXT = the claude-box dir (NOT hub/), so this can COPY the shared common-setup.sh at its
-# root; the hub's own files are therefore referenced as hub/<file>. Build it with, e.g.:
+# root; the hub's own files are referenced as hub/<file>. Build it with, e.g.:
 #   docker build -f hub/Dockerfile.base -t claude-box-hub-base .
-FROM gradle:8-jdk17-jammy
+FROM debian:trixie-slim
 
-USER root
+# The hub's uid-1000 user. Home /home/dev matches the boxes' server user, unifying every bind-mount path.
+RUN groupadd -g 1000 dev \
+	&& useradd -m -u 1000 -g 1000 -s /bin/bash dev
 
-# Shared tooling (base utils, Node + npm via fnm, the pinchtab binary) — installed by common-setup.sh,
-# the SAME script the claude-box image uses, so the toolchain is defined in one place. Version pins
-# come from build args (the Jenkins pipeline passes them explicitly).
+# Shared tooling (base utils, Node + npm via fnm, the pinchtab binary, tmux, git bash-completion, the
+# ghostty terminfo, socat) — installed by common-setup.sh, the SAME script the claude-box image uses.
 ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
 ARG PINCHTAB_VERSION=0.13.2
@@ -29,11 +29,9 @@ RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION
 		sh /tmp/common-setup.sh \
 	&& rm /tmp/common-setup.sh
 
-# Hub-specific runtime deps (the shared ones — incl. tmux — came from common-setup.sh above).
-# openssh-client clones + commits. Google Chrome is for the pinchtab SERVER: pinchtab drives a REAL
-# system browser (it has no download-your-own-Chrome step — browser.binary defaults to auto-detect),
-# so the hub must ship one. google-chrome-stable's .deb pulls in ALL the Chrome runtime libs, so we
-# no longer hand-maintain that list; xauth/xvfb remain for the headless X plumbing.
+# Hub-specific runtime deps. openssh-client clones + commits. Google Chrome is for the pinchtab SERVER
+# (pinchtab drives a REAL system browser); google-chrome-stable's .deb pulls in all the Chrome runtime
+# libs. xauth/xvfb are the headless X plumbing. curl comes from common-setup above.
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		openssh-client xauth xvfb gnupg \
 	&& curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
@@ -46,19 +44,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV NG_CLI_ANALYTICS=false
 
-# Git-over-SSH for the checkout, baked system-wide (applies without any per-stack gitconfig; a
-# mounted ~/.gitidentity/gitconfig can still override). The wrapper offers whatever private key(s)
-# live in the mounted identity dir (any type, not just ed25519) and trusts a provider's host key on
-# first connect. entrypoint.sh pre-seeds known_hosts for the REPO_URL host.
+# Git-over-SSH for the checkout, baked system-wide (applies without any per-stack gitconfig; a mounted
+# ~/.gitidentity/gitconfig can still override). The wrapper offers whatever private key(s) live in the
+# mounted identity dir and trusts a provider's host key on first connect; entrypoint.sh pre-seeds
+# known_hosts for the REPO_URL host.
 COPY hub/git-ssh /usr/local/bin/git-ssh
 RUN chmod 0755 /usr/local/bin/git-ssh \
 	&& git config --system core.sshCommand /usr/local/bin/git-ssh
 
-# Helper CLI (cbx: start/stop services, spawn/kill boxes via the broker) + entrypoint.
+# Helper CLI (cbx: start/stop services, spawn/kill/recreate boxes via the broker) + entrypoint.
 COPY hub/cbx /usr/local/bin/cbx
 COPY hub/entrypoint.sh /usr/local/bin/hub-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/cbx /usr/local/bin/hub-entrypoint.sh
 
 USER 1000
-WORKDIR /home/gradle
+WORKDIR /home/dev
 ENTRYPOINT ["/usr/local/bin/hub-entrypoint.sh"]

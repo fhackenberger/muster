@@ -1,0 +1,21 @@
+# port-forwards — services the hub publishes on its loopback per box, so the hub's pinchtab browser
+# (and anything on the hub) can reach each agent's OWN dev services as http://localhost:<port>.
+# Copy to `port-forwards` in the stack dir and edit. Empty/absent file = no forwards.
+#
+# Grammar (whitespace-separated; '#'/blank ignored):
+#   NAME  BOX_PORT  HUB_BASE_PORT
+#
+# For a box in slot N the broker runs a socat in the hub's netns mapping the hub's
+# 127.0.0.1:(HUB_BASE_PORT + N) -> box:BOX_PORT, and passes the box these env vars:
+#   PORT_FORWARDS=NAME[,NAME...]
+#   PORT_FORWARD_<NAME>_FROM=<BOX_PORT>     PORT_FORWARD_<NAME>_TO_HUB=<HUB_BASE_PORT + N>
+# The project's own scripts read those to wire e.g. CLAUDEBOX_DEV_URL (pinchtab) and the frontend's
+# backend URL to the matching hub ports, and to bind those services to 0.0.0.0 in the box.
+#
+# The number of concurrent boxes with forwards is bounded by PORT_FORWARD_SLOTS (.env, default 16);
+# the broker refuses to spawn once the slots are exhausted. Keep each service's HUB_BASE_PORT ranges
+# far enough apart that BASE+slot never collides across services.
+
+# Example (an agent runs its own frontend + backend and points the frontend at its own backend):
+#   FRONTEND  4200  4300
+#   BACKEND   8080  8900

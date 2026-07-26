@@ -1,0 +1,25 @@
+# Dockerfile.addon — the infostars project build toolchain (JDK + gradle + ant, via build-setup.sh)
+# layered onto EITHER base image. Written ONCE for both add-on images; pick the base with BASE_IMAGE:
+#   box add-on:  --build-arg BASE_IMAGE=claude-box                                    -> claude-box-infostars
+#   hub add-on:  --build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000 -> claude-box-hub
+# Context = the claude-box dir (so build-setup.sh at the root is COPYable). build-setup.sh is the ONE
+# place the toolchain versions live; this file just chooses the base + restores the runtime user.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+
+ARG GRADLE_VERSION=8.10.2
+COPY build-setup.sh /tmp/build-setup.sh
+RUN GRADLE_VERSION="${GRADLE_VERSION}" sh /tmp/build-setup.sh \
+	&& rm /tmp/build-setup.sh
+
+# JAVA_HOME/GRADLE_HOME are fixed under /opt. GRADLE_USER_HOME is deliberately NOT set: gradle defaults
+# to ~/.gradle, which for the uid-1000 'dev' user is /home/dev/.gradle — the shared gradle cache mount.
+ENV JAVA_HOME=/opt/java \
+	GRADLE_HOME=/opt/gradle
+
+# Restore the runtime user: the hub runs as uid 1000; the box stays root and drops privileges in its
+# own entrypoint. ENTRYPOINT / CMD / WORKDIR are inherited from the base image.
+ARG FINAL_USER=root
+USER ${FINAL_USER}
