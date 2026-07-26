@@ -61,22 +61,41 @@ svc_logs() {
 
 broker() {
 	local method="$1" path="$2"; shift 2
-	curl -fsS -X "$method" -H "X-Broker-Token: $BROKER_TOKEN" "$@" "${BROKER_URL}${path}"
+	# --fail-with-body (curl >= 7.76; present on the jammy hub): like -f it still returns non-zero on
+	# HTTP >= 400 so callers' `&&` chains detect failure, but UNLIKE -f it prints the response body,
+	# so the broker's {"error": "..."} is shown instead of a bare "curl: (22) ... error: 500".
+	curl --fail-with-body -sS -X "$method" -H "X-Broker-Token: $BROKER_TOKEN" "$@" "${BROKER_URL}${path}"
 }
 
 box_new() {
 	local name="${1:-$(cut -c1-6 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)}"
-	broker POST "/box/$name" && echo "cbx: box '$name' up — attach from the host:" \
-		&& echo "  docker exec -it box-\${PROJECT}-$name tmux attach -t main"
+	local resp container
+	resp="$(broker POST "/box/$name")" || die "spawning box '$name' failed: $resp"
+	# The broker returns the REAL container name in its JSON — surface that (not a literal
+	# ${PROJECT} placeholder) and don't dump the raw response at the user.
+	container="$(printf '%s' "$resp" | jq -r '.container // empty' 2>/dev/null)" || container=""
+	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+	echo "cbx: box '$name' up as container '$container'. Attach from the host with:"
+	echo "  docker exec -it $container tmux attach -t main      # Ctrl-b d to detach"
 }
 
-box_kill() { [ $# -ge 1 ] || die "kill needs a box name"; broker DELETE "/box/$1" && echo "cbx: killed box '$1'"; }
+box_kill() {
+	[ $# -ge 1 ] || die "kill needs a box name"
+	local resp
+	resp="$(broker DELETE "/box/$1")" || die "killing box '$1' failed: $resp"
+	echo "cbx: killed box '$1'"
+}
 
 box_ls() {
 	echo "== services (tmux) =="
 	tmux list-windows -t "$TMUX_SESSION" -F '  #W' 2>/dev/null || echo "  (none)"
 	echo "== boxes (broker) =="
-	broker GET "/box" 2>/dev/null || echo "  (broker unreachable)"
+	local resp
+	if resp="$(broker GET "/box" 2>/dev/null)"; then
+		printf '%s' "$resp" | jq -r '.boxes[]? | "  \(.container)\t\(.status)"' 2>/dev/null || printf '  %s\n' "$resp"
+	else
+		echo "  (broker unreachable)"
+	fi
 }
 
 expose() {

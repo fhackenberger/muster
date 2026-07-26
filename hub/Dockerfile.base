@@ -29,11 +29,11 @@ RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION
 		sh /tmp/common-setup.sh \
 	&& rm /tmp/common-setup.sh
 
-# Hub-specific runtime deps (the shared ones came from common-setup.sh above). openssh-client clones
-# + commits; tmux holds the on-demand service windows; the cypress/Chrome shared-lib list mirrors
-# docker-gradle (pinchtab downloads and drives its own Chrome, so we only need the libs) plus xauth/xvfb.
+# Hub-specific runtime deps (the shared ones — incl. tmux — came from common-setup.sh above).
+# openssh-client clones + commits; the cypress/Chrome shared-lib list mirrors docker-gradle
+# (pinchtab downloads and drives its own Chrome, so we only need the libs) plus xauth/xvfb.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		openssh-client tmux \
+		openssh-client \
 		libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev libgconf-2-4 libnss3 \
 		libxss1 libasound2 libxtst6 xauth xvfb \
 	&& rm -rf /var/lib/apt/lists/*

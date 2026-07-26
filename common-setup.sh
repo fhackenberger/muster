@@ -9,17 +9,19 @@ set -e
 #
 # It installs ONLY what BOTH images need. Image-specific packages stay in their own Dockerfile:
 #   claude-box: xclip/xsel/sudo (clipboard proxy) + the claude binary + the clip user & shims
-#   hub base:   openssh-client, tmux, the Chrome runtime libs, xauth/xvfb, git-ssh, cbx
+#   hub base:   openssh-client, the Chrome runtime libs, xauth/xvfb, git-ssh, cbx
 : "${NODE_VERSION:?common-setup: NODE_VERSION not set (pass --build-arg NODE_VERSION=...)}"
 : "${NPM_VERSION:?common-setup: NPM_VERSION not set (pass --build-arg NPM_VERSION=...)}"
 : "${PINCHTAB_VERSION:=0.13.2}"
 : "${FNM_DIR:=/opt/fnm}"
 export FNM_DIR
 
-# Base utilities common to both images. procps=pgrep (dev-loop scripts), jq + python3 for claude.
+# Base utilities common to both images. procps=pgrep (dev-loop scripts), jq + python3 for claude,
+# tmux for the box's detached session (the broker runs claude inside `tmux new-session`) and the
+# hub's on-demand service windows.
 apt-get update
 apt-get install -y --no-install-recommends \
-	ca-certificates curl git less unzip libatomic1 procps jq python3
+	ca-certificates curl git tmux less unzip libatomic1 procps jq python3
 rm -rf /var/lib/apt/lists/*
 
 # Node + npm via fnm, pinned to the host dev versions. fnm and the node install live OUTSIDE the

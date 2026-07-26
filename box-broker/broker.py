@@ -75,8 +75,9 @@ def parse_manifest():
 	"""Return (mounts, tmpfs, workdir). Grammar per line:
 	    TREE <dst> <ro|rw>      whole checkout at HOME_IN/<dst>, with <dst>/.git shadowed; sets workdir
 	    <src> <dst> <ro|rw>     checkout/<src> at HOME_IN/<dst>
-	'#'/blank lines ignored."""
-	mounts, tmpfs, workdir = [], [], HOME_IN
+	'#'/blank lines ignored. The workdir defaults to the whole-repo mount (the line whose
+	src resolves to the project root, e.g. '.'), else the first mount, else HOME_IN."""
+	mounts, tmpfs, workdir = [], [], None
 	if not BOX_MOUNTS or not os.path.exists(BOX_MOUNTS):
 		# default: whole tree, .git hidden
 		mounts.append(f"{PROJECT_ROOT}:{HOME_IN}/checkout")
@@ -99,8 +100,15 @@ def parse_manifest():
 				src, dst = parts[0], (parts[1] if len(parts) > 1 else parts[0])
 				mode = parts[2] if len(parts) > 2 else "rw"
 				suffix = ":ro" if mode == "ro" else ""
-				mounts.append(f"{confined_src(src)}:{safe_dst(dst)}{suffix}")
-	return mounts, tmpfs, workdir
+				csrc, mdst = confined_src(src), safe_dst(dst)
+				mounts.append(f"{csrc}:{mdst}{suffix}")
+				# Land the box in the repo: the whole-checkout mount (src resolves to the project
+				# root, e.g. the '.' line) sets the workdir; else the first mount seeds it.
+				if csrc == PROJECT_ROOT:
+					workdir = mdst
+				elif workdir is None:
+					workdir = mdst
+	return mounts, tmpfs, workdir or HOME_IN
 
 
 def create_box(name):
