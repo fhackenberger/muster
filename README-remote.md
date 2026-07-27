@@ -204,6 +204,7 @@ That gives you:
 - **`cbx …`** — run any cbx subcommand on the remote hub (`cbx up backend`, `cbx ls`, `cbx box work1`).
 - **`cbxhub`** — a persistent tmux shell in the hub you can detach (Ctrl-b d) / reconnect to.
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
+- **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql infotrack_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4200`).
 
 **Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
@@ -403,8 +404,9 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
 - **Shared caches:** the hub and every box mount the SAME `data/npm-cache` and `data/gradle-cache`
   (rw) at `~/.npm` and `~/.gradle`, so node/gradle artifacts are downloaded once — no per-box
   duplication on the host. uid 1000 owns them (the `dev`/`gradle` users share it), and npm/gradle
-  both lock the cache for concurrent access. (The `~/.m2` Maven cache is separate: read-only from
-  Jenkins.)
+  both lock the cache for concurrent access. `~/.m2/repository` (`MAVEN_REPO_HOST`, Jenkins' cache)
+  is shared with both as well, but **read-only** — a build must never mutate it, and it is the one
+  shared path that lives outside the stack dir, so a wrong value is silently bound as an empty dir.
 - **Port forwards (pinchtab browser + own-backend dev loops):** the pinchtab server + Chrome run on
   the **hub**, but each agent runs its OWN dev services inside its box (`ng serve`, and optionally its
   own backend). pinchtab's IDPI allowlist has no wildcard and the browser is in a different netns, so

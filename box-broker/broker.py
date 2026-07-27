@@ -33,6 +33,8 @@ Config (env, from compose):
   GOLDEN_STAGING      HOST path the hub prepares new goldens in (sealed via /golden/seal)
   PROJECT_ROOT        confinement root for box-mounts extras (default: the current golden)
   CHECKOUT_DST        where the overlay is mounted in the box (default /home/dev/repo — must match the hub)
+  NPM_CACHE/GRADLE_CACHE  HOST paths shared rw with the hub at ~/.npm and ~/.gradle
+  M2_REPO             HOST path of the Maven repository, mounted READ-ONLY at ~/.m2/repository
   CLAUDE_HOME         HOST path of the shared ~/.claude (mounted into every box)
   BOXROOT             HOST path whose <name>/{home,upper,work} subdirs back each box
   BOX_MOUNTS          HOST path of the box-mounts manifest (EXTRA mounts only; see box-mounts.example)
@@ -70,6 +72,13 @@ CLAUDE_HOME = os.environ.get("CLAUDE_HOME", "")
 # handle concurrent access to a shared cache via their own file locks.
 NPM_CACHE = os.environ.get("NPM_CACHE", "")
 GRADLE_CACHE = os.environ.get("GRADLE_CACHE", "")
+# Jenkins' pre-populated Maven repository, mounted READ-ONLY at ~/.m2/repository in every box — the
+# same mount the hub gets, so a box resolves dependencies from the shared cache instead of
+# re-downloading them. Unlike the caches above this lives OUTSIDE the stack dir and is therefore not
+# visible from this container, so it is never created or chowned here: docker resolves the host path
+# itself. A wrong path is silently bound as an empty directory (docker's behaviour), so if a box
+# suddenly can't resolve deps, check this value first.
+M2_REPO = os.environ.get("M2_REPO", "")
 BOXROOT = os.environ.get("BOXROOT", "")
 BOX_MOUNTS = os.environ.get("BOX_MOUNTS", "")
 DEV_BRANCH = os.environ.get("DEV_BRANCH", "dev")
@@ -404,6 +413,9 @@ def create_box(name, resume=False, fresh_upper=False):
 			os.makedirs(cache_host, exist_ok=True)
 			os.chown(cache_host, int(BOX_UID), int(BOX_GID))
 			mounts.append(f"{cache_host}:{cache_dst}")
+	# Maven repo: read-only, and NOT created/chowned — see M2_REPO above.
+	if M2_REPO:
+		mounts.append(f"{M2_REPO}:{HOME_IN}/.m2/repository:ro")
 	env = dict(os.environ)
 	env.update(
 		CLAUDEBOX_HEADLESS="1",

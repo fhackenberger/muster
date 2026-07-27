@@ -71,6 +71,10 @@ services:
       # node/gradle artifacts are downloaded once instead of duplicated per box.
       NPM_CACHE: ${STACK_DIR}/data/npm-cache
       GRADLE_CACHE: ${STACK_DIR}/data/gradle-cache
+      # The SAME Maven repository the hub mounts (see the hub's volumes below), read-only in every
+      # box so agents resolve deps from Jenkins' cache instead of re-downloading — and can never
+      # mutate it. Must be an absolute HOST path; docker binds an empty dir if it doesn't exist.
+      M2_REPO: ${MAVEN_REPO_HOST:-/var/jenkins_home/.m2/repository}
       BOXROOT: ${STACK_DIR}/data/boxes
       BOX_MOUNTS: ${STACK_DIR}/box-mounts
       PINCHTAB_SERVER: http://hub:9867

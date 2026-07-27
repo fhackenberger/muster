@@ -36,7 +36,7 @@
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
-unalias cbx cbxhub cbxbox cbxui cbxtun 2>/dev/null || true
+unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql 2>/dev/null || true
 unset -f cbxui 2>/dev/null || true          # cbxui was renamed to cbxtun; drop the stale function
 
 # One-shot commands: run over ssh so stdout/stderr land on your terminal and persist in scrollback.
@@ -110,6 +110,30 @@ cbxhub() {
 # flags come from _cbx_env (TERM + LANG) — see there for why both are needed.
 cbxbox() {
 	_cbx_session "docker exec -it -u dev $(_cbx_env)box-${CBX_PROJECT}-$1 tmux attach -t main"
+}
+
+# open a psql shell on the stack's postgres (the `db` service) against the DB name given as an arg:
+#   cbxpsql infotrack_dev
+# The db container is resolved by its compose labels (survives renames), like the hub. psql runs as the
+# container's `postgres` OS user, so it connects over the local socket with peer auth — no password.
+# Pass CBX_DB_USER to connect as a specific db user instead (psql then prompts; type the password —
+# never baked in here). Override the service with CBX_DB_SERVICE. Anything AFTER the dbname is passed
+# straight to psql. Both interactive and piped SQL work:
+#   cbxpsql infotrack_dev                                      # interactive REPL (clipboard works)
+#   echo 'SELECT 1;' | cbxpsql infotrack_dev                   # pipe SQL in
+#   cbxpsql infotrack_dev --single-transaction < dump.sql      # load a file atomically (all-or-nothing)
+#   cbxpsql infotrack_dev -v ON_ERROR_STOP=1 -tA < q.sql       # stop on first error, tab/unaligned out
+# When stdin is a terminal we allocate a TTY (-it / ssh -t); when it's a pipe we don't (-i / ssh -T)
+# and stream stdin straight through. Extra args are %q-quoted so they survive the server-side shell
+# re-parse; the $(docker ps …) lookup is left for the server to expand.
+cbxpsql() {
+	[ -n "$1" ] || { echo "usage: cbxpsql <dbname> [psql args…]   (e.g. cbxpsql infotrack_dev --single-transaction < f.sql)" >&2; return 2; }
+	local db="$1"; shift
+	local u=''; [ -n "${CBX_DB_USER:-}" ] && u="-U $CBX_DB_USER "
+	local extra=''; [ "$#" -gt 0 ] && printf -v extra ' %q' "$@"
+	local dflags sshflag
+	if [ -t 0 ]; then dflags='-it'; sshflag='-t'; else dflags='-i'; sshflag='-T'; fi
+	ssh "$sshflag" "$CBX_SERVER" "docker exec $dflags -u postgres \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=${CBX_DB_SERVICE:-db}) psql ${u}${extra} ${db}"
 }
 
 # cbxtun — one SSH tunnel to reach hub and/or agent-box (cbox) dev services from your laptop, so you
