@@ -205,12 +205,17 @@ That gives you:
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
 - **`cbxui [port]`** — SSH-tunnel the hub's dev server (default 4200) to your laptop.
 
-**Transport.** These use **mosh by default** (roaming: sessions survive laptop sleep, Wi-Fi→LTE, and
-IP changes, with no frozen-SSH hangs — it composes with the tmux persistence `cbxhub`/`cbxbox`
-already give you). mosh needs **UDP 60000-61000** open to the server — provisioned by
-`tasks/firewall.yml` (a UFW rule); on a hand-rolled host, open it yourself. It still uses ssh for the
-initial handshake, so key auth is unchanged. Set `CBX_TRANSPORT=ssh` (per call or globally) to fall
-back to plain ssh. **`cbxui` is always ssh** — mosh can't port-forward.
+**Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — use **mosh
+by default** (roaming: they survive laptop sleep, Wi-Fi→LTE, and IP changes with no frozen-SSH hangs,
+and compose with the tmux persistence those already give you). mosh needs **UDP 60000-61000** open to
+the server — provisioned by `tasks/firewall.yml` (a UFW rule); on a hand-rolled host, open it
+yourself. It still uses ssh for the initial handshake, so key auth is unchanged. Set
+`CBX_TRANSPORT=ssh` (per call or globally) to fall back to plain ssh for these.
+
+**One-shot commands** (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) always use **ssh**,
+regardless of `CBX_TRANSPORT` — their output prints to your terminal and stays in scrollback. mosh is
+an alternate-screen app: it would render the output and then wipe it on exit, and it buys nothing for
+a sub-second command. **`cbxui` is always ssh** too — mosh can't port-forward.
 
 The hub container is resolved by its compose labels at call time (so it survives compose's `-1`
 suffix and renames); the `$(…)` lookup runs on the server, and trailing args (`up backend`) are

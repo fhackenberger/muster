@@ -9,28 +9,43 @@
 # it survives compose's `-1` suffix and renames) — the `$(docker ps …)` lookup runs on the SERVER,
 # while $CBX_SERVER / $CBX_PROJECT are substituted locally.
 #
-# Transport is mosh by default (roaming: survives laptop sleep, Wi-Fi→LTE, IP changes, and no frozen
-# sessions). Set CBX_TRANSPORT=ssh to fall back to plain ssh — per call (`CBX_TRANSPORT=ssh cbxhub`)
-# or globally. mosh needs UDP 60000-61000 open to the server (see tasks/firewall.yml) and uses ssh
-# only for the initial handshake, so your existing key auth is unchanged. Note: `cbxui` ALWAYS uses
-# ssh — mosh can't port-forward.
+# Two kinds of invocation, deliberately on different transports:
+#   * one-shot commands (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) ALWAYS use ssh, so their
+#     output prints to your terminal and stays in scrollback. mosh is an alternate-screen app — it
+#     would render the output and then WIPE it on exit — and it buys nothing for a sub-second command.
+#   * long-lived interactive sessions (`cbxhub`, `cbxbox`, `cbx logs`) honor CBX_TRANSPORT and default
+#     to mosh (roaming: survives laptop sleep, Wi-Fi→LTE, IP changes, no frozen sessions). Set
+#     CBX_TRANSPORT=ssh to force plain ssh — per call (`CBX_TRANSPORT=ssh cbxhub`) or globally.
+# mosh needs UDP 60000-61000 open to the server (see tasks/firewall.yml) and uses ssh only for the
+# initial handshake, so key auth is unchanged. `cbxui` is always ssh — mosh can't port-forward.
 
 # Set these — either export them in ~/.bashrc before sourcing, or edit the defaults here.
 : "${CBX_SERVER:=root@your-server}"      # the claude-box host, e.g. root@hetzner1.acoveo.com
 : "${CBX_PROJECT:=myproject}"            # PROJECT_NAME of the stack, e.g. infostars
-: "${CBX_TRANSPORT:=mosh}"               # mosh (default) | ssh
+: "${CBX_TRANSPORT:=mosh}"               # transport for interactive sessions: mosh (default) | ssh
+# TERM forced inside the container's tmux. Your local $TERM (e.g. xterm-kitty, xterm-ghostty) usually
+# has no terminfo entry on the hub/box, which makes tmux die with "terminal does not support clear".
+# xterm-256color is always present and works everywhere. The box also bakes xterm-ghostty, so ghostty
+# users can `export CBX_TERM=xterm-ghostty` for native fidelity.
+: "${CBX_TERM:=xterm-256color}"
 
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
 unalias cbx cbxhub cbxbox cbxui 2>/dev/null || true
 
-# _cbx_run <remote-command>: run one command string interactively on the server via the chosen
-# transport. ssh runs it through the remote login shell directly; mosh execs it, so we wrap in
-# `bash -lc` — either way the string is parsed by exactly one server-side shell, so the $(docker ps …)
-# hub lookup expands there. mosh always allocates a PTY (no `-t` needed); ssh needs `-t` for docker's
-# `-it`. Both keep host-key auth via ssh.
-_cbx_run() {
+# One-shot commands: run over ssh so stdout/stderr land on your terminal and persist in scrollback.
+# `-t` gives the remote a PTY (proper width/color for `--help` etc.); ssh doesn't use an alternate
+# screen, so nothing is wiped on exit.
+_cbx_ssh() {
+	ssh -t "$CBX_SERVER" "$1"
+}
+
+# Long-lived interactive sessions: mosh by default (roaming), ssh when CBX_TRANSPORT=ssh. ssh runs
+# the string through the remote login shell directly; mosh execs it, so we wrap in `bash -lc` — either
+# way exactly one server-side shell parses it, so the $(docker ps …) hub lookup expands there. mosh
+# always allocates a PTY (no `-t`); both keep host-key auth via ssh.
+_cbx_session() {
 	if [ "${CBX_TRANSPORT:-mosh}" = ssh ]; then
 		ssh -t "$CBX_SERVER" "$1"
 	else
@@ -39,17 +54,24 @@ _cbx_run() {
 }
 
 # The `docker exec` into the hub, resolved by compose labels at call time. Emitted as a literal
-# string (the $(docker ps …) subshell is left for the server to evaluate); $CBX_PROJECT is inlined.
+# string (the $(docker ps …) subshell is left for the server to evaluate); $CBX_PROJECT / $CBX_TERM
+# are inlined. `-e TERM` overrides the forwarded local TERM with one the container's tmux can drive.
 _cbx_hub() {
-	printf 'docker exec -it $(docker ps -q -f label=com.docker.compose.project=%s -f label=com.docker.compose.service=hub)' "$CBX_PROJECT"
+	printf 'docker exec -it -e TERM=%s $(docker ps -q -f label=com.docker.compose.project=%s -f label=com.docker.compose.service=hub)' "$CBX_TERM" "$CBX_PROJECT"
 }
 
-# run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1
+# run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1 / cbx --help
 # %q re-quotes each arg so it survives the server-side shell re-parse (e.g. cbx fix work1 -m "a b c").
+# `cbx logs` attaches a live tmux window (interactive) → routed through the mosh-able transport; every
+# other subcommand is one-shot text output → ssh, so it prints and stays on your terminal.
 cbx() {
 	local args=''
 	[ "$#" -gt 0 ] && printf -v args ' %q' "$@"
-	_cbx_run "$(_cbx_hub) cbx$args"
+	if [ "${1:-}" = logs ]; then
+		_cbx_session "$(_cbx_hub) cbx$args"
+	else
+		_cbx_ssh "$(_cbx_hub) cbx$args"
+	fi
 }
 
 # drop into a PERSISTENT shell inside the hub, in tmux, so you can detach (Ctrl-b d) and reconnect
@@ -59,17 +81,16 @@ cbx() {
 # (the owner of the hub tmux server); for a root shell add `-u root` after `exec -it` — but that's a
 # separate, empty tmux server, so use `bash -l` instead of the tmux part for root.
 cbxhub() {
-	_cbx_run "$(_cbx_hub) tmux new-session -A -s cbxhub -c /work/repo"
+	_cbx_session "$(_cbx_hub) tmux new-session -A -s cbxhub -c /work/repo"
 }
 
 # attach to an agent box by name (Ctrl-b d to detach):  cbxbox work1
 # the name lands in the MIDDLE of the command (box-<project>-<name>). -u dev: claude's tmux session
-# runs under the box's 'dev' user, not root (root's tmux socket is empty → "no sessions"). The box
-# bakes an xterm-ghostty terminfo entry so a native ghostty TERM works; for a terminal the box
-# doesn't know (e.g. kitty) add `-e TERM=xterm-256color`, or bake its terminfo like ghostty
-# (common-setup.sh).
+# runs under the box's 'dev' user, not root (root's tmux socket is empty → "no sessions"). -e TERM
+# forces a terminfo the box has (see CBX_TERM above), so tmux won't die with "terminal does not
+# support clear" for a terminal the box doesn't know.
 cbxbox() {
-	_cbx_run "docker exec -it -u dev box-${CBX_PROJECT}-$1 tmux attach -t main"
+	_cbx_session "docker exec -it -u dev -e TERM=$CBX_TERM box-${CBX_PROJECT}-$1 tmux attach -t main"
 }
 
 # watch the UI yourself: SSH-tunnel the hub's dev server (default port 4200), then open your laptop
