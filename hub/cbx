@@ -23,6 +23,7 @@ set -euo pipefail
 #   cbx merge  <box> [--squash]             # merge the agent branch into dev
 #   cbx drop   <box>                        # discard an agent branch (tells the box)
 #   cbx rebase <box>|all                    # move agents onto the current dev (light; no recreate)
+#   cbx pull [--rebase]                     # bring dev up to date with origin (merge by default)
 #   cbx push                                # push dev to the real origin
 #
 #   cbx golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
@@ -162,15 +163,23 @@ box_ls() {
 say_to_box() {
 	# Deliver a line into the box's claude session. Note this is a PROMPT, not a shell command: the
 	# window runs claude, so phrase instructions the way you'd type them to the agent.
+	# RETURNS non-zero rather than dying: several callers (merge, drop, rebase) treat an unreachable
+	# box as a note, not a failure — and a `die` here would abort them AFTER they'd done their work.
 	local box="$1" msg="$2" resp
-	resp="$(broker POST "/box/$box/say" --data-raw "$msg")" || die "could not reach box '$box': $resp"
+	resp="$(broker POST "/box/$box/say" --data-raw "$msg" 2>&1)" || {
+		echo "cbx: could not reach box '$box': $resp" >&2
+		return 1
+	}
 }
 
 # ------------------------------------------------------------------ review queue
 
 agent_refs() { git_ for-each-ref --format='%(refname:strip=2)' refs/agents/; }
 
-note_of() { git_ notes --ref=cbx show "refs/agents/$1" 2>/dev/null | head -1; }
+# The handoff summary, or empty. The `|| true` is load-bearing: `git notes show` exits non-zero when
+# a box handed off WITHOUT a summary (bare `handoff`), pipefail propagates that through head, and
+# under `set -e` the enclosing `msg="$(note_of …)"` then kills the whole command silently.
+note_of() { git_ notes --ref=cbx show "refs/agents/$1" 2>/dev/null | head -1 || true; }
 
 # Conflicted paths between two committishes, without touching the worktree or the index.
 # --no-messages drops git's "Auto-merging / CONFLICT (content)" prose, leaving the tree oid on line 1
@@ -253,7 +262,8 @@ fix() {
 	local box="$1" msg=""; shift
 	[ "${1:-}" = -m ] && { shift; msg="$*"; } || msg="$*"
 	[ -n "$msg" ] || die "fix needs a message: cbx fix $box -m 'what to change'"
-	say_to_box "$box" "Review feedback on your handoff: ${msg}. Please fix it on your branch, then run: handoff"
+	say_to_box "$box" "Review feedback on your handoff: ${msg}. Please fix it on your branch, then run: handoff" \
+		|| die "feedback NOT delivered — is the box running? (cbx ls)"
 	echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
 }
 
@@ -279,7 +289,10 @@ merge() {
 	fi
 	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
 
+	local before after
+	echo "cbx: merging refs/agents/$box ($(git_ rev-list --count "$DEV..$ref") commit(s)) into $DEV"
 	git_ checkout -q "$DEV"
+	before="$(git_ rev-parse HEAD)"
 	if [ "$squash" = --squash ]; then
 		git_ merge --squash "$ref" || die "merge conflicts — resolve in $REPO, then commit"
 		git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
@@ -287,14 +300,23 @@ merge() {
 		git_ merge --no-ff "$ref" -m "$msg" -m "Cbx-Box: $box" \
 			|| die "merge conflicts — resolve in $REPO, then 'git commit'"
 	fi
-	echo "cbx: merged $box into $DEV ($(git_ rev-parse --short HEAD))"
+	after="$(git_ rev-parse HEAD)"
+	[ "$before" != "$after" ] || die "nothing was merged — $DEV is unchanged (already up to date?)"
+
+	echo "cbx: $DEV is now $(git_ rev-parse --short HEAD)"
+	git_ --no-pager log --oneline -1 | sed 's/^/  /'
+	git_ --no-pager diff --shortstat "$before" "$after" | sed 's/^/  /'
 	git_ update-ref -d "$ref"
 	rm -f "$STATE/$box.reviewed"
+	echo "cbx: dropped refs/agents/$box (merged)"
 	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
 	# of work starts from what you just landed.
-	say_to_box "$box" "Your work was merged into ${DEV}. Please run: git fetch hub && git rebase hub/${DEV} — then continue with the next task." 2>/dev/null \
-		|| echo "cbx: (box $box not running — it will rebase on next start)"
-	echo "cbx: push it with 'cbx push' when you're ready."
+	if say_to_box "$box" "Your work was merged into ${DEV}. Please run: git fetch hub && git rebase hub/${DEV} — then continue with the next task."; then
+		echo "cbx: asked $box to rebase onto $DEV"
+	else
+		echo "cbx: (box $box not reachable — rebase it later with 'cbx rebase $box')"
+	fi
+	echo "cbx: NOT pushed yet — the merge is local to the hub. Run: cbx push"
 }
 
 drop() {
@@ -321,8 +343,54 @@ rebase() {
 	done
 }
 
+divergence() {
+	# "<behind> <ahead>" of $DEV relative to origin/$DEV. Needs a fetch first to mean anything.
+	git_ rev-list --left-right --count "origin/$DEV...$DEV" 2>/dev/null || echo "0 0"
+}
+
+pull() {
+	# Bring the hub's branch up to date with origin. Needed whenever you (or anyone) pushed to the
+	# branch elsewhere: the hub's merges then sit on an older base and `cbx push` is rejected.
+	local mode="${1:-}" behind ahead
+	echo "cbx: fetching origin"
+	git_ fetch origin || die "fetch failed"
+	read -r behind ahead <<< "$(divergence)"
+	if [ "$behind" = 0 ]; then
+		echo "cbx: $DEV is up to date with origin ($ahead local commit(s) to push)"
+		return 0
+	fi
+	echo "cbx: origin has $behind commit(s) you don't; you have $ahead it doesn't"
+	if [ "$ahead" = 0 ]; then
+		git_ merge --ff-only "origin/$DEV" || die "fast-forward failed — resolve in $REPO"
+		echo "cbx: fast-forwarded to $(git_ rev-parse --short HEAD)"
+	elif [ "$mode" = --rebase ]; then
+		git_ rebase "origin/$DEV" || die "rebase conflicts — resolve in $REPO, then 'git rebase --continue'"
+		echo "cbx: rebased onto origin/$DEV ($(git_ rev-parse --short HEAD))"
+	else
+		git_ merge "origin/$DEV" -m "Merge origin/$DEV" \
+			|| die "merge conflicts — resolve in $REPO, then 'git commit'"
+		echo "cbx: merged origin/$DEV ($(git_ rev-parse --short HEAD))"
+	fi
+	echo "cbx: agents are now behind — 'cbx rebase all' after you push."
+}
+
 push() {
-	git_ push origin "$DEV" && echo "cbx: pushed $DEV to origin"
+	local ahead behind
+	read -r behind ahead <<< "$(divergence)"
+	[ "$behind" = 0 ] || die "origin has $behind commit(s) $DEV doesn't — run 'cbx pull' (or 'cbx pull --rebase') first"
+	echo "cbx: pushing $DEV ($ahead commit(s) ahead of origin) -> $(git_ remote get-url origin)"
+	if git_ push origin "$DEV"; then
+		echo "cbx: pushed $DEV to origin"
+	else
+		# The three things that actually go wrong here, in the order they're worth checking.
+		echo "cbx: push FAILED. Usual causes:" >&2
+		echo "  * the deploy key is read-only — GitHub: Settings -> Deploy keys -> 'Allow write access'" >&2
+		echo "  * no key offered ('Permission denied (publickey)') — check the identity dir matches the" >&2
+		echo "    hub user's HOME: ls -l \$HOME/.gitidentity, and that git-identity/gitconfig has no" >&2
+		echo "    stale core.sshCommand pointing at another home" >&2
+		echo "  * a branch ruleset protects $DEV — the key is not in the bypass list" >&2
+		exit 1
+	fi
 }
 
 # ------------------------------------------------------------------ goldens
@@ -469,6 +537,7 @@ case "$cmd" in
 	merge)    merge "$@" ;;
 	drop)     drop "$@" ;;
 	rebase)   rebase "$@" ;;
+	pull)     pull "$@" ;;
 	push)     push ;;
 	golden)
 		sub="${1:-}"; shift || true

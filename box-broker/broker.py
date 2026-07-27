@@ -349,6 +349,28 @@ def make_overlay_volume(name, golden, fresh_upper=False):
 
 # --------------------------------------------------------------------------- boxes
 
+def session_args(box_dir, resume):
+	"""The --session-id / --resume flag for this box's claude.
+
+	All boxes share CLAUDE_HOME, so `claude --continue` would be ambiguous across them; instead each
+	box pins a stable session id (stored in its box dir). A fresh spawn passes --session-id (recording
+	it); a recreate passes --resume, so the box picks up exactly where it left off.
+
+	Note claude stores transcripts per project directory, so moving a box's workdir orphans its
+	session and --resume then fails at startup. Recovering means moving the .jsonl under
+	CLAUDE_HOME/projects/ to the new directory name (or clearing this box's session-id file)."""
+	session_file = os.path.join(box_dir, "session-id")
+	if resume and os.path.exists(session_file):
+		with open(session_file) as fh:
+			sid = fh.read().strip()
+		if sid:
+			return f"--resume {sid}"
+	sid = str(uuid.uuid4())
+	with open(session_file, "w") as fh:
+		fh.write(sid)
+	return f"--session-id {sid}"
+
+
 def create_box(name, resume=False, fresh_upper=False):
 	with _golden_lock:
 		golden = current_golden()
@@ -360,22 +382,6 @@ def create_box(name, resume=False, fresh_upper=False):
 	if CLAUDE_HOME:
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
-	# Per-box claude session. All boxes share CLAUDE_HOME, so `claude --continue` would be ambiguous
-	# across boxes; instead we pin a stable session id per box (stored in the box dir) and resume THAT.
-	# A fresh spawn gets a new --session-id (recorded); a recreate reuses it via --resume, so the box
-	# picks up exactly where it left off.
-	session_file = os.path.join(box_dir, "session-id")
-	claude_args = ""
-	if resume and os.path.exists(session_file):
-		with open(session_file) as fh:
-			sid = fh.read().strip()
-		if sid:
-			claude_args = f"--resume {sid}"
-	if not claude_args:
-		sid = str(uuid.uuid4())
-		with open(session_file, "w") as fh:
-			fh.write(sid)
-		claude_args = f"--session-id {sid}"
 	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at
 	# 127.0.0.1:(HUB_BASE_PORT + slot). The box gets PORT_FORWARDS + PORT_FORWARD_<NAME>_FROM/_TO_HUB so
 	# the project's own scripts can wire e.g. CLAUDEBOX_DEV_URL and the frontend's backend URL. Running
@@ -383,6 +389,7 @@ def create_box(name, resume=False, fresh_upper=False):
 	forwards = parse_port_forwards()
 	slot = alloc_slot(box_dir) if forwards else None
 	mounts, checkout_dst, checkout_ro = parse_manifest(golden)
+	claude_args = session_args(box_dir, resume)
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
 	if checkout_ro:
 		mounts.insert(0, f"{golden}:{checkout_dst}:ro")

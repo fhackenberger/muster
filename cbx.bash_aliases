@@ -13,16 +13,19 @@
 #   * one-shot commands (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) ALWAYS use ssh, so their
 #     output prints to your terminal and stays in scrollback. mosh is an alternate-screen app — it
 #     would render the output and then WIPE it on exit — and it buys nothing for a sub-second command.
-#   * long-lived interactive sessions (`cbxhub`, `cbxbox`, `cbx logs`) honor CBX_TRANSPORT and default
-#     to mosh (roaming: survives laptop sleep, Wi-Fi→LTE, IP changes, no frozen sessions). Set
-#     CBX_TRANSPORT=ssh to force plain ssh — per call (`CBX_TRANSPORT=ssh cbxhub`) or globally.
+#   * long-lived interactive sessions (`cbxhub`, `cbxbox`, `cbx logs`) honor CBX_TRANSPORT, default
+#     ssh. Set CBX_TRANSPORT=mosh — per call (`CBX_TRANSPORT=mosh cbxhub`) or globally — for roaming
+#     (survives laptop sleep, Wi-Fi→LTE, IP changes, no frozen sessions). Trade-off: mosh can't carry
+#     the clipboard (OSC 52), so terminal copy from claude only reaches your laptop clipboard on ssh.
 # mosh needs UDP 60000-61000 open to the server (see tasks/firewall.yml) and uses ssh only for the
 # initial handshake, so key auth is unchanged. `cbxui` is always ssh — mosh can't port-forward.
+# NOTE: an exported CBX_TRANSPORT in your environment/~/.bashrc WINS over the default set here — the
+# `:=` below only assigns when it's unset. `echo "$CBX_TRANSPORT"` if a transport change seems ignored.
 
 # Set these — either export them in ~/.bashrc before sourcing, or edit the defaults here.
 : "${CBX_SERVER:=root@your-server}"      # the claude-box host, e.g. root@hetzner1.acoveo.com
 : "${CBX_PROJECT:=myproject}"            # PROJECT_NAME of the stack, e.g. infostars
-: "${CBX_TRANSPORT:=ssh}"               # transport for interactive sessions: mosh | ssh (default)
+: "${CBX_TRANSPORT:=ssh}"                # transport for interactive sessions: mosh | ssh (default)
 # TERM handling. `docker exec -it` does NOT propagate your terminal — it hands the container TERM=dumb,
 # which has no `clear`, so tmux dies with "terminal does not support clear". So we forward YOUR real
 # $TERM explicitly via `-e TERM=…`. That's your actual terminal (e.g. xterm-ghostty, which the box
@@ -42,15 +45,16 @@ _cbx_ssh() {
 	ssh -t "$CBX_SERVER" "$1"
 }
 
-# Long-lived interactive sessions: mosh by default (roaming), ssh when CBX_TRANSPORT=ssh. ssh runs
+# Long-lived interactive sessions: ssh by default, mosh when CBX_TRANSPORT=mosh (roaming). ssh runs
 # the string through the remote login shell directly; mosh execs it, so we wrap in `bash -lc` — either
 # way exactly one server-side shell parses it, so the $(docker ps …) hub lookup expands there. mosh
-# always allocates a PTY (no `-t`); both keep host-key auth via ssh.
+# always allocates a PTY (no `-t`); both keep host-key auth via ssh. The `:-ssh` fallback matches the
+# `: "${CBX_TRANSPORT:=ssh}"` default above, so an empty value still means ssh, not mosh.
 _cbx_session() {
-	if [ "${CBX_TRANSPORT:-mosh}" = ssh ]; then
-		ssh -t "$CBX_SERVER" "$1"
-	else
+	if [ "${CBX_TRANSPORT:-ssh}" = mosh ]; then
 		mosh "$CBX_SERVER" -- bash -lc "$1"
+	else
+		ssh -t "$CBX_SERVER" "$1"
 	fi
 }
 
