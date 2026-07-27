@@ -56,8 +56,12 @@ BROKER_TOKEN="${BROKER_TOKEN:-}"
 # and whatever it installs is captured at the path it will actually be used from.
 GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}"
 
-# Service commands (override in the stack .env). Wrapped so the tmux window survives the process
-# exiting, and so backgrounding dev scripts still leave a live window to read logs from.
+# Service commands. Override them in SERVICE-ENV, not in .env: .env only feeds compose interpolation
+# and never reaches this container, so an override there is silently ignored. Each runs through
+# `bash -lc` in a tmux window with the cwd set to $REPO, so a value may use relative paths and shell
+# substitutions — those are evaluated at launch, INSIDE the container, which is how a project can
+# point at e.g. a jar whose path only exists after the build. Wrapped so the tmux window survives the
+# process exiting, and so backgrounding dev scripts still leave a live window to read logs from.
 BACKEND_CMD="${BACKEND_CMD:-gradle --project-dir '$REPO/infostars/' -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default'}"
 FRONTEND_CMD="${FRONTEND_CMD:-'$REPO/infostarsFrontend/scripts/frontend-dev-restart.sh' && tail -f /tmp/infostarsFrontend-dev.log}"
 PINCHTAB_CMD="${PINCHTAB_CMD:-pinchtab server}"

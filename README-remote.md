@@ -493,9 +493,15 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
   Format is compose's (`KEY=VALUE`, `#` comments, literal values, no `${}` expansion). It is
   **required** — compose refuses to start the hub if the file is missing. Apply with
   `docker compose up -d hub` and `cbx recreate <box>`.
-- **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are env-overridable in `.env`
-  if the defaults don't match your dev loop. Each service runs in its own hub tmux window that
-  stays alive after the process exits, so `cbx logs <svc>` can always attach to read the output.
+- **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are overridden in
+  **`service-env`**, not `.env` — `.env` only feeds compose interpolation and never reaches the hub
+  container, so an override there is silently ignored. Each runs through `bash -lc` in a tmux window
+  with the cwd set to the repo, so values may use relative paths **and shell substitutions evaluated
+  at launch inside the container** — that is how the backend command can pass
+  `-javaagent:$(find … aspectjweaver-*.jar …)` for a jar whose path only exists after the build
+  (note it uses two `gradle` calls so the substitution runs *after* the dependency is resolved).
+  Each service runs in its own hub tmux window that stays alive after the process exits, so
+  `cbx logs <svc>` can always attach to read the output.
 - **Images** are built by the `Jenkinsfile` (box / hub / box-broker); the stack reuses them by
   default and only builds locally when `COMPOSE_PULL_POLICY=build`. Flip `PUSH_TO_REGISTRY` in the
   Jenkins job to also publish them for pulling on another host.
