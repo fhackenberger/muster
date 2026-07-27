@@ -204,7 +204,7 @@ That gives you:
 - **`cbx …`** — run any cbx subcommand on the remote hub (`cbx up backend`, `cbx ls`, `cbx box work1`).
 - **`cbxhub`** — a persistent tmux shell in the hub you can detach (Ctrl-b d) / reconnect to.
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
-- **`cbxui [port]`** — SSH-tunnel the hub's dev server (default 4200) to your laptop.
+- **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4200`).
 
 **Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
 **ssh**. Set **`CBX_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
@@ -223,7 +223,7 @@ if a transport change seems ignored.
 **One-shot commands** (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) always use **ssh**,
 regardless of `CBX_TRANSPORT` — their output prints to your terminal and stays in scrollback. mosh is
 an alternate-screen app: it would render the output and then wipe it on exit, and it buys nothing for
-a sub-second command. **`cbxui` is always ssh** too — mosh can't port-forward.
+a sub-second command. **`cbxtun` is always ssh** too — mosh can't port-forward.
 
 The hub container is resolved by its compose labels at call time (so it survives compose's `-1`
 suffix and renames); the `$(…)` lookup runs on the server, and trailing args (`up backend`) are
@@ -364,12 +364,23 @@ agent can sweep into a commit by accident.
 Most days you don't need it: **`cbx rebase all`** moves agents onto a newer `dev` with a `git fetch`
 + `rebase` in each box, no golden and no recreate. Refresh only when dependencies changed.
 
-Watch the UI yourself: SSH-tunnel the hub's dev server with **`cbxui`** (from `cbx.bash_aliases`),
-then open `http://localhost:4200` in your laptop browser:
+Watch the UI yourself: SSH-tunnel the dev ports with **`cbxtun`** (from `cbx.bash_aliases`), then open
+the app in your laptop browser. Each argument is a forward spec — `PORT` or `hub:PORT` for a hub
+service, `<box>:PORT` for an agent box, optionally prefixed `LOCAL:` to change the laptop port. The
+laptop listens on `127.0.0.1` at the same port numbers, so a frontend's `http://localhost:PORT`
+backend URL resolves in your browser exactly as it does on the hub. Services must bind `0.0.0.0` in
+their container (ng serve/bootRun and the box port-forwards already do).
 
 ```sh
-cbxui           # tunnel port 4200 (the default); cbxui 9867 for another port
+cbxtun                       # default: hub's dev server on http://localhost:4200
+cbxtun work1:4200 hub:8080   # THE case: box 'work1' frontend + hub backend, in one command
+                             #   open http://localhost:4200 ; its JS hits http://localhost:8080 -> hub
+cbxtun 9867                  # a single hub port (e.g. pinchtab)
+cbxtun 4300:work1:4200       # box 'work1' :4200 published on your laptop's :4300
 ```
+
+The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`; it drops the stale
+`cbxui` function on load).
 
 ## Notes
 

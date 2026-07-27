@@ -18,7 +18,8 @@ set -euo pipefail
 #
 #   cbx status                              # what can be merged / rebased / pushed, with commands
 #   cbx q                                   # the review queue: who is waiting on you
-#   cbx review <box> [--full]               # diff since your last review (--full = whole branch)
+#   cbx review <box> [--full] [--net]       # per-commit patches since your last review
+#                                           #   --full = whole branch, --net = one combined diff
 #   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
 #   cbx prereview <box>                     # ask the agent to self-review its diff before you look
 #   cbx merge  <box> [--squash]             # merge the agent branch into dev
@@ -327,7 +328,15 @@ status_overview() {
 
 review() {
 	[ $# -ge 1 ] || die "review needs a box name"
-	local box="$1" full="${2:-}" ref sha prev
+	local box="$1" full="" net="" arg ref sha prev
+	shift
+	for arg in "$@"; do
+		case "$arg" in
+			--full) full=1 ;;
+			--net)  net=1 ;;
+			*) die "review: unknown option '$arg' (--full | --net)" ;;
+		esac
+	done
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box' (has it run handoff?)"
 	sha="$(git_ rev-parse "$ref")"
@@ -342,24 +351,31 @@ review() {
 		echo
 	fi
 
-	# Commits AND diff go through ONE pager. Printing the log first and then piping the diff to delta
-	# would lose the log: delta pages on the alternate screen and paints straight over it. And the log
-	# is NOT --oneline, because --notes only renders in a format that prints a commit body — with
-	# --oneline the handoff summary is silently dropped, which is the whole point of showing it.
+	# Everything goes through ONE pager. Printing the log first and then piping a diff to delta would
+	# lose the log: delta pages on the alternate screen and paints straight over it.
 	{
 		echo "== $box: $(git_ rev-list --count "$DEV..$ref") commit(s) on top of $DEV =="
 		echo
-		git_ log --color=always --notes=cbx "$DEV..$ref"
-		echo
-		if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ "$full" != --full ] \
+		if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ -z "$full" ] \
 		   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then
 			# Re-review after a fix round: show ONLY what changed since you last looked. range-diff copes
-			# with the amends and rebases a fix round produces, which a plain diff cannot.
+			# with the amends and rebases a fix round produces, which a plain diff cannot. Keep the plain
+			# commit list above it, since range-diff shows subjects but not messages or notes.
+			git_ log --color=always --notes=cbx "$DEV..$ref"
+			echo
 			echo "-- changes since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
 			echo
 			git_ range-diff "$DEV..$prev" "$DEV..$ref"
-		else
+		elif [ -n "$net" ]; then
+			# The branch's NET effect, as it will land: one combined diff, no per-commit split.
+			git_ log --color=always --notes=cbx "$DEV..$ref"
+			echo
 			git_ diff "$DEV...$ref"
+		else
+			# Default: each commit with ITS OWN message, notes and diff, oldest first — so a branch with
+			# several commits reads as a sequence of changes instead of one merged blob you can't
+			# attribute. `--net` gives the combined diff when you want the end state instead.
+			git_ log --color=always --notes=cbx --reverse --patch --stat "$DEV..$ref"
 		fi
 	} | review_pager
 

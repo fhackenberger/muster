@@ -18,7 +18,7 @@
 #     (survives laptop sleep, Wi-Fi→LTE, IP changes, no frozen sessions). Trade-off: mosh can't carry
 #     the clipboard (OSC 52), so terminal copy from claude only reaches your laptop clipboard on ssh.
 # mosh needs UDP 60000-61000 open to the server (see tasks/firewall.yml) and uses ssh only for the
-# initial handshake, so key auth is unchanged. `cbxui` is always ssh — mosh can't port-forward.
+# initial handshake, so key auth is unchanged. `cbxtun` is always ssh — mosh can't port-forward.
 # NOTE: an exported CBX_TRANSPORT in your environment/~/.bashrc WINS over the default set here — the
 # `:=` below only assigns when it's unset. `echo "$CBX_TRANSPORT"` if a transport change seems ignored.
 
@@ -36,7 +36,8 @@
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
-unalias cbx cbxhub cbxbox cbxui 2>/dev/null || true
+unalias cbx cbxhub cbxbox cbxui cbxtun 2>/dev/null || true
+unset -f cbxui 2>/dev/null || true          # cbxui was renamed to cbxtun; drop the stale function
 
 # One-shot commands: run over ssh so stdout/stderr land on your terminal and persist in scrollback.
 # `-t` gives the remote a PTY (proper width/color for `--help` etc.); ssh doesn't use an alternate
@@ -111,10 +112,56 @@ cbxbox() {
 	_cbx_session "docker exec -it -u dev $(_cbx_env)box-${CBX_PROJECT}-$1 tmux attach -t main"
 }
 
-# watch the UI yourself: SSH-tunnel the hub's dev server (default port 4200), then open your laptop
-# browser at http://localhost:4200 —  cbxui  (or  cbxui 9867  for another port). ALWAYS ssh: mosh
-# has no port forwarding, and the inner lookup captures command output (which mosh can't do).
-cbxui() {
-	local port="${1:-4200}"
-	ssh -L "$port:$(ssh "$CBX_SERVER" "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub)"):$port" "$CBX_SERVER"
+# cbxtun — one SSH tunnel to reach hub and/or agent-box (cbox) dev services from your laptop, so you
+# can drive the UI in your own browser. ALWAYS ssh (mosh can't port-forward). Each argument is a
+# forward spec; combine as many as you like in ONE command:
+#     PORT                hub PORT          -> laptop 127.0.0.1:PORT
+#     hub:PORT            hub PORT          -> laptop 127.0.0.1:PORT
+#     <box>:PORT          box <box> PORT    -> laptop 127.0.0.1:PORT
+#     LOCAL:hub:PORT      hub PORT          -> laptop 127.0.0.1:LOCAL
+#     LOCAL:<box>:PORT    box <box> PORT    -> laptop 127.0.0.1:LOCAL
+# No args = hub:4200 (the old cbxui default). The laptop listens on 127.0.0.1 at the SAME port numbers
+# by default, mirroring the hub's localhost layout — so a frontend's `http://localhost:PORT` backend
+# URL resolves in your browser exactly as it does on the hub. THE key case, frontend on a box + backend
+# on the hub, in one command:
+#     cbxtun work1:4200 hub:8080
+#     -> open http://localhost:4200 ; its JS calls http://localhost:8080, tunneled to the hub backend.
+# Targets are reached at the container's IP, so the service must listen on 0.0.0.0 inside its container
+# (ng serve/bootRun and the box port-forward system already bind 0.0.0.0). Ctrl-C closes the tunnel.
+cbxtun() {
+	[ "$#" -gt 0 ] || set -- hub:4200
+	local -a LP TG RP; local spec a b c
+	for spec in "$@"; do
+		IFS=: read -r a b c <<<"$spec"
+		if   [ -n "$c" ]; then LP+=("$a"); TG+=("$b");   RP+=("$c")   # LOCAL:TARGET:PORT
+		elif [ -n "$b" ]; then LP+=("$b"); TG+=("$a");   RP+=("$b")   # TARGET:PORT
+		else                   LP+=("$a"); TG+=("hub");  RP+=("$a")   # PORT (hub)
+		fi
+	done
+	# Resolve each unique target to a container IP in ONE round-trip — hub via its compose labels, a box
+	# by its container name. Quoted heredoc + positional args keep local/remote quoting from clashing.
+	local resolved
+	resolved=$(ssh "$CBX_SERVER" bash -s "$CBX_PROJECT" $(printf '%s\n' "${TG[@]}" | sort -u) <<'REMOTE'
+proj="$1"; shift
+for t in "$@"; do
+	if [ "$t" = hub ]; then
+		ref=$(docker ps -q -f label=com.docker.compose.project="$proj" -f label=com.docker.compose.service=hub)
+	else
+		ref="box-$proj-$t"
+	fi
+	ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ref" 2>/dev/null)
+	printf '%s %s\n' "$t" "$ip"
+done
+REMOTE
+	) || { echo "cbxtun: could not reach $CBX_SERVER" >&2; return 1; }
+	local -a Largs; local i t ip
+	for i in "${!TG[@]}"; do
+		t="${TG[$i]}"
+		ip=$(printf '%s\n' "$resolved" | awk -v t="$t" '$1==t{print $2; exit}')
+		[ -n "$ip" ] || { echo "cbxtun: can't resolve '$t' to a running container (hub up? box '$t' spawned?)" >&2; return 1; }
+		Largs+=(-L "127.0.0.1:${LP[$i]}:$ip:${RP[$i]}")
+		echo "cbxtun: http://localhost:${LP[$i]}  ->  $t:${RP[$i]}  ($ip)" >&2
+	done
+	echo "cbxtun: tunnel up — Ctrl-C to close" >&2
+	ssh -N "${Largs[@]}" "$CBX_SERVER"
 }
