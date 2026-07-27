@@ -1,34 +1,60 @@
 #!/bin/bash
 set -euo pipefail
 
-# cbx — hub-side control CLI. Two jobs:
+# cbx — hub-side control CLI. Three jobs:
 #   * start/stop the on-demand dev services in the hub's tmux (backend / frontend / pinchtab)
 #   * spawn/kill/list agent boxes via the box-broker (the hub itself never touches the docker socket)
+#   * THE REVIEW QUEUE: each agent works on its own branch (agent/<box>) in an overlay of a shared
+#     prepared "golden" checkout and pushes to refs/agents/<box> here; you review and merge into dev.
 #
 # Usage:
 #   cbx up   backend|frontend|pinchtab      # start a service in its tmux window
 #   cbx down backend|frontend|pinchtab      # stop it
-#   cbx box  [name]                         # spawn an agent box (mounts per box-mounts)
-#   cbx kill <name>                         # remove an agent box
-#   cbx recreate <name>|all                 # pull newest image + respawn (resumes the box's session)
+#   cbx logs backend|frontend|pinchtab|gitd # attach that service window (Ctrl-b d to detach)
+#   cbx box  [name]                         # spawn an agent box (own branch, overlay checkout)
+#   cbx kill <name>                         # remove an agent box (its upper layer is kept)
+#   cbx recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
 #   cbx ls                                  # list services (tmux) + boxes (broker)
-#   cbx expose <src> [dst] [ro]             # add a repo path to box-mounts (dst defaults to src)
+#
+#   cbx q                                   # the review queue: who is waiting on you
+#   cbx review <box> [--full]               # diff since your last review (--full = whole branch)
+#   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
+#   cbx prereview <box>                     # ask the agent to self-review its diff before you look
+#   cbx merge  <box> [--squash]             # merge the agent branch into dev
+#   cbx drop   <box>                        # discard an agent branch (tells the box)
+#   cbx rebase <box>|all                    # move agents onto the current dev (light; no recreate)
+#   cbx push                                # push dev to the real origin
+#
+#   cbx golden refresh                      # new prepared base (deps rebuilt) + move every box onto it
+#   cbx golden ls | reap                    # list snapshots / delete unreferenced ones
+#   cbx expose <src> [dst] [ro]             # add an EXTRA path to box-mounts (dst defaults to src)
 #   cbx hide   <src>                        # remove it
-#   cbx logs backend|frontend|pinchtab      # attach that service window (Ctrl-b d to detach)
 
-CHECKOUT="${CHECKOUT:-/work/checkout}"
+REPO="${CHECKOUT:-/work/repo}"
+DEV="${DEV_BRANCH:-dev}"
+GOLDEN="${GOLDEN_DIR:-/work/golden}"
+STAGING="${GOLDEN_STAGING:-/work/golden-staging}"
+STATE="$REPO/.git/cbx"
 MANIFEST="${BOX_MOUNTS:-/work/box-mounts}"
 TMUX_SESSION="${TMUX_SESSION:-services}"
 BROKER_URL="${BROKER_URL:-http://box-broker:8099}"
 BROKER_TOKEN="${BROKER_TOKEN:-}"
 
+# What `cbx golden refresh` runs inside the staged tree to make it ready-to-build (override in .env).
+# This is the expensive setup that boxes then inherit for free.
+GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}"
+
 # Service commands (override in the stack .env). Wrapped so the tmux window survives the process
 # exiting, and so backgrounding dev scripts still leave a live window to read logs from.
-BACKEND_CMD="${BACKEND_CMD:-gradle --project-dir '$CHECKOUT/infostars/' -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default'}"
-FRONTEND_CMD="${FRONTEND_CMD:-'$CHECKOUT/infostarsFrontend/scripts/frontend-dev-restart.sh' && tail -f /tmp/infostarsFrontend-dev.log}"
+BACKEND_CMD="${BACKEND_CMD:-gradle --project-dir '$REPO/infostars/' -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default'}"
+FRONTEND_CMD="${FRONTEND_CMD:-'$REPO/infostarsFrontend/scripts/frontend-dev-restart.sh' && tail -f /tmp/infostarsFrontend-dev.log}"
 PINCHTAB_CMD="${PINCHTAB_CMD:-pinchtab server}"
 
 die() { echo "cbx: $*" >&2; exit 1; }
+git_() { git -C "$REPO" "$@"; }
+have_delta() { command -v delta >/dev/null 2>&1; }
+
+# ------------------------------------------------------------------ services
 
 svc_cmd() {
 	case "$1" in
@@ -45,7 +71,7 @@ svc_up() {
 		echo "cbx: $svc already running (cbx logs $svc to view)"; return 0
 	fi
 	# keep the window alive after the command exits so failures stay readable
-	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$CHECKOUT" \
+	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$REPO" \
 		"bash -lc $(printf '%q' "$cmd; echo; echo '[cbx] $svc exited — press enter to close'; read _")"
 	echo "cbx: started $svc (cbx logs $svc to view)"
 }
@@ -60,26 +86,25 @@ svc_logs() {
 	exec tmux attach -t "${TMUX_SESSION}" \; select-window -t "${TMUX_SESSION}:$1"
 }
 
+# ------------------------------------------------------------------ broker
+
 broker() {
 	local method="$1" path="$2"; shift 2
-	# --fail-with-body (curl >= 7.76; present on the jammy hub): like -f it still returns non-zero on
-	# HTTP >= 400 so callers' `&&` chains detect failure, but UNLIKE -f it prints the response body,
-	# so the broker's {"error": "..."} is shown instead of a bare "curl: (22) ... error: 500".
+	# --fail-with-body (curl >= 7.76): like -f it still returns non-zero on HTTP >= 400 so callers'
+	# `&&` chains detect failure, but UNLIKE -f it prints the response body, so the broker's
+	# {"error": "..."} is shown instead of a bare "curl: (22) ... error: 500".
 	curl --fail-with-body -sS -X "$method" -H "X-Broker-Token: $BROKER_TOKEN" "$@" "${BROKER_URL}${path}"
 }
+
+jqr() { jq -r "$1" 2>/dev/null || true; }
 
 box_new() {
 	local name="${1:-$(cut -c1-6 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)}"
 	local resp container
 	resp="$(broker POST "/box/$name")" || die "spawning box '$name' failed: $resp"
-	# The broker returns the REAL container name in its JSON — surface that (not a literal
-	# ${PROJECT} placeholder) and don't dump the raw response at the user.
-	container="$(printf '%s' "$resp" | jq -r '.container // empty' 2>/dev/null)" || container=""
+	container="$(printf '%s' "$resp" | jqr '.container // empty')"
 	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-	echo "cbx: box '$name' up as container '$container'. Attach from the host with:"
-	# -u dev: claude (and its tmux session) runs under the box's 'dev' user, not root. The box carries
-	# an xterm-ghostty terminfo entry, so your native TERM works; for a terminal it doesn't know, add
-	# '-e TERM=xterm-256color'.
+	echo "cbx: box '$name' up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty'))."
 	echo "  docker exec -it -u dev $container tmux attach -t main      # Ctrl-b d to detach"
 }
 
@@ -87,23 +112,21 @@ box_kill() {
 	[ $# -ge 1 ] || die "kill needs a box name"
 	local resp
 	resp="$(broker DELETE "/box/$1")" || die "killing box '$1' failed: $resp"
-	echo "cbx: killed box '$1'"
+	echo "cbx: killed box '$1' (its upper layer is kept — 'cbx box $1' reattaches to it)"
 }
 
 box_recreate() {
 	[ $# -ge 1 ] || die "recreate needs a box name (or 'all')"
-	local resp
-	if [ "$1" = all ]; then
+	local target="$1" q="" resp
+	shift
+	[ "${1:-}" = --fresh ] && q="?fresh=1"
+	if [ "$target" = all ]; then
 		echo "cbx: pulling newest image + recreating all boxes (each resumes its own session)..."
-		resp="$(broker POST "/recreate")" || die "recreate all failed: $resp"
-		echo "cbx: recreated: $(printf '%s' "$resp" | jq -r '.recreated | join(", ")' 2>/dev/null || printf '%s' "$resp")"
+		resp="$(broker POST "/recreate${q}")" || die "recreate all failed: $resp"
+		echo "cbx: recreated: $(printf '%s' "$resp" | jqr '.recreated | join(", ")')"
 	else
-		echo "cbx: pulling newest image + recreating box '$1' (resuming its session)..."
-		resp="$(broker POST "/recreate/$1")" || die "recreate '$1' failed: $resp"
-		local container
-		container="$(printf '%s' "$resp" | jq -r '.container // empty' 2>/dev/null)"
-		echo "cbx: box '$1' recreated as '${container:-box-?-$1}'. Attach from the host with:"
-		echo "  docker exec -it -u dev ${container:-<container>} tmux attach -t main"
+		resp="$(broker POST "/recreate/${target}${q}")" || die "recreate '$target' failed: $resp"
+		echo "cbx: box '$target' recreated as '$(printf '%s' "$resp" | jqr '.container // empty')'."
 	fi
 }
 
@@ -113,11 +136,232 @@ box_ls() {
 	echo "== boxes (broker) =="
 	local resp
 	if resp="$(broker GET "/box" 2>/dev/null)"; then
-		printf '%s' "$resp" | jq -r '.boxes[]? | "  \(.container)\t\(.status)"' 2>/dev/null || printf '  %s\n' "$resp"
+		printf '%s' "$resp" | jq -r '.boxes[]? | "  \(.container)\t\(.status)\tgolden=\(.golden)"' 2>/dev/null \
+			|| printf '  %s\n' "$resp"
 	else
 		echo "  (broker unreachable)"
 	fi
 }
+
+say_to_box() {
+	# Deliver a line into the box's claude session. Note this is a PROMPT, not a shell command: the
+	# window runs claude, so phrase instructions the way you'd type them to the agent.
+	local box="$1" msg="$2" resp
+	resp="$(broker POST "/box/$box/say" --data-raw "$msg")" || die "could not reach box '$box': $resp"
+}
+
+# ------------------------------------------------------------------ review queue
+
+agent_refs() { git_ for-each-ref --format='%(refname:strip=2)' refs/agents/; }
+
+note_of() { git_ notes --ref=cbx show "refs/agents/$1" 2>/dev/null | head -1; }
+
+# Conflicted paths between two committishes, without touching the worktree or the index.
+# --no-messages drops git's "Auto-merging / CONFLICT (content)" prose, leaving the tree oid on line 1
+# and one conflicted path per line after it; a clean merge exits 0 and we report nothing.
+conflicts_between() {
+	local out
+	if out="$(git_ merge-tree --write-tree --name-only --no-messages "$1" "$2" 2>/dev/null)"; then
+		return 0                     # clean merge, nothing to report
+	fi
+	printf '%s' "$out" | tail -n +2 | tr '\n' ' '
+}
+
+review_state() { cat "$STATE/$1.reviewed" 2>/dev/null || true; }
+
+queue() {
+	local any=0 box sha ahead age note prev status conf other
+	printf '%-12s %6s %-14s %-11s %s\n' BOX AHEAD LAST STATUS SUMMARY
+	for box in $(agent_refs); do
+		any=1
+		sha="$(git_ rev-parse "refs/agents/$box")"
+		ahead="$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')"
+		age="$(git_ log -1 --format=%cr "refs/agents/$box")"
+		note="$(note_of "$box")"
+		prev="$(review_state "$box")"
+		if [ -z "$prev" ]; then status=new
+		elif [ "$prev" = "$sha" ]; then status=reviewed
+		else status=re-review; fi
+		printf '%-12s %6s %-14s %-11s %s\n' "$box" "$ahead" "$age" "$status" "${note:-—}"
+		# Conflicts are the shared-checkout collision awareness, moved earlier: you learn that two
+		# agents touched the same lines when they push, not when you merge the second one.
+		conf="$(conflicts_between "$DEV" "refs/agents/$box")"
+		[ -n "$conf" ] && printf '  %-10s ⚠ conflicts with %s: %s\n' "" "$DEV" "$conf"
+		for other in $(agent_refs); do
+			[ "$other" = "$box" ] && continue
+			[[ "$other" > "$box" ]] || continue          # report each pair once
+			conf="$(conflicts_between "refs/agents/$box" "refs/agents/$other")"
+			[ -n "$conf" ] && printf '  %-10s ⚠ conflicts with %s: %s\n' "" "$other" "$conf"
+		done
+	done
+	[ "$any" = 1 ] || echo "  (nothing waiting — no refs/agents/* pushed yet)"
+}
+
+review() {
+	[ $# -ge 1 ] || die "review needs a box name"
+	local box="$1" full="${2:-}" ref sha prev
+	ref="refs/agents/$box"
+	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box' (has it run handoff?)"
+	sha="$(git_ rev-parse "$ref")"
+	prev="$(review_state "$box")"
+	mkdir -p "$STATE"
+
+	echo "== $box: $(git_ rev-list --count "$DEV..$ref") commit(s) on top of $DEV =="
+	git_ log --notes=cbx --oneline "$DEV..$ref" | sed 's/^/  /'
+	echo
+
+	if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ "$full" != --full ] \
+	   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then
+		# Re-review after a fix round: show ONLY what changed since you last looked. range-diff copes
+		# with the amends and rebases a fix round produces, which a plain diff cannot.
+		echo "-- changes since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
+		git_ range-diff "$DEV..$prev" "$DEV..$ref"
+	else
+		if have_delta; then git_ diff "$DEV...$ref" | delta; else git_ --paginate diff "$DEV...$ref"; fi
+	fi
+
+	printf '%s' "$sha" > "$STATE/$box.reviewed"
+	echo
+	echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
+}
+
+fix() {
+	[ $# -ge 1 ] || die "fix needs a box name"
+	local box="$1" msg=""; shift
+	[ "${1:-}" = -m ] && { shift; msg="$*"; } || msg="$*"
+	[ -n "$msg" ] || die "fix needs a message: cbx fix $box -m 'what to change'"
+	say_to_box "$box" "Review feedback on your handoff: ${msg}. Please fix it on your branch, then run: handoff"
+	echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
+}
+
+prereview() {
+	[ $# -ge 1 ] || die "prereview needs a box name"
+	# Cheap capacity multiplier: the agent re-reads its OWN diff critically before you spend a round on
+	# it. This is self-review, not an independent reviewer — see README-remote.md for the difference.
+	say_to_box "$1" "Before I review this: run 'mydiff' and read your own change critically against the project's conventions in CLAUDE.md — dead code, missing tests, unhandled errors, anything you would flag in someone else's PR. Fix what you find, then run: handoff"
+	echo "cbx: asked $1 to self-review and re-hand off."
+}
+
+merge() {
+	[ $# -ge 1 ] || die "merge needs a box name"
+	local box="$1" squash="${2:-}" ref msg
+	ref="refs/agents/$box"
+	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
+	[ -z "$(git_ status --porcelain)" ] || die "the hub working tree is dirty — commit or stash first"
+	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
+
+	git_ checkout -q "$DEV"
+	if [ "$squash" = --squash ]; then
+		git_ merge --squash "$ref" || die "merge conflicts — resolve in $REPO, then commit"
+		git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
+	else
+		git_ merge --no-ff "$ref" -m "$msg" -m "Cbx-Box: $box" \
+			|| die "merge conflicts — resolve in $REPO, then 'git commit'"
+	fi
+	echo "cbx: merged $box into $DEV ($(git_ rev-parse --short HEAD))"
+	git_ update-ref -d "$ref"
+	rm -f "$STATE/$box.reviewed"
+	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
+	# of work starts from what you just landed.
+	say_to_box "$box" "Your work was merged into ${DEV}. Please run: git fetch hub && git rebase hub/${DEV} — then continue with the next task." 2>/dev/null \
+		|| echo "cbx: (box $box not running — it will rebase on next start)"
+	echo "cbx: push it with 'cbx push' when you're ready."
+}
+
+drop() {
+	[ $# -ge 1 ] || die "drop needs a box name"
+	local box="$1"
+	git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
+	rm -f "$STATE/$box.reviewed"
+	say_to_box "$box" "I dropped your handoff — that approach is not going in. Do not re-push it; wait for new instructions." 2>/dev/null || true
+	echo "cbx: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
+}
+
+rebase() {
+	[ $# -ge 1 ] || die "rebase needs a box name (or 'all')"
+	local box list
+	if [ "$1" = all ]; then
+		list="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
+	else
+		list="$1"
+	fi
+	for box in $list; do
+		say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved. Resolve any conflicts, then carry on." 2>/dev/null \
+			&& echo "cbx: asked $box to rebase onto $DEV" \
+			|| echo "cbx: box $box unreachable — skipped"
+	done
+}
+
+push() {
+	git_ push origin "$DEV" && echo "cbx: pushed $DEV to origin"
+}
+
+# ------------------------------------------------------------------ goldens
+
+golden_ls() {
+	local resp
+	resp="$(broker GET /golden)" || die "broker unreachable: $resp"
+	echo "current: $(printf '%s' "$resp" | jqr '.current')"
+	printf '%s' "$resp" | jq -r '.goldens[]? | "  \(.golden)\t\(if .current then "current" else "" end)\tboxes: \(.boxes | join(",") // "-")"' 2>/dev/null \
+		|| printf '  %s\n' "$resp"
+}
+
+golden_reap() {
+	local resp
+	resp="$(broker POST /golden/reap)" || die "reap failed: $resp"
+	echo "cbx: reaped: $(printf '%s' "$resp" | jqr '.reaped | join(", ") // "(none)"')"
+}
+
+golden_refresh() {
+	local id st boxes box dirty
+	id="g-$(date +%Y%m%d-%H%M%S)"
+	st="$STAGING/$id"
+
+	# A refresh discards every box's upper layer, so anything not committed AND pushed is lost. Refuse
+	# rather than eat it — this is the one destructive step in the whole workflow.
+	boxes="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
+	for box in $boxes; do
+		dirty="$(broker GET "/box/$box/dirty" 2>/dev/null | jqr '.dirty[]?' | head -5)"
+		if [ -n "$dirty" ]; then
+			echo "cbx: box '$box' has uncommitted changes:" >&2
+			printf '  %s\n' $dirty >&2
+			die "commit + handoff in that box first (or 'cbx kill $box' to abandon it)"
+		fi
+	done
+
+	mkdir -p "$STAGING"
+	rm -rf "$st"
+	if [ -e "$GOLDEN/current" ]; then
+		# Reflink copy of the PREVIOUS golden: on btrfs the extents are shared, so this is near-free
+		# and — more importantly — node_modules/build caches come along, so prep only rebuilds the delta.
+		echo "cbx: copying $(readlink "$GOLDEN/current") -> staging/$id (reflink)"
+		cp --reflink=auto -a "$GOLDEN/current/." "$st"
+	else
+		echo "cbx: no golden yet — seeding from $REPO"
+		cp --reflink=auto -a "$REPO/." "$st"
+	fi
+
+	echo "cbx: updating the staged tree to $DEV"
+	git -C "$st" fetch -q "$REPO" "$DEV" || die "could not fetch $DEV from $REPO"
+	git -C "$st" checkout -q -B "$DEV" FETCH_HEAD || die "could not check out $DEV in the staged tree"
+	# The boxes reach the hub repo over the cbx network; bake that in so a box's git works immediately.
+	git -C "$st" remote remove hub 2>/dev/null || true
+	git -C "$st" remote add hub "${HUB_GIT_URL:-git://hub/repo}"
+
+	echo "cbx: preparing (${GOLDEN_PREP_CMD})"
+	( cd "$st" && bash -lc "$GOLDEN_PREP_CMD" ) || die "prep failed — staged tree left at $st for inspection"
+
+	# The hub mounts $GOLDEN read-only on purpose, so the broker performs the move + symlink flip.
+	broker POST "/golden/seal/$id" >/dev/null || die "sealing $id failed"
+	echo "cbx: sealed $id as current"
+
+	echo "cbx: moving every box onto it (fresh upper layers)..."
+	broker POST "/recreate?fresh=1" >/dev/null || die "recreate failed"
+	golden_reap
+	echo "cbx: done. Boxes are on $id and back on their pushed branches."
+}
+
+# ------------------------------------------------------------------ box-mounts extras
 
 expose() {
 	[ $# -ge 1 ] || die "expose needs a repo path"
@@ -146,7 +390,22 @@ case "$cmd" in
 	kill)     box_kill "$@" ;;
 	recreate) box_recreate "$@" ;;
 	ls)       box_ls ;;
+	q|queue)  queue ;;
+	review)   review "$@" ;;
+	fix)      fix "$@" ;;
+	prereview) prereview "$@" ;;
+	merge)    merge "$@" ;;
+	drop)     drop "$@" ;;
+	rebase)   rebase "$@" ;;
+	push)     push ;;
+	golden)
+		case "${1:-}" in
+			refresh) golden_refresh ;;
+			ls)      golden_ls ;;
+			reap)    golden_reap ;;
+			*) die "golden needs: refresh | ls | reap" ;;
+		esac ;;
 	expose) expose "$@" ;;
 	hide)   hide "$@" ;;
-	*) sed -n '4,18p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	*) sed -n '4,40p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac

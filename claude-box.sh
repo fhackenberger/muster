@@ -330,9 +330,14 @@ fi
 # relaunch, and a crash leaves a readable shell rather than "no sessions". CLAUDEBOX_CLAUDE_ARGS is
 # appended to the claude command (the broker passes --session-id/--resume so each box keeps its own
 # conversation across recreates); empty on the laptop, so the command is unchanged there.
+# CLAUDEBOX_INIT_CMD (broker: cbx-box-init) runs INSIDE that window first, as the box user and in the
+# checkout — it puts the box on its own agent/<name> branch against the hub. It runs in the window (not
+# here) so its output is visible when you attach, and so a failure leaves a usable shell rather than a
+# box that never starts. `;` not `&&`: a bootstrap that fails must not stop claude from launching.
 if [ "$DETACH" = 1 ]; then
 	_claude="claude${CLAUDEBOX_CLAUDE_ARGS:+ ${CLAUDEBOX_CLAUDE_ARGS}}"
-	RUN_CMD=(bash -lc "tmux new-session -d -s main -n claude \"${_claude}; echo; echo claude exited - type claude to relaunch; exec bash -l\"; exec sleep infinity")
+	_init="${CLAUDEBOX_INIT_CMD:+${CLAUDEBOX_INIT_CMD}; }"
+	RUN_CMD=(bash -lc "tmux new-session -d -s main -n claude \"${_init}${_claude}; echo; echo claude exited - type claude to relaunch; exec bash -l\"; exec sleep infinity")
 fi
 
 # Single cleanup on any exit (normal or signal): revoke the X-server grant (laptop only) and tear
@@ -368,10 +373,12 @@ DISPLAY_ENV=()
 # Forward the broker's PORT_FORWARDS / PORT_FORWARD_<NAME>_FROM/_TO_HUB env into the box (server mode).
 # The project's OWN scripts inside the box read these to wire e.g. CLAUDEBOX_DEV_URL and the frontend's
 # backend URL to the matching hub ports. `-e NAME` (no value) passes the current value from this env.
+# CBX_* comes along the same way: the box's git bootstrap (cbx-box-init) and the handoff/mydiff CLIs
+# read CBX_BOX / CBX_HUB_GIT_URL / CBX_DEV_BRANCH to find their branch and the hub repo.
 PF_ENV=()
 while IFS='=' read -r _pf_name _; do
 	case "$_pf_name" in
-		PORT_FORWARDS|PORT_FORWARD_*) PF_ENV+=(-e "$_pf_name") ;;
+		PORT_FORWARDS|PORT_FORWARD_*|CBX_*) PF_ENV+=(-e "$_pf_name") ;;
 	esac
 done < <(env)
 

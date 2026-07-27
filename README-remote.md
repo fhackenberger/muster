@@ -1,18 +1,29 @@
 # Remote claude-box — per-project compose stack on a shared root server
 
 Run claude-box on a server you SSH into as **root, with no host user accounts**. Each project is
-one `docker-compose` stack (bind mounts, like your other stacks). A **hub** container owns the
-checkout + git identity and runs the dev services (backend, `ng serve`, pinchtab + Chrome) on
-demand; **agent boxes** are separate `claude-box` containers spawned by a socket-holding
-**box-broker**. You detach/reattach to boxes with tmux over SSH. A second project is just a second
-copy of the stack, fully isolated.
+one `docker-compose` stack (bind mounts, like your other stacks). A **hub** container owns the git
+repo + identity and runs the dev services (backend, `ng serve`, pinchtab + Chrome) on demand;
+**agent boxes** are separate `claude-box` containers spawned by a socket-holding **box-broker**.
+You detach/reattach to boxes with tmux over SSH. A second project is just a second copy of the
+stack, fully isolated.
+
+Each agent works **on its own branch** in a copy-on-write overlay of one shared, prepared checkout,
+and pushes to the hub for review. So the expensive part (clone, `npm ci`, warm caches) exists once,
+while each agent's divergence costs only what it actually changed — and you review real git
+branches instead of a diff soup from N agents sharing one working tree.
 
 ```
 compose stack (cbx-<project> network)
-  db (dbtest) · activemq (artemis) · redis · box-broker[socket] · hub[services + git]
+  db (dbtest) · activemq (artemis) · redis · box-broker[socket] · hub[services + git repo]
                                                     │ runs claude-box.sh
                                                     ▼
-                                       box-<project>-<name>  (claude, uid 1000, no .git, no socket)
+                                       box-<project>-<name>  (claude, uid 1000, no socket)
+                                         /home/dev/checkout = overlay(golden) + own upper layer
+                                         branch agent/<name> ──push──▶ hub refs/agents/<name>
+
+  data/golden/g-<id>/     prepared tree (deps installed) — shared read-only by every box
+  data/boxes/<name>/upper/  that box's changes — the only per-agent disk cost
+  data/repo/              the hub's repo: dev, every refs/agents/*, origin credentials
 ```
 
 > **Ansible-managed on the acoveo host.** For the `infostars` stack, everything below is
@@ -58,7 +69,7 @@ mkdir -p /srv/cbx/myproject && cd /srv/cbx/myproject
 cp -r path/to/infostars/docker-claude/{compose.yml,box-broker,hub} .
 cp path/to/infostars/docker-claude/.env.example      .env
 cp path/to/infostars/docker-claude/box-mounts.example box-mounts
-mkdir -p data/{checkout,claude,boxes} data/pinchtab git-identity
+mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
 chown -R 1000:1000 data                                 # boxes + hub run as uid 1000
 $EDITOR .env            # set PROJECT_NAME, STACK_DIR=$(pwd), REPO_URL, tokens, API keys
 ```
@@ -176,29 +187,35 @@ pull from the registry on a *different* host, set `COMPOSE_PULL_POLICY=always` a
 ## Laptop aliases
 
 Everything is driven through `cbx` inside the hub. Rather than typing the full
-`ssh … docker exec …` each time, drop these into your `~/.bashrc`. Set the two variables to your
-server and the stack's `PROJECT_NAME`; the hub container is resolved by its compose labels at call
-time (so it survives compose's `-1` suffix and renames):
+`<transport> … docker exec …` each time, the helpers live in **`cbx.bash_aliases`** (next to this
+README) — source it from your `~/.bashrc`, setting the server and the stack's `PROJECT_NAME` first
+(export them before sourcing, or edit the defaults in the file):
 
 ```sh
-CBX_SERVER=root@your-server      # the claude-box host, e.g. root@hetzner1.acoveo.com
-CBX_PROJECT=myproject            # PROJECT_NAME of the stack, e.g. infostars
-
-# run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1
-alias cbx='ssh -t "$CBX_SERVER" "docker exec -it \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub) cbx"'
-# drop into a shell inside the hub to look around / debug (add -u root before \$( … ) for root):
-alias cbxhub='ssh -t "$CBX_SERVER" "docker exec -it \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub) bash -l"'
-# attach to an agent box by name (Ctrl-b d to detach):  cbxbox work1
-# a function, not an alias — the name lands in the MIDDLE of the command (box-<project>-<name>),
-# which a plain alias (trailing args only) can't do. -u dev: claude's tmux session runs under the
-# box's 'dev' user, not root (root's tmux socket is empty → "no sessions"). The box bakes an
-# xterm-ghostty terminfo entry so a native ghostty TERM works; for a terminal the box doesn't know
-# (e.g. kitty) add `-e TERM=xterm-256color`, or bake its terminfo like ghostty (common-setup.sh).
-cbxbox() { ssh -t "$CBX_SERVER" docker exec -it -u dev "box-${CBX_PROJECT}-$1" tmux attach -t main; }
+# in ~/.bashrc
+export CBX_SERVER=root@hetzner1.acoveo.com   # the claude-box host
+export CBX_PROJECT=infostars                 # PROJECT_NAME of the stack
+source /path/to/claude-box/cbx.bash_aliases
 ```
 
-The `\$(…)` is escaped so the container lookup runs on the server at call time, not when bash loads
-the alias; trailing args (`up backend`) are appended to the remote `cbx` automatically.
+That gives you:
+
+- **`cbx …`** — run any cbx subcommand on the remote hub (`cbx up backend`, `cbx ls`, `cbx box work1`).
+- **`cbxhub`** — a persistent tmux shell in the hub you can detach (Ctrl-b d) / reconnect to.
+- **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
+- **`cbxui [port]`** — SSH-tunnel the hub's dev server (default 4200) to your laptop.
+
+**Transport.** These use **mosh by default** (roaming: sessions survive laptop sleep, Wi-Fi→LTE, and
+IP changes, with no frozen-SSH hangs — it composes with the tmux persistence `cbxhub`/`cbxbox`
+already give you). mosh needs **UDP 60000-61000** open to the server — provisioned by
+`tasks/firewall.yml` (a UFW rule); on a hand-rolled host, open it yourself. It still uses ssh for the
+initial handshake, so key auth is unchanged. Set `CBX_TRANSPORT=ssh` (per call or globally) to fall
+back to plain ssh. **`cbxui` is always ssh** — mosh can't port-forward.
+
+The hub container is resolved by its compose labels at call time (so it survives compose's `-1`
+suffix and renames); the `$(…)` lookup runs on the server, and trailing args (`up backend`) are
+appended to the remote `cbx` automatically. See the file's comments for the per-alias details
+(root shell, terminfo for exotic terminals, etc.).
 
 ## Daily use
 
@@ -238,35 +255,104 @@ cbxbox work1                                                                    
 ssh -t "$CBX_SERVER" docker exec -it -u dev "box-${CBX_PROJECT}-work1" tmux attach -t main   # equivalent, raw
 ```
 
-Curate what boxes see (per project, from the hub); recreate the box to apply:
+Curate EXTRA paths boxes see (the checkout itself is the overlay, see below); recreate to apply:
 
 ```sh
-cbx expose src src rw
-cbx hide  package.json
-cbx kill work1 && cbx box work1
+cbx expose docs reference ro
+cbx hide  docs
+cbx recreate work1
 ```
 
-Commit the agents' edits from the hub (it has `.git` + your identity; boxes don't) — hop in with
-`cbxhub`:
+## The review workflow
+
+An agent starts on `agent/<box>`, based on the hub's `dev`. When it's done it runs `handoff
+"summary"` in its own session, which pushes to `refs/agents/<box>` in the hub repo and attaches the
+summary as a git note. Nothing else in the stack can write `dev`.
 
 ```sh
-cbxhub                                   # then, inside the hub:
-#   cd /work/checkout && git status && git add -A && git commit
+cbx q                       # the queue: who's waiting, how far ahead, conflicts between agents
+cbx review work1            # diff vs dev — on a SECOND look, only what changed since the last one
+cbx fix    work1 -m "extract the dup mapper, add a test for the null branch"
+cbx merge  work1            # merge into dev (--squash for a single commit) + tell the box to rebase
+cbx push                    # dev -> origin
 ```
 
-Watch the UI yourself: SSH-tunnel the hub's dev server, then open your laptop browser:
+```
+$ cbx q
+BOX           AHEAD LAST           STATUS      SUMMARY
+work1             4 12 minutes ago new         Invoice PDF export
+work3             2 40 minutes ago re-review   Fix flaky OrderMapperTest
+             ⚠ conflicts with work1: src/pdf/Renderer.java
+```
+
+- **`cbx review` is incremental.** It records what you last saw, so after a `cbx fix` round it shows
+  a `git range-diff` — only the new work, correct across the amends and rebases a fix round produces.
+  `--full` gives the whole branch.
+- **`cbx fix` types into the agent's claude session** (via the broker, `tmux send-keys`). You never
+  attach; the agent fixes and re-runs `handoff`, and the box shows up as `re-review` in `cbx q`.
+- **Conflicts surface at push time, not merge time.** Every push is test-merged against `dev` *and*
+  against every other live agent branch (`git merge-tree`, no worktree touched), so you learn that
+  two agents hit the same lines while you can still tell one of them to rebase.
+- **`cbx prereview work1`** asks the agent to critique its own diff (`mydiff`) against `CLAUDE.md`
+  before you spend a round on it. It is self-review, not an independent reviewer — an ephemeral
+  reviewer box is the obvious next step, not built yet.
+- `cbx drop work1` discards a branch and tells the box; `cbx rebase all` moves every agent onto the
+  current `dev` without a recreate (cheap, use it after merging).
+
+Inside a box the agent has three commands: `mydiff` (exactly what it will hand over, its branch
+only), `handoff "summary"`, and ordinary git. It has no credentials for the real origin and the
+hub's `update` hook rejects any push outside `refs/agents/*`.
+
+## Goldens: the shared prepared checkout
+
+`data/golden/g-<id>` is a full, ready-to-build tree — cloned, `npm ci` done, caches warm. Every box
+mounts it as an overlayfs `lowerdir` (a docker `local` volume with `type=overlay`, so **no container
+needs `CAP_SYS_ADMIN`**) and writes into `data/boxes/<name>/upper`. Six agents cost one golden plus
+six diffs, and a spawn is a mount, not an `npm ci`.
+
+Goldens are immutable while boxes run on them (changing a `lowerdir` under a live overlay is
+undefined behaviour), so they're versioned with `current` pointing at the newest.
 
 ```sh
-ssh -L 4200:$(ssh "$CBX_SERVER" "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=hub)"):4200 "$CBX_SERVER"
+cbx golden ls           # snapshots, which is current, which boxes still reference each
+cbx golden refresh      # new base at the current dev, with deps rebuilt, and move every box onto it
+cbx golden reap         # delete snapshots nothing references
+```
+
+`cbx golden refresh` reflink-copies the previous golden (near-free on btrfs, and `node_modules`
+comes along so only the delta is rebuilt), updates it to `dev`, runs `GOLDEN_PREP_CMD`, has the
+broker seal it, then recreates every box with a **fresh upper layer**. It refuses to run while any
+box has uncommitted changes — that's the one destructive step in the workflow, and it's why agents
+should `handoff` before you refresh.
+
+Most days you don't need it: **`cbx rebase all`** moves agents onto a newer `dev` with a `git fetch`
++ `rebase` in each box, no golden and no recreate. Refresh only when dependencies changed.
+
+Watch the UI yourself: SSH-tunnel the hub's dev server with **`cbxui`** (from `cbx.bash_aliases`),
+then open `http://localhost:4200` in your laptop browser:
+
+```sh
+cbxui           # tunnel port 4200 (the default); cbxui 9867 for another port
 ```
 
 ## Notes
 
-- **Isolation:** a box mounts only what `box-mounts` grants (default: the tree `rw`, `.git`
-  hidden), has no git identity and no docker socket, and can't see the hub's filesystem. Its only
-  shared surface is the network (`hub:8080/4200/9867`).
+- **Isolation:** a box sees its own overlay of the golden plus whatever `box-mounts` adds, has no
+  docker socket, no credentials for the real origin, and can't see the hub's filesystem or another
+  box's upper layer. Its only shared surface is the network (`hub:8080/4200/9867/9418`).
 - **Broker policy:** the hub passes a box name + the manifest; the broker fixes image/uid/network/
-  privileges and confines every mount source under the checkout. It is the only socket holder.
+  privileges, confines every extra mount source under the golden, and owns the overlay volumes. It
+  is the only socket holder. Its two box-facing operations (`/say`, `/dirty`) run **fixed** commands
+  — there is no arbitrary-exec endpoint.
+- **git daemon has no auth.** Boxes push over `git://` on the cbx network; the `update` hook in
+  `data/repo` (installed by the hub entrypoint) is what bounds that: `refs/agents/*` and
+  `refs/notes/cbx` only, so a box can never write `dev` or delete a branch.
+- **Sealing a golden is a read-only mount, never file modes.** The hub mounts `data/golden` `ro` and
+  prepares in `data/golden-staging`; the broker does the move. File modes cannot be used here:
+  overlayfs checks write permission on the merged inode *before* deciding to copy up, so a
+  non-writable golden makes every file unwritable inside the box instead of protecting anything.
+- **`cbx kill` keeps the box's upper layer** on disk, so `cbx box <same name>` reattaches to its
+  uncommitted work. Only `cbx golden refresh` (and `cbx recreate --fresh`) discards it.
 - **Shared caches:** the hub and every box mount the SAME `data/npm-cache` and `data/gradle-cache`
   (rw) at `~/.npm` and `~/.gradle`, so node/gradle artifacts are downloaded once — no per-box
   duplication on the host. uid 1000 owns them (the `dev`/`gradle` users share it), and npm/gradle

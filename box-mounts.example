@@ -1,26 +1,28 @@
-# box-mounts — what the agent boxes can see, decided per project (edit from the hub with
-# `cbx expose` / `cbx hide`, or by hand). All sources are confined under the checkout by the
-# broker. Recreate a box (cbx kill + cbx box) to apply changes.
+# box-mounts — EXTRA paths the agent boxes see, on top of their checkout. Edit from the hub with
+# `cbx expose` / `cbx hide`, or by hand. All sources are confined under the golden tree by the
+# broker. Recreate a box (cbx recreate <box>) to apply changes.
+#
+# The checkout itself is NOT configured here any more: every box gets an overlayfs view of the
+# shared prepared golden tree (data/golden/current) at /home/dev/checkout, writing into its own
+# upper layer. That's what makes N agents cost N x (their own diff) instead of N full checkouts,
+# and it's why each box has a real .git and works on its own branch (agent/<box>).
 #
 # Grammar (whitespace-separated; '#'/blank ignored):
-#   TREE <dst> <ro|rw>     mount the WHOLE checkout at /home/dev/<dst>, with <dst>/.git shadowed
-#                          (agents edit everything but never see .git); also sets the box workdir
-#   <src> <dst> <ro|rw>    mount checkout/<src> at /home/dev/<dst>
+#   TREE <dst> <ro|rw>     where the overlay checkout lands (default: 'checkout rw'). 'ro' mounts the
+#                          golden directly read-only instead — no upper layer, no writes, no git
+#                          bootstrap. Useful for a look-but-don't-touch box.
+#   <src> <dst> <ro|rw>    golden/<src> bind-mounted at /home/dev/<dst>
 #
-# Default: whole working tree, writable, .git hidden — only the hub can git/commit/push.
-TREE checkout rw
+# Default (this file absent or empty): just the overlay checkout at /home/dev/checkout. That is the
+# normal setup — you only need lines here for something outside the repo tree.
 
-# Examples of finer control instead of TREE:
+# Examples:
 
-# Full repo, but .git read-only
-#  .      checkout       rw
-#  .git   checkout/.git  ro
+# Put the checkout somewhere else in the box's home
+#   TREE work rw
 
-# Full repo, but .git writable (agent still unable to push, as it's missing repo credentials)
-#  .      checkout       rw
-#  .git   checkout/.git  ro
+# A read-only box that can look at the code but never change it
+#   TREE checkout ro
 
-# Only parts of the repo, partly read-only
-#   src           src            rw
-#   package.json  package.json   ro
-#   checkout/.git checkout/.git  ro     # expose history read-only if agents need `git diff/log`
+# Additionally expose a subdirectory read-only at a second path (e.g. reference material)
+#   docs  reference  ro

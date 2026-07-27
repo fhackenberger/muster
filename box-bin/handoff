@@ -1,0 +1,38 @@
+#!/bin/bash
+set -euo pipefail
+
+# handoff — hand this box's work to the hub for review.
+#
+#   handoff "short summary of what I did"
+#   handoff                                  (re-push after a fix round, summary unchanged)
+#
+# Pushes the current branch to the hub as refs/agents/<box> and attaches the summary as a git note
+# (ref 'cbx'), so the reviewer sees it in `cbx q` / `cbx review` without it polluting the tree or a
+# commit message. Force-push is intentional and safe: refs/agents/<box> is this box's OWN ref, and
+# amending/rebasing during a fix round is normal.
+
+: "${CBX_BOX:?handoff: CBX_BOX not set (this only works inside a server-mode box)}"
+cd "$(git rev-parse --show-toplevel)"
+
+summary="$*"
+branch="$(git rev-parse --abbrev-ref HEAD)"
+
+# Uncommitted work is NOT handed off — say so loudly rather than letting the reviewer see a
+# half-finished changeset (and rather than committing on the agent's behalf).
+if [ -n "$(git status --porcelain)" ]; then
+	echo "handoff: WARNING — uncommitted changes will NOT be reviewed:" >&2
+	git status --short >&2
+	echo "handoff: commit them first, then re-run handoff." >&2
+fi
+
+if [ -n "$summary" ]; then
+	git notes --ref=cbx add -f -m "$summary" HEAD
+fi
+
+git push -q -f hub "HEAD:refs/agents/${CBX_BOX}"
+git notes --ref=cbx list >/dev/null 2>&1 && git push -q -f hub refs/notes/cbx:refs/notes/cbx || true
+
+ahead="$(git rev-list --count "hub/${CBX_DEV_BRANCH:-dev}..HEAD" 2>/dev/null || echo '?')"
+echo "handoff: pushed ${branch} -> refs/agents/${CBX_BOX} (${ahead} commit(s) ahead of ${CBX_DEV_BRANCH:-dev})"
+[ -n "$summary" ] && echo "handoff: summary recorded — the reviewer sees it in 'cbx q'"
+echo "handoff: waiting for review. Feedback arrives as a message in this session."

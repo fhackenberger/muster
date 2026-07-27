@@ -94,6 +94,14 @@ RUN for t in xclip xsel; do \
 		&& chmod 0755 /usr/local/bin/$t; \
 	done
 
+# Agent-side git CLIs (server mode only; harmless on a laptop box, where CBX_BOX is unset):
+#   cbx-box-init  puts the box on its own agent/<box> branch against the hub (run by claude-box.sh
+#                 via CLAUDEBOX_INIT_CMD before claude starts)
+#   handoff       push the branch to the hub for review, with a summary as a git note
+#   mydiff        exactly what this box will hand over (its branch vs the hub's dev)
+COPY box-bin/cbx-box-init box-bin/handoff box-bin/mydiff /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/cbx-box-init /usr/local/bin/handoff /usr/local/bin/mydiff
+
 # Root entrypoint: materialize the runtime user from HOST_USER/UID/GID, then drop privileges.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh

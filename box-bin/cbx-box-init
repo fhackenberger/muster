@@ -1,0 +1,65 @@
+#!/bin/bash
+set -euo pipefail
+
+# cbx-box-init — put this box on its own agent branch. Runs in the box's tmux window just before
+# claude starts (claude-box.sh wires it via CLAUDEBOX_INIT_CMD; the broker sets that for every
+# server-mode box). Laptop boxes never run it.
+#
+# The checkout is an overlay of the shared golden tree, so it already contains a real .git with the
+# repo's history — but that clone's remote points at a path only the hub can see. This script wires
+# the box to the hub over the cbx network and lands it on agent/<box>, based on the hub's dev branch:
+#
+#   hub /work/repo  ──git://hub/repo──▶  box  agent/<box>  ──push refs/agents/<box>──▶  hub
+#
+# It is idempotent and recreate-safe: a box whose upper layer survived a recreate keeps its local
+# branch and commits untouched, and only re-fetches.
+#
+# Env (from the broker):  CBX_BOX  CBX_HUB_GIT_URL  CBX_DEV_BRANCH
+
+: "${CBX_BOX:?cbx-box-init: CBX_BOX not set}"
+HUB_URL="${CBX_HUB_GIT_URL:-git://hub/repo}"
+DEV="${CBX_DEV_BRANCH:-dev}"
+BRANCH="agent/${CBX_BOX}"
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# Identity. Every commit is attributable to the box that made it; the hub's own identity (and the
+# credentials that can reach GitHub) stay on the hub — a box can only ever push to this hub repo.
+git config user.name  "agent-${CBX_BOX}"
+git config user.email "agent-${CBX_BOX}@claude-box.local"
+
+# One remote, 'hub'. The golden's clone remote is a hub-only path, so drop it to avoid confusion —
+# `git fetch`/`git push` with no remote then resolve to the hub, which is the only thing reachable.
+git remote get-url origin >/dev/null 2>&1 && git remote remove origin
+if git remote get-url hub >/dev/null 2>&1; then
+	git remote set-url hub "$HUB_URL"
+else
+	git remote add hub "$HUB_URL"
+fi
+# Fetch the agent refs too, so a recreated box can find its own pushed branch, and the review notes
+# (`git log --notes=cbx`) so an agent can read what it told the hub last time.
+git config --replace-all remote.hub.fetch '+refs/heads/*:refs/remotes/hub/*'
+git config --add         remote.hub.fetch '+refs/agents/*:refs/remotes/hub-agents/*'
+git config --add         remote.hub.fetch '+refs/notes/cbx:refs/notes/cbx'
+
+if ! git fetch --prune hub 2>&1; then
+	echo "cbx-box-init: could not reach the hub at $HUB_URL — working offline on the golden's history." >&2
+	exit 0
+fi
+
+# Land on the agent branch, preferring what already exists:
+#   local branch  -> keep it (a recreate that preserved upper/; the agent's WIP is here)
+#   pushed branch -> restore it (upper/ was discarded by a golden refresh, work was already pushed)
+#   neither       -> start fresh from the hub's dev branch
+if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+	git checkout -q "$BRANCH"
+	echo "cbx-box-init: on ${BRANCH} (resumed local work)"
+elif git show-ref --verify --quiet "refs/remotes/hub-agents/${CBX_BOX}"; then
+	git checkout -q -B "$BRANCH" "refs/remotes/hub-agents/${CBX_BOX}"
+	echo "cbx-box-init: on ${BRANCH} (restored from the hub)"
+else
+	git checkout -q -B "$BRANCH" "refs/remotes/hub/${DEV}"
+	echo "cbx-box-init: on ${BRANCH} (fresh, based on ${DEV})"
+fi
+
+echo "cbx-box-init: 'mydiff' shows your work, 'handoff \"summary\"' sends it to the hub for review."

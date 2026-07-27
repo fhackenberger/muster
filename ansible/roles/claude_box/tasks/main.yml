@@ -20,8 +20,15 @@
     file: path={{ item }} state=directory owner=1000 group=root mode="u=rwx,g=rx,o="
     with_items:
       - /virtual_machines/claude-box-docker/data/
-      - /virtual_machines/claude-box-docker/data/checkout/
+      # The hub's authoritative git repo (dev + every refs/agents/*, and the only clone with the
+      # deploy key). Was data/checkout before the agent-branch workflow — see README-remote.md.
+      - /virtual_machines/claude-box-docker/data/repo/
+      # Prepared checkouts the agent boxes overlay (data/golden/current), plus the staging dir the
+      # hub prepares a new one in before the broker seals it into place.
+      - /virtual_machines/claude-box-docker/data/golden/
+      - /virtual_machines/claude-box-docker/data/golden-staging/
       - /virtual_machines/claude-box-docker/data/claude/
+      # Per-box state: session id, port-forward slot, and the box's overlay upper layer.
       - /virtual_machines/claude-box-docker/data/boxes/
       - /virtual_machines/claude-box-docker/data/pinchtab/
       # Shared npm + gradle caches (mounted rw into the hub + every box at ~/.npm and ~/.gradle)

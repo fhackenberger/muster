@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+# mydiff — exactly what this box will hand over: everything on agent/<box> since it diverged from
+# the hub's dev branch. Other agents' parallel work is NOT in here (they're on their own branches),
+# so this is your changeset and nobody else's.
+#
+#   mydiff            full diff
+#   mydiff --stat     just the file list
+#   mydiff --log      the commits (with their handoff notes)
+#
+# Review this before running `handoff` — anything you catch here is a review round you don't spend.
+
+DEV="${CBX_DEV_BRANCH:-dev}"
+cd "$(git rev-parse --show-toplevel)"
+
+git fetch -q hub 2>/dev/null || true
+base="hub/${DEV}"
+git rev-parse --verify -q "$base" >/dev/null || base="$DEV"
+
+case "${1:-}" in
+	--log)  exec git log --notes=cbx --oneline "${base}..HEAD" ;;
+	--stat) exec git diff --stat "${base}...HEAD" ;;
+esac
+
+if command -v delta >/dev/null 2>&1; then
+	git diff "${base}...HEAD" | delta
+else
+	git --paginate diff "${base}...HEAD"
+fi

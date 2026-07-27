@@ -8,6 +8,18 @@ image, uid, network, privileges and the socket are the broker's. Every curated m
 resolved and confined under the project root, so a compromised hub can expose project files to a
 box but can never mount host paths or gain privilege.
 
+THE CHECKOUT IS AN OVERLAY. One prepared "golden" tree (cloned, deps installed, caches warm) is
+shared read-only by every box as an overlayfs lowerdir; each box writes into its own upperdir, so
+N agents cost N x (their own diff) instead of N full checkouts. The mount is performed by DOCKER
+(a local-driver volume with type=overlay), so neither this broker nor the box needs CAP_SYS_ADMIN.
+Each box therefore gets a REAL .git and works on its own branch (agent/<box>), pushing to the hub;
+the hub reviews and merges. See hub/cbx and README-remote.md.
+
+Goldens are immutable while any box is overlaid on one (changing a lowerdir under a live overlay
+is undefined behaviour), so they are versioned: data/golden/g-<id>, with `current` pointing at the
+newest. The hub prepares a new one in data/golden-staging (the only golden path it can write) and
+calls /golden/seal to move it into place; boxes pick it up on the next recreate.
+
 To keep spawns fast AND current, the broker pulls BOX_IMAGE in the background at startup and after
 each spawn — so a new box uses a recent image without ever waiting on a `docker pull`.
 
@@ -17,10 +29,15 @@ Config (env, from compose):
   PROJECT_NAME        used for the box name prefix  box-<project>-<name>
   BOX_IMAGE           the claude-box image (default: claude-box)
   BOX_NETWORK         docker network the box joins (e.g. cbx-<project>)
-  PROJECT_ROOT        HOST path of the repo checkout — the mount-source confinement root
+  GOLDEN_DIR          HOST path holding the sealed goldens + the `current` symlink
+  GOLDEN_STAGING      HOST path the hub prepares new goldens in (sealed via /golden/seal)
+  PROJECT_ROOT        confinement root for box-mounts extras (default: the current golden)
+  CHECKOUT_DST        where the overlay is mounted in the box (default /home/dev/checkout)
   CLAUDE_HOME         HOST path of the shared ~/.claude (mounted into every box)
-  BOXROOT             HOST path whose <name>/home subdir is each box's empty home anchor
-  BOX_MOUNTS          HOST path of the box-mounts manifest
+  BOXROOT             HOST path whose <name>/{home,upper,work} subdirs back each box
+  BOX_MOUNTS          HOST path of the box-mounts manifest (EXTRA mounts only; see box-mounts.example)
+  DEV_BRANCH          branch agents base their work on (default: dev)
+  HUB_GIT_URL         the hub repo as the boxes reach it (default: git://hub/repo)
   PINCHTAB_SERVER     e.g. http://hub:9867     PINCHTAB_TOKEN  the pinchtab token
   PORT_FORWARDS_FILE  HOST path of the port-forwards manifest (NAME BOX_PORT HUB_BASE_PORT per line)
   PORT_FORWARD_SLOTS  max concurrent boxes with forwards; each box's slot N -> hub port BASE+N (dflt 16)
@@ -30,6 +47,7 @@ Config (env, from compose):
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import uuid
@@ -40,15 +58,19 @@ PORT = int(os.environ.get("BROKER_PORT", "8099"))
 PROJECT = os.environ.get("PROJECT_NAME", "project")
 BOX_IMAGE = os.environ.get("BOX_IMAGE", "claude-box")
 BOX_NETWORK = os.environ.get("BOX_NETWORK", "")
-PROJECT_ROOT = os.path.realpath(os.environ.get("PROJECT_ROOT", "/work/checkout"))
+GOLDEN_DIR = os.environ.get("GOLDEN_DIR", "")
+GOLDEN_STAGING = os.environ.get("GOLDEN_STAGING", "")
+CHECKOUT_DST = os.environ.get("CHECKOUT_DST", "/home/dev/checkout")
 CLAUDE_HOME = os.environ.get("CLAUDE_HOME", "")
 # Shared package caches mounted (rw) into every box AND the hub at ~/.npm and ~/.gradle, so node/gradle
-# artifacts are downloaded once, not duplicated per box. uid 1000 (dev/gradle) owns them; npm + gradle
-# both handle concurrent access to a shared cache via their own file locks.
+# artifacts are downloaded once, not duplicated per box. uid 1000 (dev) owns them; npm + gradle both
+# handle concurrent access to a shared cache via their own file locks.
 NPM_CACHE = os.environ.get("NPM_CACHE", "")
 GRADLE_CACHE = os.environ.get("GRADLE_CACHE", "")
 BOXROOT = os.environ.get("BOXROOT", "")
 BOX_MOUNTS = os.environ.get("BOX_MOUNTS", "")
+DEV_BRANCH = os.environ.get("DEV_BRANCH", "dev")
+HUB_GIT_URL = os.environ.get("HUB_GIT_URL", "git://hub/repo")
 PT_SERVER = os.environ.get("PINCHTAB_SERVER", "")
 PT_TOKEN = os.environ.get("PINCHTAB_TOKEN", "")
 # Per-project port forwards (like box-mounts). File grammar: 'NAME BOX_PORT HUB_BASE_PORT' per line;
@@ -60,14 +82,22 @@ BOX_GID = os.environ.get("BOX_GID", "1000")
 CLAUDEBOX_SCRIPT = os.environ.get("CLAUDEBOX_SCRIPT", "/usr/local/bin/claude-box.sh")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+GOLDEN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 HOME_IN = "/home/dev"
 
 # Serializes the background `docker pull` of BOX_IMAGE so concurrent spawns don't each start one.
 _pull_lock = threading.Lock()
+# Serializes golden seal/reap against spawns, so a box can never be created against a golden that is
+# being moved or deleted underneath it.
+_golden_lock = threading.RLock()
 
 
 def box_container(name):
 	return f"box-{PROJECT}-{name}"
+
+
+def box_volume(name):
+	return f"cbx-{PROJECT}-{name}"
 
 
 def pf_container(name, fwd_name):
@@ -85,6 +115,79 @@ def hub_container():
 	ids = r.stdout.split()
 	return ids[0] if ids else None
 
+
+# --------------------------------------------------------------------------- goldens
+
+def current_golden():
+	"""HOST path of the golden the next box should overlay. Follows data/golden/current."""
+	if not GOLDEN_DIR:
+		raise RuntimeError("GOLDEN_DIR is not configured")
+	cur = os.path.join(GOLDEN_DIR, "current")
+	if not os.path.exists(cur):
+		raise RuntimeError(
+			"no golden yet — prepare one from the hub with: cbx golden refresh")
+	return os.path.realpath(cur)
+
+
+def list_goldens():
+	"""Sealed goldens, which one is current, and which boxes reference each (reap safety)."""
+	out, cur = [], ""
+	try:
+		cur = os.path.basename(current_golden())
+	except RuntimeError:
+		pass
+	in_use = {}
+	if BOXROOT and os.path.isdir(BOXROOT):
+		for d in sorted(os.listdir(BOXROOT)):
+			gf = os.path.join(BOXROOT, d, "golden")
+			if os.path.exists(gf):
+				in_use.setdefault(open(gf).read().strip(), []).append(d)
+	if GOLDEN_DIR and os.path.isdir(GOLDEN_DIR):
+		for d in sorted(os.listdir(GOLDEN_DIR)):
+			p = os.path.join(GOLDEN_DIR, d)
+			if d == "current" or not os.path.isdir(p) or os.path.islink(p):
+				continue
+			out.append({"golden": d, "current": d == cur, "boxes": in_use.get(d, [])})
+	return {"goldens": out, "current": cur, "staging": GOLDEN_STAGING}
+
+
+def seal_golden(gid):
+	"""Move a hub-prepared staging tree into GOLDEN_DIR and point `current` at it.
+
+	The hub cannot do this itself: it mounts GOLDEN_DIR read-only precisely so it can never write a
+	sealed golden (mode bits can't be used for that — overlayfs checks write permission on the merged
+	inode BEFORE copy-up, so a non-writable golden would make every file unwritable inside the box)."""
+	if not GOLDEN_RE.match(gid):
+		raise ValueError("bad golden id")
+	with _golden_lock:
+		src = os.path.join(GOLDEN_STAGING, gid)
+		dst = os.path.join(GOLDEN_DIR, gid)
+		if not os.path.isdir(src):
+			raise RuntimeError(f"no staged golden at {src}")
+		if os.path.exists(dst):
+			raise RuntimeError(f"golden {gid} already exists")
+		os.rename(src, dst)          # same filesystem (both under the stack dir) -> atomic
+		link = os.path.join(GOLDEN_DIR, "current")
+		tmp = link + ".tmp"
+		os.symlink(gid, tmp)
+		os.replace(tmp, link)        # atomic flip; boxes spawned from here on get the new golden
+		return {"sealed": gid, "current": gid}
+
+
+def reap_goldens():
+	"""Delete sealed goldens that are neither current nor referenced by an existing box dir."""
+	with _golden_lock:
+		info = list_goldens()
+		removed = []
+		for g in info["goldens"]:
+			if g["current"] or g["boxes"]:
+				continue
+			shutil.rmtree(os.path.join(GOLDEN_DIR, g["golden"]), ignore_errors=True)
+			removed.append(g["golden"])
+		return {"reaped": removed}
+
+
+# --------------------------------------------------------------------------- port forwards
 
 def parse_port_forwards():
 	"""Per-project forwards from PORT_FORWARDS_FILE (like box-mounts). One line each:
@@ -167,6 +270,8 @@ def stop_forwarders(name):
 		subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, text=True)
 
 
+# --------------------------------------------------------------------------- mounts
+
 def safe_dst(dst):
 	"""Container-side destination under HOME_IN; reject absolute / traversal."""
 	dst = dst.strip().lstrip("/")
@@ -176,27 +281,25 @@ def safe_dst(dst):
 	return f"{HOME_IN}/{norm}"
 
 
-def confined_src(src):
-	"""HOST source, forced to resolve under PROJECT_ROOT (blocks /, the socket, other projects)."""
+def confined_src(src, root):
+	"""HOST source, forced to resolve under `root` (blocks /, the socket, other projects)."""
 	src = src.strip()
-	cand = os.path.realpath(os.path.join(PROJECT_ROOT, src))
-	if cand != PROJECT_ROOT and not cand.startswith(PROJECT_ROOT + os.sep):
+	cand = os.path.realpath(os.path.join(root, src))
+	if cand != root and not cand.startswith(root + os.sep):
 		raise ValueError(f"mount source {src!r} escapes the project root")
 	return cand
 
 
-def parse_manifest():
-	"""Return (mounts, tmpfs, workdir). Grammar per line:
-	    TREE <dst> <ro|rw>      whole checkout at HOME_IN/<dst>, with <dst>/.git shadowed; sets workdir
-	    <src> <dst> <ro|rw>     checkout/<src> at HOME_IN/<dst>
-	'#'/blank lines ignored. The workdir defaults to the whole-repo mount (the line whose
-	src resolves to the project root, e.g. '.'), else the first mount, else HOME_IN."""
-	mounts, tmpfs, workdir = [], [], None
+def parse_manifest(golden):
+	"""EXTRA mounts from box-mounts, on top of the overlay checkout. Grammar per line:
+	    TREE <dst> <ro|rw>     where the overlay checkout lands (default: checkout rw). `ro` mounts the
+	                           golden directly read-only instead of an overlay (no upper, no writes).
+	    <src> <dst> <ro|rw>    golden/<src> bind-mounted at HOME_IN/<dst>
+	Returns (mounts, checkout_dst, checkout_ro). '#'/blank lines ignored; a missing file means just the
+	overlay checkout at CHECKOUT_DST."""
+	mounts, checkout_dst, checkout_ro = [], CHECKOUT_DST, False
 	if not BOX_MOUNTS or not os.path.exists(BOX_MOUNTS):
-		# default: whole tree, .git hidden
-		mounts.append(f"{PROJECT_ROOT}:{HOME_IN}/checkout")
-		tmpfs.append(f"{HOME_IN}/checkout/.git")
-		return mounts, tmpfs, f"{HOME_IN}/checkout"
+		return mounts, checkout_dst, checkout_ro
 	with open(BOX_MOUNTS) as fh:
 		for raw in fh:
 			line = raw.strip()
@@ -204,28 +307,48 @@ def parse_manifest():
 				continue
 			parts = line.split()
 			if parts[0] == "TREE":
-				dst = safe_dst(parts[1]) if len(parts) > 1 else f"{HOME_IN}/checkout"
-				mode = parts[2] if len(parts) > 2 else "rw"
-				suffix = ":ro" if mode == "ro" else ""
-				mounts.append(f"{PROJECT_ROOT}:{dst}{suffix}")
-				tmpfs.append(f"{dst}/.git")
-				workdir = dst
+				checkout_dst = safe_dst(parts[1]) if len(parts) > 1 else CHECKOUT_DST
+				checkout_ro = len(parts) > 2 and parts[2] == "ro"
 			else:
 				src, dst = parts[0], (parts[1] if len(parts) > 1 else parts[0])
 				mode = parts[2] if len(parts) > 2 else "rw"
 				suffix = ":ro" if mode == "ro" else ""
-				csrc, mdst = confined_src(src), safe_dst(dst)
-				mounts.append(f"{csrc}:{mdst}{suffix}")
-				# Land the box in the repo: the whole-checkout mount (src resolves to the project
-				# root, e.g. the '.' line) sets the workdir; else the first mount seeds it.
-				if csrc == PROJECT_ROOT:
-					workdir = mdst
-				elif workdir is None:
-					workdir = mdst
-	return mounts, tmpfs, workdir or HOME_IN
+				mounts.append(f"{confined_src(src, golden)}:{safe_dst(dst)}{suffix}")
+	return mounts, checkout_dst, checkout_ro
 
 
-def create_box(name, resume=False):
+def make_overlay_volume(name, golden, fresh_upper=False):
+	"""(Re)create the box's checkout volume: golden as lowerdir, the box's own upperdir on top.
+
+	Docker's local driver performs the mount itself, so no capability is needed here or in the box.
+	Mount options are fixed at create time, so the volume is always recreated (removing a volume does
+	NOT touch upper/ — that's what lets a recreate keep the agent's uncommitted work)."""
+	vol = box_volume(name)
+	box_dir = os.path.join(BOXROOT, name)
+	upper, work = os.path.join(box_dir, "upper"), os.path.join(box_dir, "work")
+	if fresh_upper:
+		shutil.rmtree(upper, ignore_errors=True)
+		shutil.rmtree(work, ignore_errors=True)
+	for d in (upper, work):
+		os.makedirs(d, exist_ok=True)
+		os.chown(d, int(BOX_UID), int(BOX_GID))
+	subprocess.run(["docker", "volume", "rm", vol], capture_output=True, text=True)
+	r = subprocess.run(
+		["docker", "volume", "create", "--driver", "local",
+		 "--opt", "type=overlay", "--opt", "device=overlay",
+		 "--opt", f"o=lowerdir={golden},upperdir={upper},workdir={work}", vol],
+		capture_output=True, text=True,
+	)
+	if r.returncode != 0:
+		raise RuntimeError(f"creating the overlay volume failed: {r.stderr.strip()}")
+	return vol
+
+
+# --------------------------------------------------------------------------- boxes
+
+def create_box(name, resume=False, fresh_upper=False):
+	with _golden_lock:
+		golden = current_golden()
 	container = box_container(name)
 	box_dir = os.path.join(BOXROOT, name)
 	anchor = os.path.join(box_dir, "home")
@@ -234,10 +357,10 @@ def create_box(name, resume=False):
 	if CLAUDE_HOME:
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
-	# Per-box claude session. All boxes share CLAUDE_HOME + the same cwd, so `claude --continue` would
-	# be ambiguous across boxes; instead we pin a stable session id per box (stored in the box dir) and
-	# resume THAT. A fresh spawn gets a new --session-id (recorded); a recreate reuses it via --resume,
-	# so the box picks up exactly where it left off.
+	# Per-box claude session. All boxes share CLAUDE_HOME, so `claude --continue` would be ambiguous
+	# across boxes; instead we pin a stable session id per box (stored in the box dir) and resume THAT.
+	# A fresh spawn gets a new --session-id (recorded); a recreate reuses it via --resume, so the box
+	# picks up exactly where it left off.
 	session_file = os.path.join(box_dir, "session-id")
 	claude_args = ""
 	if resume and os.path.exists(session_file):
@@ -256,7 +379,14 @@ def create_box(name, resume=False):
 	# out of slots refuses the spawn (alloc_slot raises).
 	forwards = parse_port_forwards()
 	slot = alloc_slot(box_dir) if forwards else None
-	mounts, tmpfs, workdir = parse_manifest()
+	mounts, checkout_dst, checkout_ro = parse_manifest(golden)
+	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
+	if checkout_ro:
+		mounts.insert(0, f"{golden}:{checkout_dst}:ro")
+	else:
+		mounts.insert(0, f"{make_overlay_volume(name, golden, fresh_upper)}:{checkout_dst}")
+	with open(os.path.join(box_dir, "golden"), "w") as fh:
+		fh.write(os.path.basename(golden))
 	# Shared package caches (rw) at ~/.npm and ~/.gradle — one copy across the hub + all boxes, so
 	# node/gradle don't re-download per box. The dirs are created + chowned to the box uid here.
 	for cache_host, cache_dst in ((NPM_CACHE, f"{HOME_IN}/.npm"), (GRADLE_CACHE, f"{HOME_IN}/.gradle")):
@@ -276,12 +406,18 @@ def create_box(name, resume=False):
 		CLAUDEBOX_NETWORK=BOX_NETWORK,
 		CLAUDEBOX_SHARED=anchor,
 		CLAUDEBOX_CLAUDE_DIR=CLAUDE_HOME,
-		CLAUDEBOX_WORKDIR=workdir,
+		CLAUDEBOX_WORKDIR=checkout_dst,
 		CLAUDEBOX_CLAUDE_ARGS=claude_args,
 		CLAUDEBOX_PINCHTAB_SERVER=PT_SERVER,
 		CLAUDEBOX_PINCHTAB_TOKEN=PT_TOKEN,
 		CLAUDEBOX_EXTRA_MOUNTS="\n".join(mounts),
-		CLAUDEBOX_EXTRA_TMPFS="\n".join(tmpfs),
+		CLAUDEBOX_EXTRA_TMPFS="",
+		# Runs in the box's tmux window before claude: puts the box on its own agent/<name> branch,
+		# based on the hub's DEV_BRANCH, with the hub as its only remote (see box-bin/cbx-box-init).
+		CLAUDEBOX_INIT_CMD="cbx-box-init" if not checkout_ro else "",
+		CBX_BOX="" if checkout_ro else name,
+		CBX_HUB_GIT_URL=HUB_GIT_URL,
+		CBX_DEV_BRANCH=DEV_BRANCH,
 		HOME="/tmp",
 	)
 	forward_ports = {}
@@ -296,13 +432,17 @@ def create_box(name, resume=False):
 	if proc.returncode != 0:
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude-box.sh failed")
 	start_forwarders(name, slot, forwards)  # after the box exists
-	return {"box": name, "container": container, "workdir": workdir, "session": claude_args,
-	        "slot": slot, "forwards": forward_ports, "mounts": mounts, "tmpfs": tmpfs}
+	return {"box": name, "container": container, "workdir": checkout_dst, "session": claude_args,
+	        "golden": os.path.basename(golden), "branch": f"agent/{name}",
+	        "slot": slot, "forwards": forward_ports, "mounts": mounts}
 
 
 def kill_box(name):
+	"""Remove the box + its forwarders + its overlay volume. upper/ is deliberately LEFT on disk: it
+	holds any work the agent had not pushed, and `cbx box <same name>` reattaches to it."""
 	stop_forwarders(name)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True, check=True)
+	subprocess.run(["docker", "volume", "rm", box_volume(name)], capture_output=True, text=True)
 	return {"killed": name}
 
 
@@ -311,8 +451,44 @@ def list_boxes():
 		["docker", "ps", "-a", "--filter", f"name=^box-{PROJECT}-", "--format", "{{.Names}}\t{{.Status}}"],
 		capture_output=True, text=True, check=True,
 	).stdout.strip()
-	rows = [dict(zip(("container", "status"), ln.split("\t", 1))) for ln in out.splitlines() if ln]
+	rows = []
+	for ln in out.splitlines():
+		if not ln:
+			continue
+		container, status = ln.split("\t", 1)
+		name = _box_name_of(container)
+		gf = os.path.join(BOXROOT, name, "golden")
+		rows.append({"container": container, "status": status, "box": name,
+		             "golden": open(gf).read().strip() if os.path.exists(gf) else ""})
 	return {"boxes": rows}
+
+
+def box_dirty(name):
+	"""`git status --porcelain` inside the box — a FIXED command, not arbitrary exec. The hub uses it
+	to refuse a golden refresh that would discard an agent's uncommitted work."""
+	r = subprocess.run(
+		["docker", "exec", "-u", "dev", box_container(name),
+		 "git", "-C", CHECKOUT_DST, "status", "--porcelain"],
+		capture_output=True, text=True,
+	)
+	if r.returncode != 0:
+		return {"box": name, "reachable": False, "dirty": [], "error": r.stderr.strip()}
+	files = [ln for ln in r.stdout.splitlines() if ln.strip()]
+	return {"box": name, "reachable": True, "dirty": files}
+
+
+def box_say(name, text):
+	"""Type a line into the box's claude session (tmux send-keys). This is how `cbx fix` delivers
+	review feedback without you attaching. -l sends the text LITERALLY, so tmux never interprets a
+	word like 'Enter' or 'C-c' inside your message as a key."""
+	c = box_container(name)
+	r = subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", "main", "-l", text],
+	                   capture_output=True, text=True)
+	if r.returncode != 0:
+		raise RuntimeError(r.stderr.strip() or "send-keys failed")
+	subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", "main", "Enter"],
+	               capture_output=True, text=True)
+	return {"box": name, "sent": text}
 
 
 def pull_box_image(wait=False):
@@ -343,21 +519,23 @@ def _box_name_of(container):
 	return container[len(prefix):] if container.startswith(prefix) else container
 
 
-def recreate_box(name):
-	"""Pull the newest image, drop the old container, and respawn the box resuming ITS session."""
+def recreate_box(name, fresh_upper=False):
+	"""Pull the newest image, drop the old container, and respawn the box resuming ITS session — now on
+	whatever golden is current. fresh_upper=True also discards the box's upper layer, which is what
+	moves it cleanly onto a new golden (only safe once its work is pushed; `cbx golden refresh` checks)."""
 	pull_box_image(wait=True)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True)
-	return create_box(name, resume=True)
+	return create_box(name, resume=True, fresh_upper=fresh_upper)
 
 
-def recreate_all():
+def recreate_all(fresh_upper=False):
 	"""Recreate every box (newest image, each resuming its own session). Pulls once for all."""
 	pull_box_image(wait=True)
 	done = []
 	for r in list_boxes()["boxes"]:
-		name = _box_name_of(r["container"])
+		name = r["box"]
 		subprocess.run(["docker", "rm", "-f", r["container"]], capture_output=True, text=True)
-		done.append(create_box(name, resume=True)["box"])
+		done.append(create_box(name, resume=True, fresh_upper=fresh_upper)["box"])
 	return {"recreated": done}
 
 
@@ -376,42 +554,69 @@ class Handler(BaseHTTPRequestHandler):
 			return False
 		return True
 
-	def _box_name(self):
-		return self.path[len("/box/"):].strip("/")
+	def _body(self):
+		n = int(self.headers.get("Content-Length") or 0)
+		return self.rfile.read(n).decode() if n else ""
+
+	def _flag(self, name):
+		return name in (self.path.split("?", 1)[1] if "?" in self.path else "")
+
+	def _path(self):
+		return self.path.split("?", 1)[0].rstrip("/")
 
 	def do_GET(self):
 		if not self._authed():
 			return
-		if self.path == "/box":
-			try:
-				self._reply(200, list_boxes())
-			except Exception as e:  # noqa: BLE001
-				self._reply(500, {"error": str(e)})
-		else:
-			self._reply(404, {"error": "not found"})
+		path = self._path()
+		try:
+			if path == "/box":
+				return self._reply(200, list_boxes())
+			if path == "/golden":
+				return self._reply(200, list_goldens())
+			if path.startswith("/box/") and path.endswith("/dirty"):
+				name = path[len("/box/"):-len("/dirty")]
+				if not NAME_RE.match(name):
+					return self._reply(400, {"error": "bad box name"})
+				return self._reply(200, box_dirty(name))
+			return self._reply(404, {"error": "not found"})
+		except Exception as e:  # noqa: BLE001
+			return self._reply(500, {"error": str(e)})
 
 	def do_POST(self):
 		if not self._authed():
 			return
-		# Recreate (newest image + respawn resuming each box's session). /recreate = every box.
-		if self.path.rstrip("/") == "/recreate":
-			try:
-				return self._reply(200, recreate_all())
-			except Exception as e:  # noqa: BLE001
-				return self._reply(500, {"error": str(e)})
-		if self.path.startswith("/recreate/"):
-			rname = self.path[len("/recreate/"):].strip("/")
-			if not NAME_RE.match(rname):
-				return self._reply(400, {"error": "bad box name"})
-			try:
-				return self._reply(200, recreate_box(rname))
-			except Exception as e:  # noqa: BLE001
-				return self._reply(500, {"error": str(e)})
-		# Default: spawn a fresh box.
-		name = self._box_name()
-		if not self.path.startswith("/box/") or not NAME_RE.match(name):
-			return self._reply(400, {"error": "bad box name"})
+		path = self._path()
+		fresh = self._flag("fresh")
 		try:
+			# Golden lifecycle. The hub prepares in GOLDEN_STAGING (its only writable golden path) and
+			# calls seal; reap drops goldens no box still references.
+			if path.startswith("/golden/seal/"):
+				return self._reply(200, seal_golden(path[len("/golden/seal/"):]))
+			if path == "/golden/reap":
+				return self._reply(200, reap_goldens())
+			# Recreate (newest image + respawn resuming each box's session). /recreate = every box.
+			if path == "/recreate":
+				return self._reply(200, recreate_all(fresh_upper=fresh))
+			if path.startswith("/recreate/"):
+				rname = path[len("/recreate/"):]
+				if not NAME_RE.match(rname):
+					return self._reply(400, {"error": "bad box name"})
+				return self._reply(200, recreate_box(rname, fresh_upper=fresh))
+			# Deliver review feedback into a box's claude session.
+			if path.startswith("/box/") and path.endswith("/say"):
+				name = path[len("/box/"):-len("/say")]
+				if not NAME_RE.match(name):
+					return self._reply(400, {"error": "bad box name"})
+				text = self._body()
+				if not text.strip():
+					return self._reply(400, {"error": "empty message"})
+				return self._reply(200, box_say(name, text))
+			# Default: spawn a fresh box.
+			if not path.startswith("/box/"):
+				return self._reply(404, {"error": "not found"})
+			name = path[len("/box/"):]
+			if not NAME_RE.match(name):
+				return self._reply(400, {"error": "bad box name"})
 			result = create_box(name)
 		except Exception as e:  # noqa: BLE001
 			return self._reply(500, {"error": str(e)})
@@ -423,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
 	def do_DELETE(self):
 		if not self._authed():
 			return
-		name = self._box_name()
+		name = self._path()[len("/box/"):]
 		if not NAME_RE.match(name):
 			return self._reply(400, {"error": "bad box name"})
 		try:
