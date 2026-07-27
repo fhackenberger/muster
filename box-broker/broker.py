@@ -488,6 +488,7 @@ def create_box(name, resume=False, fresh_upper=False):
 	# out of slots refuses the spawn (alloc_slot raises).
 	forwards = parse_port_forwards()
 	slot = alloc_slot(box_dir) if forwards else None
+	svc_env = parse_service_env()
 	mounts, checkout_dst, checkout_ro = parse_manifest(golden)
 	claude_args = session_args(box_dir, resume)
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
@@ -526,8 +527,8 @@ def create_box(name, resume=False, fresh_upper=False):
 		CLAUDEBOX_EXTRA_MOUNTS="\n".join(mounts),
 		CLAUDEBOX_EXTRA_TMPFS="",
 		# Project/service env (service-env), so a backend/frontend an AGENT starts is configured
-		# exactly like the one the hub starts.
-		CLAUDEBOX_EXTRA_ENV="\n".join(parse_service_env()),
+		# exactly like the one the hub starts. Some entries are rewritten per box below.
+		CLAUDEBOX_EXTRA_ENV="\n".join(svc_env),
 		# Runs in the box's tmux window before claude: puts the box on its own agent/<name> branch,
 		# based on the hub's DEV_BRANCH, with the hub as its only remote (see box-bin/cbx-box-init).
 		CLAUDEBOX_INIT_CMD="cbx-box-init" if not checkout_ro else "",
@@ -544,6 +545,20 @@ def create_box(name, resume=False, fresh_upper=False):
 			forward_ports[fwd_name] = hub_port
 			env[f"PORT_FORWARD_{fwd_name}_FROM"] = str(box_port)
 			env[f"PORT_FORWARD_{fwd_name}_TO_HUB"] = str(hub_port)
+	# A box's frontend must call ITS OWN backend, which lives on the hub loopback at the BACKEND
+	# forward — so the service-env value (correct for the hub) is rebuilt here. It must stay a FULL
+	# app URL, not just host:port: the frontend derives its REST base by stripping /app[-suffix]/* off
+	# this value, so dropping the path segment silently sends every REST call to the wrong place.
+	# The path comes from FRONTEND_DEV_BACKEND_PATH in service-env, so this stays project-agnostic.
+	if "BACKEND" in forward_ports:
+		path = ""
+		for e in svc_env:
+			if e.startswith("FRONTEND_DEV_BACKEND_PATH="):
+				path = e.split("=", 1)[1]
+		url = f"http://localhost:{forward_ports['BACKEND']}{path}"
+		svc_env = [e for e in svc_env if not e.startswith("FRONTEND_DEV_BACKEND_URL=")]
+		svc_env.append(f"FRONTEND_DEV_BACKEND_URL={url}")
+		env["CLAUDEBOX_EXTRA_ENV"] = "\n".join(svc_env)
 	proc = subprocess.run([CLAUDEBOX_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude-box.sh failed")

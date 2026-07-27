@@ -20,13 +20,19 @@
 
 # ---- service ports ----
 # SERVER_PORT is Spring Boot's server.port; FRONTEND_DEV_PORT is read by the project's frontend-dev
-# scripts for `ng serve --port`. FRONTEND_DEV_BACKEND_URL is resolved by the BROWSER, so it is
-# always localhost — on the hub the frontend and backend share a container. In an agent box
-# claude-box.sh overrides it with that box's BACKEND port-forward, so the agent's frontend hits its
-# OWN backend (see port-forwards).
+# scripts for `ng serve --port` (they must NOT hardcode a port, or a reshuffle breaks the dev loop
+# silently: the tunnel forwards one port while ng serve binds another).
 SERVER_PORT=8091
 FRONTEND_DEV_PORT=4211
-FRONTEND_DEV_BACKEND_URL=http://localhost:8091
+# The FULL app URL, not just host:port — the frontend derives its REST base by stripping
+# /app[-suffix]/* off this value, so a bare host:port loses the /infostarsWeb segment and every REST
+# call 404s. Default setup: the backend runs on the HUB, and the browser (pinchtab's Chrome there, or
+# your laptop via cbxtun/cbxfe) resolves localhost to that same hub — so this one value is right for
+# the hub AND for agent boxes.
+FRONTEND_DEV_BACKEND_URL=http://localhost:8091/infostarsWeb/app
+# Used ONLY when a box runs its own backend (a BACKEND line in port-forwards): the broker rebuilds
+# the URL above as http://localhost:<that box's hub port><this path>.
+FRONTEND_DEV_BACKEND_PATH=/infostarsWeb/app
 
 # ---- backend wiring (config.properties keys; env overrides the baked-in defaults) ----
 DB_INFOSTARS_PSQL_URL=jdbc:postgresql://db:5432/infotrack_dev

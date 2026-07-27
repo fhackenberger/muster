@@ -288,12 +288,6 @@ if [ "$HEADLESS" = 1 ]; then
 	[ -z "${CLAUDEBOX_DEV_URL:-}" ] && [ -n "${PORT_FORWARD_FRONTEND_TO_HUB:-}" ] \
 		&& CLAUDEBOX_DEV_URL="http://localhost:${PORT_FORWARD_FRONTEND_TO_HUB}"
 	[ -n "${CLAUDEBOX_DEV_URL:-}" ] && DEV_ENV=(-e FRONTEND_DEV_HOST=0.0.0.0 -e CLAUDEBOX_DEV_URL="$CLAUDEBOX_DEV_URL")
-	# The frontend's backend URL is resolved by the BROWSER (pinchtab's Chrome, on the hub), so it must
-	# be a hub-loopback port — this box's BACKEND forward. That points an agent's frontend at its OWN
-	# backend instead of the hub's. service-env carries the hub-appropriate default; this overrides it
-	# per box, which is why DEV_ENV is passed AFTER the service-env vars in the docker run below.
-	[ -n "${PORT_FORWARD_BACKEND_TO_HUB:-}" ] \
-		&& DEV_ENV+=(-e FRONTEND_DEV_BACKEND_URL="http://localhost:${PORT_FORWARD_BACKEND_TO_HUB}")
 elif DEV_PORT="$(pick_free_port)"; then
 	DEV_PUBLISH=(-p "127.0.0.1:${DEV_PORT}:4200")
 	DEV_ENV=(
@@ -392,17 +386,8 @@ done < <(env)
 # service-env file, the same one compose feeds the hub via env_file:). Passed through verbatim as
 # `-e KEY=VALUE`, so a backend/frontend an agent runs in its box sees the same settings as the hub's.
 # Values may not contain newlines — the list separator is the newline.
-#
-# A key this script derives PER BOX is dropped here rather than emitted twice: FRONTEND_DEV_BACKEND_URL
-# is the hub-appropriate default in service-env, but a box must point at its OWN backend's forward
-# (set in DEV_ENV above). Skipping it is deterministic; relying on which of two duplicate `-e` flags
-# docker keeps would not be.
 while IFS= read -r _kv; do
-	[ -n "$_kv" ] || continue
-	case "${_kv%%=*}" in
-		FRONTEND_DEV_BACKEND_URL) [ -n "${PORT_FORWARD_BACKEND_TO_HUB:-}" ] && continue ;;
-	esac
-	PF_ENV+=(-e "$_kv")
+	[ -n "$_kv" ] && PF_ENV+=(-e "$_kv")
 done <<< "${CLAUDEBOX_EXTRA_ENV:-}"
 
 WORKDIR="$ORIG_PWD"
