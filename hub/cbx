@@ -16,6 +16,7 @@ set -euo pipefail
 #   cbx recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
 #   cbx ls                                  # list services (tmux) + boxes (broker)
 #
+#   cbx status                              # what can be merged / rebased / pushed, with commands
 #   cbx q                                   # the review queue: who is waiting on you
 #   cbx review <box> [--full]               # diff since your last review (--full = whole branch)
 #   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
@@ -192,7 +193,46 @@ conflicts_between() {
 	printf '%s' "$out" | tail -n +2 | tr '\n' ' '
 }
 
+# Review state per box: "<agent-ref sha> <dev sha>", both as of your last review. The dev sha is what
+# lets us tell a REBASE apart from new work — after a rebase every commit gets a new sha, so the ref
+# alone always looks changed even when the agent did nothing.
 review_state() { cat "$STATE/$1.reviewed" 2>/dev/null || true; }
+reviewed_ref() { awk '{print $1}' "$STATE/$1.reviewed" 2>/dev/null || true; }
+reviewed_dev() { awk '{print $2}' "$STATE/$1.reviewed" 2>/dev/null || true; }
+
+# Sorted patch-ids for a range. A patch-id hashes the CHANGE, not the commit, so it survives a rebase
+# (and any commit-date/parent churn) — identical sets mean identical content.
+# NOTE the input must be a PATCH: `git patch-id` fed a list of shas (rev-list) silently reads no diff
+# and prints nothing, which would make every comparison below trivially "equal".
+patch_ids() {
+	git_ log --no-color --no-merges -p "$1..$2" 2>/dev/null | git_ patch-id --stable 2>/dev/null \
+		| awk '{print $1}' | sort || true
+}
+
+# True when the branch changed only because it was rebased: same patches, different shas. Needs a
+# recorded dev sha, so state written before this existed just falls through to "re-review".
+rebase_only() {
+	local box="$1" pdev pref old new
+	pdev="$(reviewed_dev "$box")"; pref="$(reviewed_ref "$box")"
+	[ -n "$pdev" ] && [ -n "$pref" ] || return 1
+	git_ rev-parse --verify -q "${pdev}^{commit}" >/dev/null || return 1
+	old="$(patch_ids "$pdev" "$pref")"
+	new="$(patch_ids "$DEV" "refs/agents/$box")"
+	# Two empty sets are not evidence of a rebase — they mean we failed to read patches at all.
+	[ -n "$old" ] && [ "$old" = "$new" ]
+}
+
+# new | reviewed | rebased | re-review
+box_status() {
+	local box="$1" sha prev
+	sha="$(git_ rev-parse "refs/agents/$box")"
+	prev="$(reviewed_ref "$box")"
+	if [ -z "$prev" ]; then echo new
+	elif [ "$prev" = "$sha" ]; then echo reviewed
+	elif rebase_only "$box"; then echo rebased
+	else echo re-review
+	fi
+}
 
 queue() {
 	local any=0 box sha ahead age note prev status conf other
@@ -203,10 +243,7 @@ queue() {
 		ahead="$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')"
 		age="$(git_ log -1 --format=%cr "refs/agents/$box")"
 		note="$(note_of "$box")"
-		prev="$(review_state "$box")"
-		if [ -z "$prev" ]; then status=new
-		elif [ "$prev" = "$sha" ]; then status=reviewed
-		else status=re-review; fi
+		status="$(box_status "$box")"
 		printf '%-12s %6s %-14s %-11s %s\n' "$box" "$ahead" "$age" "$status" "${note:-—}"
 		# Conflicts are the shared-checkout collision awareness, moved earlier: you learn that two
 		# agents touched the same lines when they push, not when you merge the second one.
@@ -222,14 +259,88 @@ queue() {
 	[ "$any" = 1 ] || echo "  (nothing waiting — no refs/agents/* pushed yet)"
 }
 
+status_overview() {
+	# One screen: everything that can move, and the command that moves it. Each section prints state;
+	# anything actionable is collected into the "next" list at the bottom in the order you'd do it
+	# (pull before merge before push, so agent work never lands on a stale base).
+	local behind ahead box sha st bhd list running gprov gsha todo=()
+
+	echo "== branch =="
+	git_ fetch -q origin "$DEV" 2>/dev/null || echo "  (origin unreachable — counts below may be stale)"
+	read -r behind ahead <<< "$(divergence)"
+	printf '  %s @ %s — %s behind, %s ahead of origin\n' \
+		"$DEV" "$(git_ rev-parse --short "$DEV")" "$behind" "$ahead"
+	[ "$behind" != 0 ] && todo+=("cbx pull                # take $behind commit(s) from origin first")
+
+	echo "== agent branches =="
+	list="$(agent_refs)"
+	if [ -z "$list" ]; then
+		echo "  (none pushed — an agent publishes with 'handoff \"summary\"')"
+	fi
+	for box in $list; do
+		sha="$(git_ rev-parse --short "refs/agents/$box")"
+		st="$(box_status "$box")"
+		bhd="$(git_ rev-list --count "refs/agents/$box..$DEV" 2>/dev/null || echo '?')"
+		printf '  %-12s %-10s %s  %s commit(s) ahead, %s behind %s\n' "$box" "$st" "$sha" \
+			"$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')" "$bhd" "$DEV"
+		case "$st" in
+			new|re-review) todo+=("cbx review $box") ;;
+			rebased)       todo+=("cbx merge $box            # rebased only, nothing new to read") ;;
+			reviewed)      todo+=("cbx merge $box") ;;
+		esac
+		[ "$bhd" != 0 ] && [ "$bhd" != '?' ] && todo+=("cbx rebase $box           # $bhd commit(s) behind $DEV")
+	done
+
+	echo "== boxes =="
+	running="$(broker GET /box 2>/dev/null || true)"
+	if [ -n "$running" ]; then
+		printf '%s' "$running" | jq -r '.boxes[]? | "  \(.box)\t\(.status)\tgolden=\(.golden)"' 2>/dev/null \
+			|| echo "  (unparseable broker reply)"
+	else
+		echo "  (broker unreachable)"
+	fi
+
+	echo "== golden =="
+	gprov="$(cat "$GOLDEN/current/.git/cbx-golden" 2>/dev/null || true)"
+	if [ -z "$gprov" ]; then
+		echo "  (none yet)"
+		todo+=("cbx golden snapshot     # no base for boxes to overlay")
+	else
+		echo "  $gprov"
+		# Field 3 of "g-<id> from <sha> (<branch>) at <date>" — a hint only, so it is never fatal.
+		gsha="$(printf '%s' "$gprov" | awk '{print $3}')"
+		if [ -n "$gsha" ] && ! git_ merge-base --is-ancestor "$DEV" "$gsha" 2>/dev/null; then
+			echo "  ($DEV has moved since — a snapshot would give new boxes a fresher base)"
+		fi
+	fi
+
+	echo "== next =="
+	if [ "${#todo[@]}" -eq 0 ]; then
+		[ "$ahead" != 0 ] && echo "  cbx push                # $ahead commit(s) to origin" \
+			|| echo "  (nothing to do)"
+	else
+		printf '  %s\n' "${todo[@]}"
+		[ "$ahead" != 0 ] && [ "$behind" = 0 ] && echo "  cbx push                # $ahead commit(s) to origin"
+	fi
+	return 0
+}
+
 review() {
 	[ $# -ge 1 ] || die "review needs a box name"
 	local box="$1" full="${2:-}" ref sha prev
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box' (has it run handoff?)"
 	sha="$(git_ rev-parse "$ref")"
-	prev="$(review_state "$box")"
+	prev="$(reviewed_ref "$box")"
 	mkdir -p "$STATE"
+	# A rebase rewrites every sha, so the branch looks changed even when the agent added nothing. Say
+	# so up front — otherwise the range-diff below (one '=' line per carried-over commit) reads like
+	# new work you have to re-read.
+	if [ -n "$prev" ] && [ "$prev" != "$sha" ] && rebase_only "$box"; then
+		echo "cbx: $box was only REBASED onto a newer $DEV since your last review — same patches, new shas."
+		echo "cbx: nothing new to read; 'cbx merge $box' when ready (--full to see the branch anyway)."
+		echo
+	fi
 
 	# Commits AND diff go through ONE pager. Printing the log first and then piping the diff to delta
 	# would lose the log: delta pages on the alternate screen and paints straight over it. And the log
@@ -252,7 +363,7 @@ review() {
 		fi
 	} | review_pager
 
-	printf '%s' "$sha" > "$STATE/$box.reviewed"
+	printf '%s %s' "$sha" "$(git_ rev-parse "$DEV")" > "$STATE/$box.reviewed"
 	echo
 	echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
 }
@@ -346,17 +457,39 @@ drop() {
 
 rebase() {
 	[ $# -ge 1 ] || die "rebase needs a box name (or 'all')"
-	local box list
+	local box list behind n=0 ok=0
 	if [ "$1" = all ]; then
 		list="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
+		[ -n "$list" ] || die "no boxes exist — 'cbx ls' to check"
 	else
 		list="$1"
 	fi
+
+	echo "cbx: $DEV is at $(git_ rev-parse --short "$DEV") ($(git_ log -1 --format=%s "$DEV"))"
 	for box in $list; do
-		say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved. Resolve any conflicts, then carry on." 2>/dev/null \
-			&& echo "cbx: asked $box to rebase onto $DEV" \
-			|| echo "cbx: box $box unreachable — skipped"
+		n=$((n + 1))
+		# How far the agent's PUSHED branch trails the branch it's based on. A box that never handed
+		# off has no ref here, which is normal — it just means we can't say how stale it is.
+		if git_ rev-parse --verify -q "refs/agents/$box" >/dev/null; then
+			behind="$(git_ rev-list --count "refs/agents/$box..$DEV" 2>/dev/null || echo '?')"
+			behind="behind by $behind commit(s)"
+		else
+			behind="nothing pushed yet"
+		fi
+		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved. Resolve any conflicts, then carry on."; then
+			ok=$((ok + 1))
+			echo "  $box: asked to rebase ($behind)"
+		else
+			echo "  $box: NOT reachable, skipped ($behind) — 'cbx box $box' to start it"
+		fi
 	done
+
+	echo "cbx: delivered to $ok of $n box(es)."
+	# The single most confusing thing about this command: nothing has rebased yet.
+	echo "cbx: NOTE this is a prompt typed into each agent's session, not a rebase that already ran."
+	echo "     Each agent runs 'git fetch hub && git rebase hub/$DEV' when it picks the message up,"
+	echo "     which may be a while if it is mid-task, and it may hit conflicts and ask you about them."
+	echo "     Watch one:  cbxbox <box>      Re-check later:  cbx q"
 }
 
 divergence() {
@@ -394,6 +527,13 @@ push() {
 	local ahead behind
 	read -r behind ahead <<< "$(divergence)"
 	[ "$behind" = 0 ] || die "origin has $behind commit(s) $DEV doesn't — run 'cbx pull' (or 'cbx pull --rebase') first"
+	# Don't report "pushed" when there was nothing to push — that reads as "my merge went out" when
+	# in fact nothing was ever merged (a silent `cbx merge` failure looks exactly like this).
+	if [ "$ahead" = 0 ]; then
+		echo "cbx: nothing to push — $DEV already matches origin ($(git_ rev-parse --short "$DEV"))."
+		echo "cbx: expecting an agent's work here? It is merged only after 'cbx merge <box>' succeeds — check 'cbx q'."
+		return 0
+	fi
 	echo "cbx: pushing $DEV ($ahead commit(s) ahead of origin) -> $(git_ remote get-url origin)"
 	if git_ push origin "$DEV"; then
 		echo "cbx: pushed $DEV to origin"
@@ -547,6 +687,7 @@ case "$cmd" in
 	recreate) box_recreate "$@" ;;
 	ls)       box_ls ;;
 	q|queue)  queue ;;
+	status|st) status_overview ;;
 	review)   review "$@" ;;
 	fix)      fix "$@" ;;
 	prereview) prereview "$@" ;;
