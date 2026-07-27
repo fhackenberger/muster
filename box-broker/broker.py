@@ -32,7 +32,7 @@ Config (env, from compose):
   GOLDEN_DIR          HOST path holding the sealed goldens + the `current` symlink
   GOLDEN_STAGING      HOST path the hub prepares new goldens in (sealed via /golden/seal)
   PROJECT_ROOT        confinement root for box-mounts extras (default: the current golden)
-  CHECKOUT_DST        where the overlay is mounted in the box (default /home/dev/checkout)
+  CHECKOUT_DST        where the overlay is mounted in the box (default /home/dev/repo — must match the hub)
   CLAUDE_HOME         HOST path of the shared ~/.claude (mounted into every box)
   BOXROOT             HOST path whose <name>/{home,upper,work} subdirs back each box
   BOX_MOUNTS          HOST path of the box-mounts manifest (EXTRA mounts only; see box-mounts.example)
@@ -60,7 +60,10 @@ BOX_IMAGE = os.environ.get("BOX_IMAGE", "claude-box")
 BOX_NETWORK = os.environ.get("BOX_NETWORK", "")
 GOLDEN_DIR = os.environ.get("GOLDEN_DIR", "")
 GOLDEN_STAGING = os.environ.get("GOLDEN_STAGING", "")
-CHECKOUT_DST = os.environ.get("CHECKOUT_DST", "/home/dev/checkout")
+# Where the overlay lands in the box. MUST equal the hub's own repo path: goldens are snapshots of
+# that tree, and installed dependencies bake absolute paths in, so they only stay valid if the tree
+# is mounted back where it was prepared.
+CHECKOUT_DST = os.environ.get("CHECKOUT_DST", "/home/dev/repo")
 CLAUDE_HOME = os.environ.get("CLAUDE_HOME", "")
 # Shared package caches mounted (rw) into every box AND the hub at ~/.npm and ~/.gradle, so node/gradle
 # artifacts are downloaded once, not duplicated per box. uid 1000 (dev) owns them; npm + gradle both
@@ -125,7 +128,7 @@ def current_golden():
 	cur = os.path.join(GOLDEN_DIR, "current")
 	if not os.path.exists(cur):
 		raise RuntimeError(
-			"no golden yet — prepare one from the hub with: cbx golden refresh")
+			"no golden yet — prepare one from the hub with: cbx golden snapshot")
 	return os.path.realpath(cur)
 
 
@@ -292,7 +295,7 @@ def confined_src(src, root):
 
 def parse_manifest(golden):
 	"""EXTRA mounts from box-mounts, on top of the overlay checkout. Grammar per line:
-	    TREE <dst> <ro|rw>     where the overlay checkout lands (default: checkout rw). `ro` mounts the
+	    TREE <dst> <ro|rw>     where the overlay checkout lands (default: repo rw). `ro` mounts the
 	                           golden directly read-only instead of an overlay (no upper, no writes).
 	    <src> <dst> <ro|rw>    golden/<src> bind-mounted at HOME_IN/<dst>
 	Returns (mounts, checkout_dst, checkout_ro). '#'/blank lines ignored; a missing file means just the
@@ -465,7 +468,7 @@ def list_boxes():
 
 def box_dirty(name):
 	"""`git status --porcelain` inside the box — a FIXED command, not arbitrary exec. The hub uses it
-	to refuse a golden refresh that would discard an agent's uncommitted work."""
+	to refuse a golden snapshot that would discard an agent's uncommitted work."""
 	r = subprocess.run(
 		["docker", "exec", "-u", "dev", box_container(name),
 		 "git", "-C", CHECKOUT_DST, "status", "--porcelain"],
@@ -522,7 +525,7 @@ def _box_name_of(container):
 def recreate_box(name, fresh_upper=False):
 	"""Pull the newest image, drop the old container, and respawn the box resuming ITS session — now on
 	whatever golden is current. fresh_upper=True also discards the box's upper layer, which is what
-	moves it cleanly onto a new golden (only safe once its work is pushed; `cbx golden refresh` checks)."""
+	moves it cleanly onto a new golden (only safe once its work is pushed; `cbx golden snapshot` checks)."""
 	pull_box_image(wait=True)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True)
 	return create_box(name, resume=True, fresh_upper=fresh_upper)

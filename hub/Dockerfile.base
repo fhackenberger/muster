@@ -44,6 +44,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV NG_CLI_ANALYTICS=false
 
+# UTF-8 locale — same reason as the box image: debian-slim configures none, and the hub's tmux
+# (cbxhub, cbx logs) would render every non-ASCII glyph as '_' under the C locale. C.UTF-8 is built
+# into glibc, so no locales package is needed.
+ENV LANG=C.UTF-8
+
 # Git-over-SSH for the checkout, baked system-wide (applies without any per-stack gitconfig; a mounted
 # ~/.gitidentity/gitconfig can still override). The wrapper offers whatever private key(s) live in the
 # mounted identity dir and trusts a provider's host key on first connect; entrypoint.sh pre-seeds

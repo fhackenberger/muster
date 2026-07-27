@@ -67,6 +67,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # survive — the env var lives in the image and suppresses the prompt for every run.
 ENV NG_CLI_ANALYTICS=false
 
+# UTF-8 locale. debian-slim configures none, so LANG would be unset (C/POSIX) — and in server mode
+# claude runs inside tmux, which then replaces every non-ASCII glyph with '_' (claude's logo and box
+# borders come out as underscores). C.UTF-8 is built into glibc, so this needs no locales package
+# and no locale-gen. Your terminal's own locale can't fix it: `docker exec` doesn't propagate the
+# host environment, so the setting has to live in the image.
+ENV LANG=C.UTF-8
+
 # Unprivileged identity that is the ONLY X client authorized to touch the clipboard. The UID
 # here is just a placeholder — the entrypoint resets it at startup to the runtime CLIP_UID,
 # so changing the UID needs no rebuild, only the settings file + a matching host account.

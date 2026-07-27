@@ -18,12 +18,13 @@ compose stack (cbx-<project> network)
                                                     │ runs claude-box.sh
                                                     ▼
                                        box-<project>-<name>  (claude, uid 1000, no socket)
-                                         /home/dev/checkout = overlay(golden) + own upper layer
+                                         /home/dev/repo = overlay(golden) + own upper layer
                                          branch agent/<name> ──push──▶ hub refs/agents/<name>
 
   data/golden/g-<id>/     prepared tree (deps installed) — shared read-only by every box
   data/boxes/<name>/upper/  that box's changes — the only per-agent disk cost
-  data/repo/              the hub's repo: dev, every refs/agents/*, origin credentials
+  data/repo/              the hub's repo AND your setup workspace, mounted at /home/dev/repo —
+                          the same path the boxes use, so baked-in absolute paths stay valid
 ```
 
 > **Ansible-managed on the acoveo host.** For the `infostars` stack, everything below is
@@ -319,16 +320,39 @@ Goldens are immutable while boxes run on them (changing a `lowerdir` under a liv
 undefined behaviour), so they're versioned with `current` pointing at the newest.
 
 ```sh
-cbx golden ls           # snapshots, which is current, which boxes still reference each
-cbx golden refresh      # new base at the current dev, with deps rebuilt, and move every box onto it
+cbx golden snapshot     # freeze the hub's repo as the new base + move every box onto it
+cbx golden snapshot --prep   # ...running GOLDEN_PREP_CMD in the repo first
+cbx golden seal <id>    # finish a staged golden you fixed up by hand
+cbx golden ls           # snapshots (with provenance), which is current, which boxes reference each
 cbx golden reap         # delete snapshots nothing references
 ```
 
-`cbx golden refresh` reflink-copies the previous golden (near-free on btrfs, and `node_modules`
-comes along so only the delta is rebuilt), updates it to `dev`, runs `GOLDEN_PREP_CMD`, has the
-broker seal it, then recreates every box with a **fresh upper layer**. It refuses to run while any
-box has uncommitted changes — that's the one destructive step in the workflow, and it's why agents
-should `handoff` before you refresh.
+**Set up in the hub's repo, then freeze it.** `/home/dev/repo` is your workspace: edit config files,
+`npm ci`, warm gradle, patch a dependency by hand — whatever makes the tree ready. `cbx golden
+snapshot` reflink-copies it (near-free on btrfs), has the broker seal it, then recreates every box
+with a **fresh upper layer**.
+
+**The path is the same on both sides — that's the point.** The repo is `/home/dev/repo` on the hub
+*and* where every box mounts its overlay. Installed dependencies bake absolute paths in (npm's
+`node_modules/.bin` shebangs and `.package-lock.json`, project-local `.gradle` caches, python
+venvs), so a tree prepared on the hub only keeps working in a box if it's mounted back at the path
+it was prepared at. Nothing is ever built in the staging copy for the same reason — a build there
+would record the staging path and be wrong everywhere.
+
+The copy can't be skipped by pointing `lowerdir` straight at the repo: overlayfs requires an
+immutable lower layer while boxes are mounted on it, and you keep editing that tree.
+
+Two guards, both worth knowing:
+
+- **It refuses while any box has uncommitted changes.** Recreating discards upper layers, so
+  unpushed work would be lost. Agents should `handoff` first; `cbx kill <box>` abandons one.
+- **It refuses while `backend`/`frontend` are running**, since they write into the repo while it's
+  being copied and you'd get a torn snapshot. `cbx down backend` first.
+
+Whatever is dirty in the repo is baked in and becomes every agent's starting `git status` — that's
+how your local setup reaches the boxes, and `snapshot` prints the list so it's never a surprise.
+Keeping local-only config in gitignored files avoids it; modified *tracked* files are the ones an
+agent can sweep into a commit by accident.
 
 Most days you don't need it: **`cbx rebase all`** moves agents onto a newer `dev` with a `git fetch`
 + `rebase` in each box, no golden and no recreate. Refresh only when dependencies changed.
@@ -357,7 +381,7 @@ cbxui           # tunnel port 4200 (the default); cbxui 9867 for another port
   overlayfs checks write permission on the merged inode *before* deciding to copy up, so a
   non-writable golden makes every file unwritable inside the box instead of protecting anything.
 - **`cbx kill` keeps the box's upper layer** on disk, so `cbx box <same name>` reattaches to its
-  uncommitted work. Only `cbx golden refresh` (and `cbx recreate --fresh`) discards it.
+  uncommitted work. Only `cbx golden snapshot` (and `cbx recreate --fresh`) discards it.
 - **Shared caches:** the hub and every box mount the SAME `data/npm-cache` and `data/gradle-cache`
   (rw) at `~/.npm` and `~/.gradle`, so node/gradle artifacts are downloaded once — no per-box
   duplication on the host. uid 1000 owns them (the `dev`/`gradle` users share it), and npm/gradle

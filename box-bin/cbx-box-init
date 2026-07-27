@@ -9,7 +9,7 @@ set -euo pipefail
 # repo's history — but that clone's remote points at a path only the hub can see. This script wires
 # the box to the hub over the cbx network and lands it on agent/<box>, based on the hub's dev branch:
 #
-#   hub /work/repo  ──git://hub/repo──▶  box  agent/<box>  ──push refs/agents/<box>──▶  hub
+#   hub /home/dev/repo  ──git://hub/repo──▶  box  agent/<box>  ──push refs/agents/<box>──▶  hub
 #
 # It is idempotent and recreate-safe: a box whose upper layer survived a recreate keeps its local
 # branch and commits untouched, and only re-fetches.
@@ -38,9 +38,13 @@ else
 fi
 # Fetch the agent refs too, so a recreated box can find its own pushed branch, and the review notes
 # (`git log --notes=cbx`) so an agent can read what it told the hub last time.
+# All three MUST be wildcards. A non-wildcard refspec for a ref the hub doesn't have yet (e.g.
+# refs/notes/cbx before anyone has run `handoff "summary"`) makes the whole fetch die with
+# "fatal: couldn't find remote ref" — no branches fetched — and this script would then bail out
+# below thinking the hub is unreachable. A wildcard that matches nothing is silently skipped.
 git config --replace-all remote.hub.fetch '+refs/heads/*:refs/remotes/hub/*'
 git config --add         remote.hub.fetch '+refs/agents/*:refs/remotes/hub-agents/*'
-git config --add         remote.hub.fetch '+refs/notes/cbx:refs/notes/cbx'
+git config --add         remote.hub.fetch '+refs/notes/*:refs/notes/*'
 
 if ! git fetch --prune hub 2>&1; then
 	echo "cbx-box-init: could not reach the hub at $HUB_URL — working offline on the golden's history." >&2
@@ -49,7 +53,7 @@ fi
 
 # Land on the agent branch, preferring what already exists:
 #   local branch  -> keep it (a recreate that preserved upper/; the agent's WIP is here)
-#   pushed branch -> restore it (upper/ was discarded by a golden refresh, work was already pushed)
+#   pushed branch -> restore it (upper/ was discarded by a golden snapshot, work was already pushed)
 #   neither       -> start fresh from the hub's dev branch
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
 	git checkout -q "$BRANCH"

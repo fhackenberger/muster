@@ -25,12 +25,17 @@ set -euo pipefail
 #   cbx rebase <box>|all                    # move agents onto the current dev (light; no recreate)
 #   cbx push                                # push dev to the real origin
 #
-#   cbx golden refresh                      # new prepared base (deps rebuilt) + move every box onto it
+#   cbx golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
+#   cbx golden seal <id>                    # finish a staged golden you fixed up by hand
 #   cbx golden ls | reap                    # list snapshots / delete unreferenced ones
 #   cbx expose <src> [dst] [ro]             # add an EXTRA path to box-mounts (dst defaults to src)
 #   cbx hide   <src>                        # remove it
+#
+# The repo lives at the SAME absolute path here and inside every box (/home/dev/repo), because
+# installed dependencies bake absolute paths in — npm into node_modules/.bin shebangs, gradle into
+# the project-local .gradle cache. So whatever you set up here works unchanged in an agent's box.
 
-REPO="${CHECKOUT:-/work/repo}"
+REPO="${CHECKOUT:-/home/dev/repo}"
 DEV="${DEV_BRANCH:-dev}"
 GOLDEN="${GOLDEN_DIR:-/work/golden}"
 STAGING="${GOLDEN_STAGING:-/work/golden-staging}"
@@ -40,8 +45,9 @@ TMUX_SESSION="${TMUX_SESSION:-services}"
 BROKER_URL="${BROKER_URL:-http://box-broker:8099}"
 BROKER_TOKEN="${BROKER_TOKEN:-}"
 
-# What `cbx golden refresh` runs inside the staged tree to make it ready-to-build (override in .env).
-# This is the expensive setup that boxes then inherit for free.
+# Your project's "make this tree ready to build" command. `cbx golden snapshot --prep` runs it IN THE
+# REPO (not in a copy), so it's an optional convenience around the setup you'd otherwise do by hand —
+# and whatever it installs is captured at the path it will actually be used from.
 GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}"
 
 # Service commands (override in the stack .env). Wrapped so the tmux window survives the process
@@ -247,7 +253,13 @@ merge() {
 	local box="$1" squash="${2:-}" ref msg
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
-	[ -z "$(git_ status --porcelain)" ] || die "the hub working tree is dirty — commit or stash first"
+	# The hub tree is EXPECTED to carry local setup work (it's what goldens are snapshotted from), so a
+	# dirty tree is not an error here. Just show it and let git decide: it refuses precisely when the
+	# merge would overwrite a file you've modified, which is the only case that actually matters.
+	if [ -n "$(git_ status --porcelain)" ]; then
+		echo "cbx: note — local changes in $REPO (kept; the merge aborts only if it would overwrite one):" >&2
+		git_ status --short | sed 's/^/  /' >&2
+	fi
 	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
 
 	git_ checkout -q "$DEV"
@@ -299,11 +311,27 @@ push() {
 # ------------------------------------------------------------------ goldens
 
 golden_ls() {
-	local resp
+	local resp g prov
 	resp="$(broker GET /golden)" || die "broker unreachable: $resp"
 	echo "current: $(printf '%s' "$resp" | jqr '.current')"
-	printf '%s' "$resp" | jq -r '.goldens[]? | "  \(.golden)\t\(if .current then "current" else "" end)\tboxes: \(.boxes | join(",") // "-")"' 2>/dev/null \
-		|| printf '  %s\n' "$resp"
+	for g in $(printf '%s' "$resp" | jqr '.goldens[]?.golden'); do
+		# Provenance is stored INSIDE .git (not as a file in the tree), so it never shows up as an
+		# untracked file in every agent's `git status`.
+		prov="$(cat "$GOLDEN/$g/.git/cbx-golden" 2>/dev/null | tr '\n' ' ')"
+		printf '  %-22s %s\n' "$g" "${prov:-(no provenance recorded)}"
+		printf '%s' "$resp" | jq -r --arg g "$g" '.goldens[]? | select(.golden==$g) | "      \(if .current then "current  " else "" end)boxes: \(if (.boxes|length)>0 then (.boxes|join(",")) else "-" end)"' 2>/dev/null
+	done
+}
+
+golden_seal() {
+	# Finish a golden you staged and then fixed up by hand (e.g. after a failed --prep). Same tail as
+	# snapshot: seal, move every box onto it, drop the ones nothing references any more.
+	[ $# -ge 1 ] || die "seal needs a staged golden id (see $STAGING)"
+	[ -d "$STAGING/$1" ] || die "no staged golden at $STAGING/$1"
+	broker POST "/golden/seal/$1" >/dev/null || die "sealing $1 failed"
+	echo "cbx: sealed $1 as current"
+	broker POST "/recreate?fresh=1" >/dev/null || die "recreate failed"
+	golden_reap
 }
 
 golden_reap() {
@@ -312,13 +340,35 @@ golden_reap() {
 	echo "cbx: reaped: $(printf '%s' "$resp" | jqr '.reaped | join(", ") // "(none)"')"
 }
 
-golden_refresh() {
-	local id st boxes box dirty
-	id="g-$(date +%Y%m%d-%H%M%S)"
-	st="$STAGING/$id"
+golden_snapshot() {
+	# Freeze THIS repo — exactly as you have it set up — as the base every box overlays.
+	#
+	# The snapshot is taken from, and mounted back at, the SAME absolute path ($REPO is also the box's
+	# checkout path). So anything with baked-in absolute paths — npm's node_modules/.bin shebangs and
+	# .package-lock.json, a project-local .gradle cache, a python venv — keeps working inside the box.
+	# That is also why nothing is built in the staging copy: a build there would record the staging
+	# path and be wrong everywhere. Run `--prep` (or your own commands) HERE, then snapshot.
+	#
+	# We can't skip the copy and point the boxes' lowerdir straight at $REPO: overlayfs requires the
+	# lower layer to be immutable while boxes are mounted on it, and you keep editing this tree.
+	local id st prep=0 boxes box dirty svc
+	[ "${1:-}" = --prep ] && prep=1
 
-	# A refresh discards every box's upper layer, so anything not committed AND pushed is lost. Refuse
-	# rather than eat it — this is the one destructive step in the whole workflow.
+	# A build running in the hub's tmux writes into $REPO while we copy it — the snapshot would be a
+	# torn mixture of before and after. Cheap to avoid, miserable to debug.
+	for svc in backend frontend; do
+		if tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$svc"; then
+			die "'$svc' is running and writing into $REPO — 'cbx down $svc' first, then snapshot"
+		fi
+	done
+
+	if [ "$prep" = 1 ]; then
+		echo "cbx: preparing the repo (${GOLDEN_PREP_CMD})"
+		( cd "$REPO" && bash -lc "$GOLDEN_PREP_CMD" ) || die "prep failed — fix it in $REPO and re-run"
+	fi
+
+	# Recreating the boxes discards their upper layers, so anything not committed AND pushed is lost.
+	# Refuse rather than eat it — this is the one destructive step in the whole workflow.
 	boxes="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
 	for box in $boxes; do
 		dirty="$(broker GET "/box/$box/dirty" 2>/dev/null | jqr '.dirty[]?' | head -5)"
@@ -329,30 +379,35 @@ golden_refresh() {
 		fi
 	done
 
-	mkdir -p "$STAGING"
-	rm -rf "$st"
-	if [ -e "$GOLDEN/current" ]; then
-		# Reflink copy of the PREVIOUS golden: on btrfs the extents are shared, so this is near-free
-		# and — more importantly — node_modules/build caches come along, so prep only rebuilds the delta.
-		echo "cbx: copying $(readlink "$GOLDEN/current") -> staging/$id (reflink)"
-		cp --reflink=auto -a "$GOLDEN/current/." "$st"
-	else
-		echo "cbx: no golden yet — seeding from $REPO"
-		cp --reflink=auto -a "$REPO/." "$st"
+	# Whatever is dirty here gets baked in and becomes every agent's starting `git status`. That's the
+	# deal — it's how your local setup reaches the boxes — but it should never be a surprise, and
+	# modified TRACKED files are the ones an agent can sweep into a commit by accident.
+	if [ -n "$(git_ status --porcelain)" ]; then
+		echo "cbx: baking these local changes into the golden — every box will start with them:"
+		git_ status --short | sed 's/^/  /'
 	fi
 
-	echo "cbx: updating the staged tree to $DEV"
-	git -C "$st" fetch -q "$REPO" "$DEV" || die "could not fetch $DEV from $REPO"
-	git -C "$st" checkout -q -B "$DEV" FETCH_HEAD || die "could not check out $DEV in the staged tree"
+	id="g-$(date +%Y%m%d-%H%M%S)"
+	st="$STAGING/$id"
+	mkdir -p "$STAGING"
+	rm -rf "$st"
+	echo "cbx: snapshotting $REPO -> staging/$id (reflink)"
+	cp --reflink=auto -a "$REPO/." "$st" || die "snapshot copy failed"
+
 	# The boxes reach the hub repo over the cbx network; bake that in so a box's git works immediately.
 	git -C "$st" remote remove hub 2>/dev/null || true
 	git -C "$st" remote add hub "${HUB_GIT_URL:-git://hub/repo}"
-
-	echo "cbx: preparing (${GOLDEN_PREP_CMD})"
-	( cd "$st" && bash -lc "$GOLDEN_PREP_CMD" ) || die "prep failed — staged tree left at $st for inspection"
+	# Hub-only bits that have no business in a box: the push-restriction hook (nothing pushes into a
+	# box) and the review state. Provenance goes inside .git so it can never appear as an untracked
+	# file in every agent's `git status`.
+	rm -f  "$st/.git/hooks/update"
+	rm -rf "$st/.git/cbx"
+	printf '%s from %s (%s) at %s\n' "$id" "$(git_ rev-parse --short HEAD)" "$DEV" "$(date -Is)" \
+		> "$st/.git/cbx-golden"
 
 	# The hub mounts $GOLDEN read-only on purpose, so the broker performs the move + symlink flip.
-	broker POST "/golden/seal/$id" >/dev/null || die "sealing $id failed"
+	broker POST "/golden/seal/$id" >/dev/null \
+		|| die "sealing $id failed (staged tree kept — retry with: cbx golden seal $id)"
 	echo "cbx: sealed $id as current"
 
 	echo "cbx: moving every box onto it (fresh upper layers)..."
@@ -399,11 +454,13 @@ case "$cmd" in
 	rebase)   rebase "$@" ;;
 	push)     push ;;
 	golden)
-		case "${1:-}" in
-			refresh) golden_refresh ;;
-			ls)      golden_ls ;;
-			reap)    golden_reap ;;
-			*) die "golden needs: refresh | ls | reap" ;;
+		sub="${1:-}"; shift || true
+		case "$sub" in
+			snapshot) golden_snapshot "$@" ;;
+			seal)     golden_seal "$@" ;;
+			ls)       golden_ls ;;
+			reap)     golden_reap ;;
+			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap" ;;
 		esac ;;
 	expose) expose "$@" ;;
 	hide)   hide "$@" ;;

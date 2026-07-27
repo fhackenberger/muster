@@ -60,7 +60,10 @@ services:
       GOLDEN_DIR: ${STACK_DIR}/data/golden
       GOLDEN_STAGING: ${STACK_DIR}/data/golden-staging
       PROJECT_ROOT: ${STACK_DIR}/data/golden
-      CHECKOUT_DST: /home/dev/checkout
+      # SAME absolute path as the hub's own repo, deliberately: installed dependencies bake absolute
+      # paths in (npm's node_modules/.bin shebangs, project-local .gradle), so a golden prepared on
+      # the hub only works in a box if it is mounted back at the path it was prepared at.
+      CHECKOUT_DST: /home/dev/repo
       DEV_BRANCH: ${DEV_BRANCH:-dev}
       HUB_GIT_URL: ${HUB_GIT_URL:-git://hub/repo}
       CLAUDE_HOME: ${STACK_DIR}/data/claude
@@ -104,15 +107,17 @@ services:
     depends_on: [db, redis, box-broker]
     environment:
       # The hub's own repo: the only clone with origin credentials, the only place dev is merged, and
-      # what the boxes fetch/push over git:// (see hub/entrypoint.sh).
-      CHECKOUT: /work/repo
+      # what the boxes fetch/push over git:// (see hub/entrypoint.sh). It is ALSO your setup
+      # workspace — `cbx golden snapshot` freezes it as the base every box overlays, at this exact
+      # path, so absolute paths baked into installed deps stay valid inside the boxes.
+      CHECKOUT: /home/dev/repo
       REPO_URL: ${REPO_URL}
       DEV_BRANCH: ${DEV_BRANCH:-dev}
       HUB_GIT_URL: ${HUB_GIT_URL:-git://hub/repo}
       GOLDEN_DIR: /work/golden
       GOLDEN_STAGING: /work/golden-staging
-      # Run inside a staged golden by `cbx golden refresh` to make it ready-to-build. This is the
-      # expensive setup the boxes then inherit for free — put your project's install/warm steps here.
+      # Run by `cbx golden snapshot --prep` IN THE HUB'S REPO (not in a copy), so what it installs is
+      # frozen at the path the boxes use it from — put your project's install/warm steps here.
       GOLDEN_PREP_CMD: ${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}
       BROKER_URL: http://box-broker:8099
       BROKER_TOKEN: ${BROKER_TOKEN}
@@ -131,7 +136,7 @@ services:
       GEOSERVICEGOOGLE_APIKEY: ${GEOSERVICEGOOGLE_APIKEY}
       GEOSERVICELOCATIONIQ_APIKEY: ${GEOSERVICELOCATIONIQ_APIKEY}
     volumes:
-      - ./data/repo:/work/repo
+      - ./data/repo:/home/dev/repo
       # Sealed goldens are READ-ONLY here on purpose. It cannot be done with file modes: overlayfs
       # checks write permission on the merged inode BEFORE deciding to copy up, so a non-writable
       # golden would make every file unwritable inside the boxes. The mount is the enforcement; the

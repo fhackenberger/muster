@@ -8,12 +8,16 @@ set -euo pipefail
 # `cbx up <service>` — see cbx. Reattach the service windows or a shell with:
 #   docker exec -it <project>-hub tmux attach
 #
-# The hub is the git authority: /work/repo is the ONLY clone with credentials for the real origin,
+# The hub is the git authority: the repo below is the ONLY clone with credentials for the real origin,
 # and the only place `dev` is merged. Agent boxes work on their own overlay of a prepared golden tree
 # and push to refs/agents/<box> here over git://; an update hook makes that the only ref namespace
 # they may write. See README-remote.md.
 
-: "${CHECKOUT:=/work/repo}"         # the hub's repo + working tree (bind-mounted from the host)
+# The hub's repo + working tree (bind-mounted from the host). This path is also where every box
+# mounts its overlay of a golden — goldens are snapshots of THIS tree, and installed dependencies
+# bake absolute paths in, so hub and box must agree on the path. Don't change one without the other
+# (broker CHECKOUT_DST) or npm/gradle artifacts prepared here break inside the boxes.
+: "${CHECKOUT:=/home/dev/repo}"
 : "${REPO_URL:=}"                   # clone source, from the stack .env (optional)
 : "${DEV_BRANCH:=dev}"              # the branch agents base on and you merge into
 : "${GIT_DAEMON_PORT:=9418}"
@@ -98,12 +102,14 @@ fi
 # can always attach a shell. tmux keeps running as long as the session lives.
 tmux new-session -d -s "$TMUX_SESSION" -c "$CHECKOUT" -n shell
 
-# Serve the repo to the boxes: git://hub/repo (base-path=/work maps that to /work/repo). receive-pack
-# is enabled so boxes can push their branches; the update hook above bounds what that means. It runs
-# in its own tmux window so `cbx logs gitd` shows the pushes.
-tmux new-window -t "$TMUX_SESSION" -n gitd -c /work \
+# Serve the repo to the boxes as git://hub/repo. base-path is the PARENT of the repo, so the URL path
+# stays '/repo' regardless of where the tree lives. receive-pack is enabled so boxes can push their
+# branches; the update hook above bounds what that means. It runs in its own tmux window so
+# `cbx logs gitd` shows the pushes.
+GIT_BASE_PATH="$(dirname "$CHECKOUT")"
+tmux new-window -t "$TMUX_SESSION" -n gitd -c "$GIT_BASE_PATH" \
 	"git daemon --verbose --export-all --enable=receive-pack --reuseaddr \
-		--base-path=/work --listen=0.0.0.0 --port=${GIT_DAEMON_PORT} /work/repo; \
+		--base-path='$GIT_BASE_PATH' --listen=0.0.0.0 --port=${GIT_DAEMON_PORT} '$CHECKOUT'; \
 	 echo; echo '[cbx] git daemon exited — press enter to close'; read _"
 
 echo "hub: ready. Services are on-demand:" >&2
