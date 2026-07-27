@@ -382,6 +382,14 @@ while IFS='=' read -r _pf_name _; do
 	esac
 done < <(env)
 
+# Project/service env: newline-separated KEY=VALUE (server mode; the broker fills it from the stack's
+# service-env file, the same one compose feeds the hub via env_file:). Passed through verbatim as
+# `-e KEY=VALUE`, so a backend/frontend an agent runs in its box sees the same settings as the hub's.
+# Values may not contain newlines — the list separator is the newline.
+while IFS= read -r _kv; do
+	[ -n "$_kv" ] && PF_ENV+=(-e "$_kv")
+done <<< "${CLAUDEBOX_EXTRA_ENV:-}"
+
 WORKDIR="$ORIG_PWD"
 [ "$HEADLESS" = 1 ] && WORKDIR="${CLAUDEBOX_WORKDIR:-$HOME_IN}"
 

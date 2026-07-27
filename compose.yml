@@ -81,6 +81,10 @@ services:
       PINCHTAB_TOKEN: ${PT_TOKEN}
       # Per-project port forwards (like box-mounts): NAME BOX_PORT HUB_BASE_PORT per line. Each box
       # gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
+      # Project/service settings (KEY=VALUE) handed to every box. The hub gets the SAME file via
+      # `env_file:` below, so a backend/frontend is configured identically whether the hub or an
+      # agent runs it.
+      SERVICE_ENV_FILE: ${STACK_DIR}/service-env
       PORT_FORWARDS_FILE: ${STACK_DIR}/port-forwards
       PORT_FORWARD_SLOTS: ${PORT_FORWARD_SLOTS:-16}
     volumes:
@@ -127,18 +131,12 @@ services:
       BROKER_TOKEN: ${BROKER_TOKEN}
       BOX_MOUNTS: /work/box-mounts
       GIT_CONFIG_GLOBAL: /home/dev/.gitidentity/gitconfig
-      # backend wiring (confirmed keys; env overrides the baked-in config.properties defaults)
-      DB_INFOSTARS_PSQL_URL: jdbc:postgresql://db:5432/infotrack_dev
-      DB_INFOSTARS_PSQL_USER: infostars_u
-      DB_INFOSTARS_PSQL_PASSWORD: test
-      DB_LIQUIBASE_UPGRADE_DISABLED: "true"
-      LIVE_JMSURI: tcp://activemq:61616
-      ACTIVEMQ_ENABLE: "true"
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      FRONTEND_GOOGLE_MAPS_API_KEY: ${FRONTEND_GOOGLE_MAPS_API_KEY}
-      GEOSERVICEGOOGLE_APIKEY: ${GEOSERVICEGOOGLE_APIKEY}
-      GEOSERVICELOCATIONIQ_APIKEY: ${GEOSERVICELOCATIONIQ_APIKEY}
+    # Everything PROJECT-specific (backend/frontend wiring, API keys) lives in `service-env` instead
+    # of here, because the box-broker hands the very same file to every agent box. That is what makes
+    # a backend an AGENT starts behave like the one the hub starts. Keep this `environment:` block for
+    # stack plumbing only — anything a service reads belongs in service-env.
+    env_file:
+      - ./service-env
     volumes:
       - ./data/repo:/home/dev/repo
       # Sealed goldens are READ-ONLY here on purpose. It cannot be done with file modes: overlayfs

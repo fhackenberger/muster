@@ -66,6 +66,19 @@
       backup: no
     tags: [containers-claude-box-files]
 
+  # Settings for the project's services (backend/frontend). Handed to the hub via compose `env_file:`
+  # AND to every agent box by the broker, so a service behaves the same whichever side starts it.
+  # Holds vault-backed API keys, hence mode 0600 like infostars.conf.
+  - name: Claude box service-env (backend/frontend settings for hub + boxes)
+    template:
+      src: templates/docker-compose/claude-box/service-env
+      dest: /virtual_machines/claude-box-docker/service-env
+      owner: root
+      group: root
+      mode: "u=rw,g=,o="
+      backup: no
+    tags: [containers-claude-box-files]
+
   - name: Claude box port-forwards for infostars
     template:
       src: templates/docker-compose/claude-box/port-forwards

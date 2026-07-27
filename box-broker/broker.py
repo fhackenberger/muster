@@ -89,6 +89,10 @@ PT_TOKEN = os.environ.get("PINCHTAB_TOKEN", "")
 # each box gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
 PORT_FORWARDS_FILE = os.environ.get("PORT_FORWARDS_FILE", "")
 PORT_FORWARD_SLOTS = int(os.environ.get("PORT_FORWARD_SLOTS", "16"))
+# Project/service env (KEY=VALUE lines) handed to every box — backend/frontend settings an agent needs
+# when it runs those services itself. The SAME file is given to the hub via `env_file:` in compose, so
+# a service behaves identically whether the hub or a box runs it.
+SERVICE_ENV_FILE = os.environ.get("SERVICE_ENV_FILE", "")
 BOX_UID = os.environ.get("BOX_UID", "1000")
 BOX_GID = os.environ.get("BOX_GID", "1000")
 CLAUDEBOX_SCRIPT = os.environ.get("CLAUDEBOX_SCRIPT", "/usr/local/bin/claude-box.sh")
@@ -219,6 +223,35 @@ def parse_port_forwards():
 				raise ValueError(f"bad port-forwards line {raw.strip()!r} (want: NAME BOX_PORT HUB_BASE_PORT)")
 			fwds.append((parts[0], int(parts[1]), int(parts[2])))
 	return fwds
+
+
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_service_env():
+	"""KEY=VALUE lines from SERVICE_ENV_FILE, as a list of "KEY=VALUE" strings.
+
+	Same file compose feeds the hub with `env_file:`, so the format is compose's: one KEY=VALUE per
+	line, '#' comments, no quoting rules and no shell expansion — the value is taken literally to the
+	end of the line. Keys are validated; a malformed line is rejected loudly rather than silently
+	shipping something odd into every box. Values cannot contain newlines (the list is newline-joined
+	when handed to claude-box.sh)."""
+	out = []
+	if not SERVICE_ENV_FILE or not os.path.exists(SERVICE_ENV_FILE):
+		return out
+	with open(SERVICE_ENV_FILE) as fh:
+		for raw in fh:
+			line = raw.strip()
+			if not line or line.startswith("#"):
+				continue
+			if "=" not in line:
+				raise ValueError(f"bad service-env line {line!r} (want: KEY=VALUE)")
+			key, value = line.split("=", 1)
+			key = key.strip()
+			if not ENV_KEY_RE.match(key):
+				raise ValueError(f"bad service-env key {key!r}")
+			out.append(f"{key}={value}")
+	return out
 
 
 def alloc_slot(box_dir):
@@ -434,6 +467,9 @@ def create_box(name, resume=False, fresh_upper=False):
 		CLAUDEBOX_PINCHTAB_TOKEN=PT_TOKEN,
 		CLAUDEBOX_EXTRA_MOUNTS="\n".join(mounts),
 		CLAUDEBOX_EXTRA_TMPFS="",
+		# Project/service env (service-env), so a backend/frontend an AGENT starts is configured
+		# exactly like the one the hub starts.
+		CLAUDEBOX_EXTRA_ENV="\n".join(parse_service_env()),
 		# Runs in the box's tmux window before claude: puts the box on its own agent/<name> branch,
 		# based on the hub's DEV_BRANCH, with the hub as its only remote (see box-bin/cbx-box-init).
 		CLAUDEBOX_INIT_CMD="cbx-box-init" if not checkout_ro else "",
