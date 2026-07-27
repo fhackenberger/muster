@@ -60,6 +60,16 @@ die() { echo "cbx: $*" >&2; exit 1; }
 git_() { git -C "$REPO" "$@"; }
 have_delta() { command -v delta >/dev/null 2>&1; }
 
+# One pager for a whole review (commits + notes + diff), so nothing gets painted over. delta renders
+# the diff hunks and passes other lines through, which is why the log can share the stream. Falls
+# back to less, and to cat when the output isn't a terminal (piping `cbx review` somewhere).
+review_pager() {
+	if [ ! -t 1 ]; then cat
+	elif have_delta; then delta --paging=always
+	else less -R
+	fi
+}
+
 # ------------------------------------------------------------------ services
 
 svc_cmd() {
@@ -212,19 +222,26 @@ review() {
 	prev="$(review_state "$box")"
 	mkdir -p "$STATE"
 
-	echo "== $box: $(git_ rev-list --count "$DEV..$ref") commit(s) on top of $DEV =="
-	git_ log --notes=cbx --oneline "$DEV..$ref" | sed 's/^/  /'
-	echo
-
-	if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ "$full" != --full ] \
-	   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then
-		# Re-review after a fix round: show ONLY what changed since you last looked. range-diff copes
-		# with the amends and rebases a fix round produces, which a plain diff cannot.
-		echo "-- changes since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
-		git_ range-diff "$DEV..$prev" "$DEV..$ref"
-	else
-		if have_delta; then git_ diff "$DEV...$ref" | delta; else git_ --paginate diff "$DEV...$ref"; fi
-	fi
+	# Commits AND diff go through ONE pager. Printing the log first and then piping the diff to delta
+	# would lose the log: delta pages on the alternate screen and paints straight over it. And the log
+	# is NOT --oneline, because --notes only renders in a format that prints a commit body — with
+	# --oneline the handoff summary is silently dropped, which is the whole point of showing it.
+	{
+		echo "== $box: $(git_ rev-list --count "$DEV..$ref") commit(s) on top of $DEV =="
+		echo
+		git_ log --color=always --notes=cbx "$DEV..$ref"
+		echo
+		if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ "$full" != --full ] \
+		   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then
+			# Re-review after a fix round: show ONLY what changed since you last looked. range-diff copes
+			# with the amends and rebases a fix round produces, which a plain diff cannot.
+			echo "-- changes since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
+			echo
+			git_ range-diff "$DEV..$prev" "$DEV..$ref"
+		else
+			git_ diff "$DEV...$ref"
+		fi
+	} | review_pager
 
 	printf '%s' "$sha" > "$STATE/$box.reviewed"
 	echo
