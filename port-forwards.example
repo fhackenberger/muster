@@ -16,6 +16,8 @@
 # the broker refuses to spawn once the slots are exhausted. Keep each service's HUB_BASE_PORT ranges
 # far enough apart that BASE+slot never collides across services.
 
-# Example (an agent runs its own frontend + backend and points the frontend at its own backend):
-#   FRONTEND  4200  4300
-#   BACKEND   8080  8900
+# Example (an agent runs its own frontend + backend and points the frontend at its own backend).
+# BOX_PORT must match what the services bind in the box — i.e. FRONTEND_DEV_PORT / SERVER_PORT from
+# service-env; change one without the other and the forward points at nothing.
+#   FRONTEND  4211  4300
+#   BACKEND   8091  8900

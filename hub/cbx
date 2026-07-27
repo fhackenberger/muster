@@ -24,7 +24,10 @@ set -euo pipefail
 #   cbx prereview <box>                     # ask the agent to self-review its diff before you look
 #   cbx merge  <box> [--squash]             # merge the agent branch into dev
 #   cbx drop   <box>                        # discard an agent branch (tells the box)
-#   cbx rebase <box>|all                    # move agents onto the current dev (light; no recreate)
+#   cbx rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
+#
+# Commands that TYPE into an agent's session (fix / prereview / rebase) refuse while that agent is
+# working — `cbx ls` and `cbx status` show busy | waiting | idle per box. Add --force to interrupt.
 #   cbx pull [--rebase]                     # bring dev up to date with origin (merge by default)
 #   cbx push                                # push dev to the real origin
 #
@@ -61,6 +64,40 @@ PINCHTAB_CMD="${PINCHTAB_CMD:-pinchtab server}"
 
 die() { echo "cbx: $*" >&2; exit 1; }
 git_() { git -C "$REPO" "$@"; }
+
+# ---- agent activity -------------------------------------------------------------------------
+# Each box's claude writes "<state> <epoch>" to $HOME/.cbx-state via the cbx-activity hooks (the
+# broker registers them in the shared ~/.claude/settings.json). That file is the box's home anchor,
+# mounted here read-only — so this is a plain file read, no broker round-trip.
+BOXES="${BOXES_DIR:-/work/boxes}"
+# A 'busy' older than this is reported as 'stale': the hooks stopped firing (claude was killed, the
+# box was recreated, hooks aren't installed). Treated as NOT busy, so a stale file can never wedge
+# the workflow — the failure mode of this feature is "no protection", never "can't work".
+ACTIVITY_STALE="${CBX_ACTIVITY_STALE:-900}"
+
+# Prints "<state> <age-seconds>"; state is busy | waiting | idle | stale | unknown.
+box_activity() {
+	local f="$BOXES/$1/home/.cbx-state" st ts age
+	[ -r "$f" ] || { echo "unknown -"; return 0; }
+	read -r st ts < "$f" 2>/dev/null || { echo "unknown -"; return 0; }
+	case "$ts" in ''|*[!0-9]*) echo "unknown -"; return 0 ;; esac
+	age=$(( $(date +%s) - ts ))
+	[ "$st" = busy ] && [ "$age" -gt "$ACTIVITY_STALE" ] && st=stale
+	echo "$st $age"
+}
+
+# Refuse to interrupt a working agent. 'waiting' is NOT guarded: claude is asking YOU something, so
+# typing at it is the point. Returns non-zero when the caller should skip this box.
+guard_busy() {
+	local box="$1" force="${2:-}" st age
+	read -r st age <<< "$(box_activity "$box")"
+	if [ "$st" = busy ] && [ "$force" != --force ]; then
+		echo "cbx: $box is BUSY (working for ${age}s) — not interrupting it." >&2
+		echo "cbx: your text would land in its input mid-task. Wait for idle ('cbx status'), or --force." >&2
+		return 1
+	fi
+	return 0
+}
 have_delta() { command -v delta >/dev/null 2>&1; }
 
 # One pager for a whole review (commits + notes + diff), so nothing gets painted over. delta renders
@@ -153,10 +190,13 @@ box_ls() {
 	echo "== services (tmux) =="
 	tmux list-windows -t "$TMUX_SESSION" -F '  #W' 2>/dev/null || echo "  (none)"
 	echo "== boxes (broker) =="
-	local resp
+	local resp box st age
 	if resp="$(broker GET "/box" 2>/dev/null)"; then
-		printf '%s' "$resp" | jq -r '.boxes[]? | "  \(.container)\t\(.status)\tgolden=\(.golden)"' 2>/dev/null \
-			|| printf '  %s\n' "$resp"
+		while IFS=$'\t' read -r box status golden; do
+			[ -n "$box" ] || continue
+			read -r st age <<< "$(box_activity "$box")"
+			printf '  %-12s %-10s %-22s %s\n' "$box" "$st" "$status" "golden=$golden"
+		done < <(printf '%s' "$resp" | jq -r '.boxes[]? | "\(.box)\t\(.status)\t\(.golden)"' 2>/dev/null)
 	else
 		echo "  (broker unreachable)"
 	fi
@@ -295,8 +335,16 @@ status_overview() {
 	echo "== boxes =="
 	running="$(broker GET /box 2>/dev/null || true)"
 	if [ -n "$running" ]; then
-		printf '%s' "$running" | jq -r '.boxes[]? | "  \(.box)\t\(.status)\tgolden=\(.golden)"' 2>/dev/null \
-			|| echo "  (unparseable broker reply)"
+		local bstate bage bstatus bgolden bname
+		while IFS=$'\t' read -r bname bstatus bgolden; do
+			[ -n "$bname" ] || continue
+			read -r bstate bage <<< "$(box_activity "$bname")"
+			case "$bstate" in
+				busy)    printf '  %-12s %-9s working for %ss\n' "$bname" "$bstate" "$bage" ;;
+				waiting) printf '  %-12s %-9s wants your input (%ss)\n' "$bname" "$bstate" "$bage" ;;
+				*)       printf '  %-12s %-9s %s\n' "$bname" "$bstate" "$bstatus" ;;
+			esac
+		done < <(printf '%s' "$running" | jq -r '.boxes[]? | "\(.box)\t\(.status)\t\(.golden)"' 2>/dev/null)
 	else
 		echo "  (broker unreachable)"
 	fi
@@ -386,9 +434,15 @@ review() {
 
 fix() {
 	[ $# -ge 1 ] || die "fix needs a box name"
-	local box="$1" msg=""; shift
+	local box="$1" msg="" force="" a args=()
+	shift
+	for a in "$@"; do
+		case "$a" in --force) force=--force ;; *) args+=("$a") ;; esac
+	done
+	set -- "${args[@]+"${args[@]}"}"
 	[ "${1:-}" = -m ] && { shift; msg="$*"; } || msg="$*"
 	[ -n "$msg" ] || die "fix needs a message: cbx fix $box -m 'what to change'"
+	guard_busy "$box" "$force" || exit 1
 	say_to_box "$box" "Review feedback on your handoff: ${msg}. Please fix it on your branch, then run: handoff" \
 		|| die "feedback NOT delivered — is the box running? (cbx ls)"
 	echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
@@ -396,6 +450,7 @@ fix() {
 
 prereview() {
 	[ $# -ge 1 ] || die "prereview needs a box name"
+	guard_busy "$1" "${2:-}" || exit 1
 	# Cheap capacity multiplier: the agent re-reads its OWN diff critically before you spend a round on
 	# it. This is self-review, not an independent reviewer — see README-remote.md for the difference.
 	say_to_box "$1" "Before I review this: run 'mydiff' and read your own change critically against the project's conventions in CLAUDE.md — dead code, missing tests, unhandled errors, anything you would flag in someone else's PR. Fix what you find, then run: handoff"
@@ -473,7 +528,8 @@ drop() {
 
 rebase() {
 	[ $# -ge 1 ] || die "rebase needs a box name (or 'all')"
-	local box list behind n=0 ok=0
+	local box list behind n=0 ok=0 force=""
+	[ "${2:-}" = --force ] && force=--force
 	if [ "$1" = all ]; then
 		list="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
 		[ -n "$list" ] || die "no boxes exist — 'cbx ls' to check"
@@ -484,6 +540,11 @@ rebase() {
 	echo "cbx: $DEV is at $(git_ rev-parse --short "$DEV") ($(git_ log -1 --format=%s "$DEV"))"
 	for box in $list; do
 		n=$((n + 1))
+		# Skip, don't abort: with 'all' one working agent shouldn't stop the others being told.
+		if ! guard_busy "$box" "$force"; then
+			echo "  $box: skipped (busy) — 'cbx rebase $box --force' to interrupt anyway"
+			continue
+		fi
 		# How far the agent's PUSHED branch trails the branch it's based on. A box that never handed
 		# off has no ref here, which is normal — it just means we can't say how stale it is.
 		if git_ rev-parse --verify -q "refs/agents/$box" >/dev/null; then

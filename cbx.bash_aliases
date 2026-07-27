@@ -36,7 +36,7 @@
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
-unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql 2>/dev/null || true
+unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql cbxfe cbxsync 2>/dev/null || true
 unset -f cbxui 2>/dev/null || true          # cbxui was renamed to cbxtun; drop the stale function
 
 # One-shot commands: run over ssh so stdout/stderr land on your terminal and persist in scrollback.
@@ -153,7 +153,7 @@ cbxpsql() {
 # Targets are reached at the container's IP, so the service must listen on 0.0.0.0 inside its container
 # (ng serve/bootRun and the box port-forward system already bind 0.0.0.0). Ctrl-C closes the tunnel.
 cbxtun() {
-	[ "$#" -gt 0 ] || set -- hub:4200
+	[ "$#" -gt 0 ] || set -- "hub:${CBX_FRONTEND_PORT:-4211}"
 	local -a LP TG RP; local spec a b c
 	for spec in "$@"; do
 		IFS=: read -r a b c <<<"$spec"
@@ -188,4 +188,49 @@ REMOTE
 	done
 	echo "cbxtun: tunnel up — Ctrl-C to close" >&2
 	ssh -N "${Largs[@]}" "$CBX_SERVER"
+}
+
+# ---------------------------------------------------------------------------------------------
+# PROJECT-SPECIFIC shorthand (infostars ports): open ONE agent's frontend on your laptop.
+#
+#   cbxfe work1        -> http://localhost:4211 serves box 'work1' ng serve
+#
+# Two forwards are needed, not one. The page comes from the box's dev server, but its JS calls
+# FRONTEND_DEV_BACKEND_URL — which claude-box.sh points at that box's BACKEND port-forward on the
+# hub loopback (http://localhost:<8900+slot>). Your BROWSER resolves that URL, so the same port has
+# to exist on your laptop and lead to that box's backend. We read the box's own
+# PORT_FORWARD_BACKEND_TO_HUB to learn the number, then tunnel it straight to the box (the hub-side
+# socat binds the hub's loopback, which ssh -L cannot reach).
+#
+# Ports come from service-env: FRONTEND_DEV_PORT / SERVER_PORT. Override per call with
+# CBX_FRONTEND_PORT / CBX_BACKEND_PORT if a stack uses different ones.
+cbxfe() {
+	local box="${1:-}" fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
+	[ -n "$box" ] || { echo "usage: cbxfe <box>   (e.g. cbxfe work1)" >&2; return 1; }
+	hubport=$(ssh "$CBX_SERVER" "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' box-${CBX_PROJECT}-${box} 2>/dev/null | sed -n 's/^PORT_FORWARD_BACKEND_TO_HUB=//p'")
+	if [ -n "$hubport" ]; then
+		echo "cbxfe: $box -> frontend :$fe, backend :$hubport (its own)" >&2
+		cbxtun "${box}:${fe}" "${hubport}:${box}:${be}"
+	else
+		# No BACKEND line in port-forwards (or the box is down): the frontend then talks to the hub's
+		# backend, so tunnel that instead — same localhost port the page will ask for.
+		echo "cbxfe: $box has no BACKEND forward — using the hub's backend on :$be" >&2
+		cbxtun "${box}:${fe}" "hub:${be}"
+	fi
+}
+
+# take new commits from origin onto the dev branch, then tell every agent to re-base on them:
+#
+#   cbxsync              # merge origin into the dev branch, then have the agents rebase
+#   cbxsync --rebase     # ...rebasing the hub's branch instead of merging
+#
+# Two steps because they are two different repos: `cbx pull` moves the HUB's branch, `cbx rebase all`
+# types a rebase instruction into each agent's claude session (their branches are their own clones).
+# Deliberately NOT one remote command: `a && b` in the ssh string would run b on the SERVER rather
+# than inside the hub container. Skips the rebase if the pull failed (conflicts to resolve first),
+# since rebasing agents onto a half-merged branch only spreads the mess.
+cbxsync() {
+	cbx pull "$@" || { echo "cbxsync: pull failed — agents NOT notified" >&2; return 1; }
+	cbx rebase all
+	echo "cbxsync: agents were asked to rebase; they act when they pick the message up. 'cbx status' for the queue." >&2
 }

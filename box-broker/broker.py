@@ -391,6 +391,63 @@ def make_overlay_volume(name, golden, fresh_upper=False):
 
 # --------------------------------------------------------------------------- boxes
 
+# Claude Code hooks that let the hub see whether a box is working. Each writes one line to
+# $HOME/.cbx-state in the box, which is data/boxes/<name>/home on the host and /work/boxes/<name>/home
+# (read-only) in the hub — so `cbx ls` / `cbx status` can read it with no daemon and no extra mount.
+ACTIVITY_HOOKS = (
+	("UserPromptSubmit", "busy"),     # a prompt was submitted
+	("PostToolUse", "busy"),          # heartbeat: keeps 'busy' fresh through a long run
+	("Notification", "waiting"),      # claude wants permission / an answer
+	("Stop", "idle"),                 # turn finished
+	("SessionStart", "idle"),
+)
+
+
+def ensure_activity_hooks():
+	"""Add the activity hooks to the stack's shared ~/.claude/settings.json, idempotently.
+
+	MERGES: existing hooks and every other setting are preserved, and an entry already present is not
+	duplicated. A settings.json we can't parse is left completely alone — a broken activity readout is
+	very much better than clobbering the file that also holds the login."""
+	if not CLAUDE_HOME:
+		return
+	path = os.path.join(CLAUDE_HOME, "settings.json")
+	data = {}
+	if os.path.exists(path):
+		try:
+			with open(path) as fh:
+				data = json.load(fh)
+		except (ValueError, OSError) as e:  # noqa: BLE001
+			print(f"box-broker: not touching {path} ({e}) — activity state will read as 'unknown'", flush=True)
+			return
+	if not isinstance(data, dict):
+		return
+	hooks = data.setdefault("hooks", {})
+	if not isinstance(hooks, dict):
+		return
+	changed = False
+	for event, state in ACTIVITY_HOOKS:
+		cmd = f"cbx-activity {state}"
+		entries = hooks.setdefault(event, [])
+		if not isinstance(entries, list):
+			continue
+		if any(h.get("command") == cmd
+		       for grp in entries if isinstance(grp, dict)
+		       for h in grp.get("hooks", []) if isinstance(h, dict)):
+			continue
+		entries.append({"hooks": [{"type": "command", "command": cmd}]})
+		changed = True
+	if not changed:
+		return
+	tmp = path + ".cbx-tmp"
+	with open(tmp, "w") as fh:
+		json.dump(data, fh, indent=2)
+		fh.write("\n")
+	os.replace(tmp, path)
+	os.chown(path, int(BOX_UID), int(BOX_GID))
+	print(f"box-broker: registered activity hooks in {path}", flush=True)
+
+
 def session_args(box_dir, resume):
 	"""The --session-id / --resume flag for this box's claude.
 
@@ -424,6 +481,7 @@ def create_box(name, resume=False, fresh_upper=False):
 	if CLAUDE_HOME:
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
+		ensure_activity_hooks()
 	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at
 	# 127.0.0.1:(HUB_BASE_PORT + slot). The box gets PORT_FORWARDS + PORT_FORWARD_<NAME>_FROM/_TO_HUB so
 	# the project's own scripts can wire e.g. CLAUDEBOX_DEV_URL and the frontend's backend URL. Running

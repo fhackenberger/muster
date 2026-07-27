@@ -70,6 +70,8 @@ mkdir -p /srv/cbx/myproject && cd /srv/cbx/myproject
 cp -r path/to/infostars/docker-claude/{compose.yml,box-broker,hub} .
 cp path/to/infostars/docker-claude/.env.example      .env
 cp path/to/infostars/docker-claude/box-mounts.example box-mounts
+cp path/to/infostars/docker-claude/service-env       service-env   # REQUIRED: compose env_file
+cp path/to/infostars/docker-claude/port-forwards.example port-forwards
 mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
 chown -R 1000:1000 data                                 # boxes + hub run as uid 1000
 $EDITOR .env            # set PROJECT_NAME, STACK_DIR=$(pwd), REPO_URL, tokens, API keys
@@ -185,6 +187,54 @@ The **box image** the broker spawns is separate: set `BOX_IMAGE` in `.env` (defa
 pull from the registry on a *different* host, set `COMPOSE_PULL_POLICY=always` and point
 `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified names.
 
+## Updating a running stack
+
+Changes reach the server by **two independent paths**, and nearly every "I deployed it but nothing
+changed" comes from doing one and not the other:
+
+| What you changed | Travels via | Carried by |
+|---|---|---|
+| `hub/cbx`, `hub/entrypoint.sh`, `hub/git-ssh`, `hub/Dockerfile.base` | Jenkins build | `claude-box-hub-base` → `claude-box-hub` |
+| `Dockerfile`, `common-setup.sh`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
+| `box-broker/broker.py`, **`claude-box.sh`** | Jenkins build | `claude-box-broker` |
+| `compose.yml`, `.env`, `service-env`, `box-mounts`, `port-forwards`, `git-identity/*` | file sync (Ansible / rsync) | — |
+
+Two traps in that table. **`claude-box.sh` is `COPY`d into the *broker* image**, not the box image —
+a change there needs a broker rebuild. And **each add-on image must be rebuilt after its base**
+(`claude-box` before `claude-box-infostars`); rebuilding only the add-on silently keeps the old base.
+The Jenkinsfile orders them correctly.
+
+```sh
+# 1. images: push to master (or trigger the job) -> Jenkins builds + tags :stable
+# 2. files:  ansible-playbook … --tags containers-claude-box-files
+# 3. on the server:
+cd /virtual_machines/claude-box-docker
+docker compose up -d --pull always hub box-broker   # RECREATES them — env is fixed at creation
+docker compose pull                                 # refresh the box image for the next spawn
+cbx recreate all                                    # boxes: new image + new env/mounts
+```
+
+- **Recreate, not restart.** Environment variables and mounts are fixed when a container is created,
+  so `docker restart` / `docker compose restart` will *not* pick up a changed `compose.yml` or
+  `service-env`. `docker compose up -d` recreates when the config hash changed; `cbx recreate` does
+  the same for boxes, keeping each box's upper layer and its claude session.
+- **No golden snapshot needed** for an image or config update — take one only when the repo *tree*
+  changed (deps installed, config files edited in `/home/dev/repo`).
+- `cbx recreate all --fresh` additionally discards every box's upper layer. Only use it when you mean
+  to throw uncommitted agent work away.
+
+Verify what actually landed, rather than assuming:
+
+```sh
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' infostars-box-broker-1 | grep -E 'M2_REPO|SERVICE_ENV_FILE'
+docker exec infostars-box-broker-1 grep -c SERVICE_ENV_FILE /usr/local/bin/broker.py   # code, not env
+docker exec -u dev box-infostars-<name> printenv DB_INFOSTARS_PSQL_URL
+docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' box-infostars-<name>
+```
+
+The first two are the useful pair: env comes from the **file sync**, the code from the **image**, and
+they fail in different ways.
+
 ## Laptop aliases
 
 Everything is driven through `cbx` inside the hub. Rather than typing the full
@@ -205,7 +255,12 @@ That gives you:
 - **`cbxhub`** — a persistent tmux shell in the hub you can detach (Ctrl-b d) / reconnect to.
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
 - **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql infotrack_dev`).
-- **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4200`).
+- **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
+- **`cbxfe <box>`** — project shorthand: open **one agent's** frontend at `http://localhost:4211`,
+  with that box's own backend tunnelled on the port its JS actually asks for. Two forwards, because
+  `FRONTEND_DEV_BACKEND_URL` is resolved by your browser, not by the box.
+- **`cbxsync [--rebase]`** — take new origin commits onto the dev branch (`cbx pull`) and then tell
+  every agent to rebase onto them (`cbx rebase all`). Skips the notify if the pull hit conflicts.
 
 **Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
 **ssh**. Set **`CBX_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
@@ -385,6 +440,15 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
 
 ## Notes
 
+- **Agent activity:** each box's claude writes `busy` / `waiting` / `idle` to `$HOME/.cbx-state` via
+  `cbx-activity` hooks, which the broker registers in the stack's shared `~/.claude/settings.json`
+  (merging — your other settings and hooks are preserved, and an unparseable file is left alone).
+  That path is the box's home anchor, which the hub already mounts read-only, so `cbx ls` /
+  `cbx status` read it directly. Commands that type into a session (`fix`, `prereview`, `rebase`)
+  refuse while an agent is working; `--force` overrides. `waiting` is deliberately not guarded —
+  claude is asking *you* something. A `busy` older than `CBX_ACTIVITY_STALE` (default 900s) reads as
+  `stale` and does not block, so missing or broken hooks can only cost you the protection, never the
+  ability to work.
 - **Isolation:** a box sees its own overlay of the golden plus whatever `box-mounts` adds, has no
   docker socket, no credentials for the real origin, and can't see the hub's filesystem or another
   box's upper layer. Its only shared surface is the network (`hub:8080/4200/9867/9418`).
@@ -422,6 +486,13 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
   (default 16); the broker refuses to spawn once slots are exhausted. The slot is stable per box
   (`data/boxes/<name>/slot`), reused across `cbx recreate`. (Project scripts must also bind those
   services to `0.0.0.0` in the box so the forwarder can reach them.)
+- **`service-env` configures the hub AND every box.** Project settings a service reads (backend DB /
+  ActiveMQ / Redis wiring, API keys, feature flags) live in `service-env`, not in `compose.yml`: the
+  hub gets it via compose `env_file:` and the broker passes every entry into each box as
+  `-e KEY=VALUE`. That is what makes a backend an *agent* starts behave like the one the hub starts.
+  Format is compose's (`KEY=VALUE`, `#` comments, literal values, no `${}` expansion). It is
+  **required** — compose refuses to start the hub if the file is missing. Apply with
+  `docker compose up -d hub` and `cbx recreate <box>`.
 - **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are env-overridable in `.env`
   if the defaults don't match your dev loop. Each service runs in its own hub tmux window that
   stays alive after the process exits, so `cbx logs <svc>` can always attach to read the output.

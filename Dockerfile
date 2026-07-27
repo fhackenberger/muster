@@ -106,8 +106,10 @@ RUN for t in xclip xsel; do \
 #                 via CLAUDEBOX_INIT_CMD before claude starts)
 #   handoff       push the branch to the hub for review, with a summary as a git note
 #   mydiff        exactly what this box will hand over (its branch vs the hub's dev)
-COPY box-bin/cbx-box-init box-bin/handoff box-bin/mydiff /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/cbx-box-init /usr/local/bin/handoff /usr/local/bin/mydiff
+#   cbx-activity  Claude Code hook: records busy/idle/waiting for the hub (see cbx ls / cbx status)
+COPY box-bin/cbx-box-init box-bin/handoff box-bin/mydiff box-bin/cbx-activity /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/cbx-box-init /usr/local/bin/handoff /usr/local/bin/mydiff \
+	/usr/local/bin/cbx-activity
 
 # Root entrypoint: materialize the runtime user from HOST_USER/UID/GID, then drop privileges.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

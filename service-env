@@ -18,6 +18,16 @@
 # This file is the project's; under Ansible it is templated from
 # templates/docker-compose/claude-box/service-env (which is where secrets come from the vault).
 
+# ---- service ports ----
+# SERVER_PORT is Spring Boot's server.port; FRONTEND_DEV_PORT is read by the project's frontend-dev
+# scripts for `ng serve --port`. FRONTEND_DEV_BACKEND_URL is resolved by the BROWSER, so it is
+# always localhost — on the hub the frontend and backend share a container. In an agent box
+# claude-box.sh overrides it with that box's BACKEND port-forward, so the agent's frontend hits its
+# OWN backend (see port-forwards).
+SERVER_PORT=8091
+FRONTEND_DEV_PORT=4211
+FRONTEND_DEV_BACKEND_URL=http://localhost:8091
+
 # ---- backend wiring (config.properties keys; env overrides the baked-in defaults) ----
 DB_INFOSTARS_PSQL_URL=jdbc:postgresql://db:5432/infotrack_dev
 DB_INFOSTARS_PSQL_USER=infostars_u
@@ -27,6 +37,13 @@ LIVE_JMSURI=tcp://activemq:61616
 ACTIVEMQ_ENABLE=true
 REDIS_HOST=redis
 REDIS_PORT=6379
+
+# ---- properties whose names can't be environment variables ----
+# A property named with '/' (or any character outside [A-Za-z0-9_]) has no env-var spelling: Spring
+# only translates '.' and '-' to '_' when matching a property name against the environment. Use
+# SPRING_APPLICATION_JSON — a high-precedence property source whose keys are taken literally. Put ALL
+# such properties in this ONE variable; a second SPRING_APPLICATION_JSON line would replace the first.
+#SPRING_APPLICATION_JSON={"AnonymousLogin/enabled":"true","AnonymousLogin/isDefault":"true","AnonymousLogin/userId":"1"}
 
 # ---- API keys (fill in, or let Ansible template them from the vault) ----
 FRONTEND_GOOGLE_MAPS_API_KEY=

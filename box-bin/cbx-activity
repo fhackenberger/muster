@@ -1,0 +1,26 @@
+#!/bin/sh
+# cbx-activity — record what this box's claude is doing, for the hub to read.
+#
+# Wired as a Claude Code hook (the broker adds it to the shared ~/.claude/settings.json):
+#   UserPromptSubmit -> busy      a prompt was submitted; the agent is working
+#   PostToolUse      -> busy      still working (this is the heartbeat: long runs keep it fresh)
+#   Notification     -> waiting   claude wants something from you (permission, a question)
+#   Stop             -> idle      the agent finished its turn
+#   SessionStart     -> idle
+#
+# Writes "<state> <epoch>" to $HOME/.cbx-state. That path is the box's home anchor on the host
+# (data/boxes/<name>/home), which the hub mounts READ-ONLY at /work/boxes — so `cbx ls` / `cbx status`
+# can see it with no extra mount and no daemon.
+#
+# Hooks get JSON on stdin, which we ignore. It MUST exit 0 whatever happens: a non-zero hook can
+# block or annoy the agent, and knowing the state is never worth breaking the session over.
+set -u
+
+state="${1:-unknown}"
+f="${HOME:-/home/dev}/.cbx-state"
+
+# Write-then-rename so the hub never reads a half-written line.
+printf '%s %s\n' "$state" "$(date +%s)" > "$f.tmp" 2>/dev/null \
+	&& mv "$f.tmp" "$f" 2>/dev/null
+
+exit 0
