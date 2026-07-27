@@ -289,7 +289,23 @@ merge() {
 	fi
 	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
 
-	local before after
+	# Don't land agent work on a stale base. If origin moved (you pushed from the laptop, a colleague
+	# pushed), merging here produces a merge commit on an old tip and `cbx push` is then rejected —
+	# leaving you to untangle it after the fact. Check BEFORE touching anything, and say what to do.
+	local before after behind ahead
+	echo "cbx: checking $DEV against origin"
+	git_ fetch -q origin "$DEV" 2>/dev/null || echo "cbx: (could not reach origin — merging against the local $DEV)" >&2
+	read -r behind ahead <<< "$(divergence)"
+	if [ "$behind" != 0 ]; then
+		echo "cbx: origin/$DEV has $behind commit(s) that $DEV doesn't." >&2
+		echo "cbx: merging now would put this agent's work on a stale base and 'cbx push' would be rejected." >&2
+		echo "cbx: do this first:" >&2
+		echo "    cbx pull              # merge origin into $DEV (or: cbx pull --rebase)" >&2
+		echo "    cbx rebase $box       # let the agent re-base its branch on the updated $DEV" >&2
+		echo "    cbx review $box       # re-check what it looks like on the new base, then merge" >&2
+		die "refusing to merge onto a stale $DEV"
+	fi
+
 	echo "cbx: merging refs/agents/$box ($(git_ rev-list --count "$DEV..$ref") commit(s)) into $DEV"
 	git_ checkout -q "$DEV"
 	before="$(git_ rev-parse HEAD)"

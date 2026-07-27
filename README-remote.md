@@ -206,12 +206,19 @@ That gives you:
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
 - **`cbxui [port]`** — SSH-tunnel the hub's dev server (default 4200) to your laptop.
 
-**Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — use **mosh
-by default** (roaming: they survive laptop sleep, Wi-Fi→LTE, and IP changes with no frozen-SSH hangs,
-and compose with the tmux persistence those already give you). mosh needs **UDP 60000-61000** open to
-the server — provisioned by `tasks/firewall.yml` (a UFW rule); on a hand-rolled host, open it
-yourself. It still uses ssh for the initial handshake, so key auth is unchanged. Set
-`CBX_TRANSPORT=ssh` (per call or globally) to fall back to plain ssh for these.
+**Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
+**ssh**. Set **`CBX_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
+survives laptop sleep, Wi-Fi→LTE, and IP changes with no frozen-SSH hangs, and composes with the tmux
+persistence those already give you. mosh needs **UDP 60000-61000** open to the server — provisioned by
+`tasks/firewall.yml` (a UFW rule); on a hand-rolled host, open it yourself. It still uses ssh for the
+initial handshake, so key auth is unchanged.
+
+The reason ssh is the default: **mosh can't carry the clipboard.** Terminal copy from claude reaches
+your laptop clipboard via an OSC 52 escape sequence, which ssh passes through transparently but mosh's
+predictive terminal drops (a long-standing mosh gap). So on mosh a mouse-selection clears without
+copying; on ssh it lands in your clipboard. Use mosh when roaming matters more than copy-paste. Note
+that an exported `CBX_TRANSPORT` in your `~/.bashrc` wins over the file default — `echo "$CBX_TRANSPORT"`
+if a transport change seems ignored.
 
 **One-shot commands** (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) always use **ssh**,
 regardless of `CBX_TRANSPORT` — their output prints to your terminal and stays in scrollback. mosh is

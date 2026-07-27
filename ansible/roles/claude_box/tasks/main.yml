@@ -92,14 +92,30 @@
   # Generate an SSH keypair on the remote (never checked into git) that can be
   # registered as a GitHub deploy key for the repo the hub clones on first boot.
   # Lives in ./git-identity, which compose mounts into the hub as ~/.gitidentity.
-  - name: Ensure git-identity directory exists (holds the deploy key)
+  # Tagged for BOTH the files and deploy-key runs: the gitconfig template below lands in this dir, so
+  # a `--tags containers-claude-box-files` run must be able to create it too.
+  - name: Ensure git-identity directory exists (holds the deploy key + the hub's gitconfig)
     file:
       path: /virtual_machines/claude-box-docker/git-identity/
       state: directory
       owner: 1000
       group: root
       mode: "u=rwx,g=,o="
-    tags: [containers-claude-box-deploy-key]
+    tags: [containers-claude-box-files, containers-claude-box-deploy-key]
+
+  # The hub's git identity — what `cbx merge` commits as. Without it the hub has no user.name/email
+  # (GIT_CONFIG_GLOBAL points here) and every merge fails with "Please tell me who you are". Managed
+  # here so it can't drift on the server: a hand-written core.sshCommand in this file once overrode
+  # the image's git-ssh wrapper and broke pushes with "Permission denied (publickey)".
+  - name: Template the hub's git identity (gitconfig) to the remote
+    template:
+      src: templates/docker-compose/claude-box/gitconfig
+      dest: /virtual_machines/claude-box-docker/git-identity/gitconfig
+      owner: 1000
+      group: root
+      mode: "u=rw,g=r,o="
+      backup: no
+    tags: [containers-claude-box-files]
   - name: Generate GitHub deploy key on the remote
     command: >
       ssh-keygen -t ed25519 -N ''
