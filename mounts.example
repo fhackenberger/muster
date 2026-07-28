@@ -1,0 +1,65 @@
+# mounts — the ONE mount table for this stack: what the hub has, and what the boxes have.
+#
+# Project set-up, not runtime state: root-owned, synced by Ansible, applied when a container is
+# CREATED. There is no command that edits it from inside the hub — change it here, then
+#   ./gen-hub-mounts.sh && docker compose up -d hub && cbx recreate all
+#
+# Both sides in ONE file on purpose. The hub and the boxes must agree path-for-path (installed
+# dependencies bake absolute paths in), and when the two lists were maintained separately they drifted:
+# a `~/.gradle` shared rw with the hub let its long-running `bootRun` hold gradle's cache locks against
+# every box indefinitely. One row per path, a mode per side, no way to change one and forget the other.
+# The broker reads the BOX column; gen-hub-mounts.sh renders the HUB column into compose.override.yml,
+# and the hub's entrypoint warns at boot if what it actually has doesn't match this file.
+#
+# Grammar (whitespace-separated; '#'/blank ignored):
+#
+#   CHECKOUT <dst> <rw|ro>          The box's working copy at /home/dev/<dst> (default: 'repo rw'):
+#                                   an overlayfs view of the current golden (data/golden/current) with
+#                                   the box's own upper layer, which is what makes N agents cost
+#                                   N x (their own diff) instead of N full checkouts, each with a real
+#                                   .git on its own branch (agent/<box>). `ro` binds the golden itself
+#                                   instead — no upper layer, no writes, no git bootstrap (a
+#                                   look-but-don't-touch box). Box-side by definition: the hub has the
+#                                   real repo, not a golden.
+#
+#   <src> <dst> <hub> <box>         One path, mounted at /home/dev/<dst> on either side.
+#
+#     src   ./x   relative to the stack dir (this directory)
+#           /x    an absolute host path outside the stack
+#           x     relative to the golden, and confined to it — box-side only (hub mode must be '-')
+#
+#     mode  rw       plain bind mount, writable
+#           ro       plain bind mount, read-only
+#           overlay  <src> as a shared read-only LOWER layer with a per-box upper layer on top:
+#                    shared content, private writes. BOX SIDE ONLY. Use it for any toolchain cache
+#                    whose tool takes long-lived locks — see the gradle note below. The upper layer
+#                    lives in data/boxes/<box>/ovl-<key>/ and survives kill/recreate.
+#           -        not mounted on this side
+#
+# Default (this file absent or empty): just the overlay checkout at /home/dev/repo.
+
+# <src>                              <dst>            <hub>  <box>
+CHECKOUT                             repo             rw
+
+# npm cache: genuinely shared rw. npm's cacache is content-addressed and safe for concurrent writers.
+./data/npm-cache                     .npm             rw     rw
+
+# Gradle home: shared as an OVERLAY, never rw. Gradle holds its cache locks for the whole build —
+# and `bootRun` never finishes — handing them over only when the waiting process pings the holder on
+# LOCALHOST. Between containers that ping cannot arrive, so a shared rw ~/.gradle made one long build
+# block every box's gradle forever ("Owner PID: <a pid you can't see>", waiting on caches/journal-1).
+# The overlay keeps the downloads shared and makes locks/journal/daemon-registry per box.
+./data/gradle-cache                  .gradle          rw     overlay
+
+# Jenkins' pre-populated Maven repository, read-only on both sides so no build can ever mutate it.
+# This is the one source OUTSIDE the stack dir: the broker cannot see it, docker resolves it on the
+# host, and a wrong path is silently bound as an EMPTY DIR — check it first if deps stop resolving.
+/var/jenkins_home/.m2/repository     .m2/repository   ro     ro
+
+# Examples:
+
+# Expose a subdirectory of the golden read-only at a second path (reference material for the agents)
+#   docs  reference  -  ro
+
+# A read-only box that can look at the code but never change it
+#   CHECKOUT  repo  ro

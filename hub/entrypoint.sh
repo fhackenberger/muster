@@ -98,6 +98,39 @@ HOOK
 	mkdir -p "$CHECKOUT/.git/cbx"
 fi
 
+# Does what this container actually HAS match the mounts table every box is built from? The table
+# (MOUNTS_FILE) is the single source for both sides, but compose can't read it: gen-hub-mounts.sh
+# renders the hub column into compose.override.yml, so the hub's mounts are only correct if that ran
+# AND this container was recreated afterwards. Both are easy to forget, and the failure is silent —
+# the hub and the boxes quietly end up with different environments, which is exactly how a `~/.gradle`
+# shared rw with every box (and its cross-container lock deadlock) survived unnoticed. So: warn, don't
+# fail. A drifted mount is a bad boot, not a broken one.
+check_mounts() {
+	[ -n "${MOUNTS_FILE:-}" ] && [ -r "$MOUNTS_FILE" ] || return 0
+	local src dst hub rest want opts actual drift=0
+	local mountinfo="${MOUNTINFO:-/proc/self/mountinfo}"   # overridable so this is testable
+	while read -r src dst hub rest; do
+		case "${src:-}" in ''|'#'*|CHECKOUT) continue ;; esac
+		[ -n "${hub:-}" ] || continue
+		case "$hub" in -|rw|ro) ;; *) continue ;; esac
+		want="/home/dev/$dst"
+		# What the KERNEL says, not what compose meant: field 5 is the mount point, field 6 the options.
+		opts="$(awk -v p="$want" '$5 == p { o = $6 } END { print o }' "$mountinfo")"
+		if [ -z "$opts" ]; then
+			[ "$hub" = - ] || { echo "hub: MOUNT DRIFT — $want is NOT mounted, '$MOUNTS_FILE' says '$hub'" >&2; drift=1; }
+			continue
+		fi
+		if [ "$hub" = - ]; then
+			echo "hub: MOUNT DRIFT — $want is mounted but '$MOUNTS_FILE' gives the hub nothing there" >&2; drift=1; continue
+		fi
+		case ",$opts," in *,ro,*) actual=ro ;; *) actual=rw ;; esac
+		[ "$actual" = "$hub" ] ||
+			{ echo "hub: MOUNT DRIFT — $want is $actual, '$MOUNTS_FILE' says $hub" >&2; drift=1; }
+	done < "$MOUNTS_FILE"
+	[ "$drift" = 0 ] || echo "hub: fix with  ./gen-hub-mounts.sh && docker compose up -d hub  (on the host)" >&2
+}
+check_mounts || true
+
 # Idle tmux server with a landing window, so `cbx up` has somewhere to add service windows and you
 # can always attach a shell. tmux keeps running as long as the session lives.
 tmux new-session -d -s "$TMUX_SESSION" -c "$CHECKOUT" -n shell

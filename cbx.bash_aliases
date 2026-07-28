@@ -4,6 +4,10 @@
 #     export CBX_PROJECT=infostars
 #     source /path/to/claude-box/cbx.bash_aliases
 #
+# The exports must be their OWN commands. `CBX_SERVER=… . cbx.bash_aliases` silently leaves the
+# variable unset — see _cbx_need_server below for why. Sourcing also registers bash completion for
+# subcommands, flags and live box/service names; `cbxrefresh` re-reads them before the cache TTL.
+#
 # Everything is driven through `cbx` inside the hub; these wrap the full `<transport> … docker exec …`
 # so you don't type it each time. The hub container is resolved by its compose labels at call time (so
 # it survives compose's `-1` suffix and renames) — the `$(docker ps …)` lookup runs on the SERVER,
@@ -36,13 +40,43 @@
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
-unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql cbxfe cbxsync 2>/dev/null || true
+unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql cbxfe cbxsync cbxexport cbximport 2>/dev/null || true
 unset -f cbxui 2>/dev/null || true          # cbxui was renamed to cbxtun; drop the stale function
+
+# Every entry point below reaches the server as plain "$CBX_SERVER" / "$CBX_PROJECT". Empty, and ssh
+# reports `Could not resolve hostname : Name or service not known` — which reads as a DNS problem and
+# says nothing about the missing export. The commonest way to end up there is
+#     CBX_SERVER=root@host CBX_PROJECT=proj . cbx.bash_aliases
+# Assignments prefixed to a command are TEMPORARY in bash (POSIX mode makes them persist for special
+# builtins like `.`, but that is not the default), so they are gone by the time a function runs — and
+# because the `: "${CBX_SERVER:=…}"` defaults above DID see them, they did not fall back to the
+# placeholder either. The variable simply ends up unset. Fail here with the fix instead.
+_cbx_need_server() {
+	local hint
+	printf -v hint '    export CBX_SERVER=root@your-host CBX_PROJECT=yourproject\n    source %s' \
+		"${BASH_SOURCE[0]}"
+	case "${CBX_SERVER:-}" in
+		'')               echo "cbx: CBX_SERVER is not set." >&2 ;;
+		root@your-server) echo "cbx: CBX_SERVER is still the placeholder ($CBX_SERVER)." >&2 ;;
+		*)
+			case "${CBX_PROJECT:-}" in
+				''|myproject)
+					echo "cbx: CBX_PROJECT is ${CBX_PROJECT:-not set} — it must be the stack's PROJECT_NAME (e.g. infostars)." >&2
+					echo "$hint" >&2
+					return 1 ;;
+			esac
+			return 0 ;;
+	esac
+	echo "cbx: export it as its own command — prefixing the assignment to \`.\`/\`source\` does NOT persist:" >&2
+	echo "$hint" >&2
+	return 1
+}
 
 # One-shot commands: run over ssh so stdout/stderr land on your terminal and persist in scrollback.
 # `-t` gives the remote a PTY (proper width/color for `--help` etc.); ssh doesn't use an alternate
 # screen, so nothing is wiped on exit.
 _cbx_ssh() {
+	_cbx_need_server || return 1
 	ssh -t "$CBX_SERVER" "$1"
 }
 
@@ -52,6 +86,7 @@ _cbx_ssh() {
 # always allocates a PTY (no `-t`); both keep host-key auth via ssh. The `:-ssh` fallback matches the
 # `: "${CBX_TRANSPORT:=ssh}"` default above, so an empty value still means ssh, not mosh.
 _cbx_session() {
+	_cbx_need_server || return 1
 	if [ "${CBX_TRANSPORT:-ssh}" = mosh ]; then
 		mosh "$CBX_SERVER" -- bash -lc "$1"
 	else
@@ -133,6 +168,7 @@ cbxbox() {
 # and stream stdin straight through. Extra args are %q-quoted so they survive the server-side shell
 # re-parse; the $(docker ps …) lookup is left for the server to expand.
 cbxpsql() {
+	_cbx_need_server || return 1
 	[ -n "$1" ] || { echo "usage: cbxpsql <dbname> [psql args…]   (e.g. cbxpsql infotrack_dev --single-transaction < f.sql)" >&2; return 2; }
 	local db="$1"; shift
 	local u=''; [ -n "${CBX_DB_USER:-}" ] && u="-U $CBX_DB_USER "
@@ -159,6 +195,7 @@ cbxpsql() {
 # Targets are reached at the container's IP, so the service must listen on 0.0.0.0 inside its container
 # (ng serve/bootRun and the box port-forward system already bind 0.0.0.0). Ctrl-C closes the tunnel.
 cbxtun() {
+	_cbx_need_server || return 1
 	[ "$#" -gt 0 ] || set -- "hub:${CBX_FRONTEND_PORT:-4211}"
 	local -a LP TG RP; local spec a b c
 	for spec in "$@"; do
@@ -211,6 +248,7 @@ REMOTE
 # Ports come from service-env: FRONTEND_DEV_PORT / SERVER_PORT. Override per call with
 # CBX_FRONTEND_PORT / CBX_BACKEND_PORT if a stack uses different ones.
 cbxfe() {
+	_cbx_need_server || return 1
 	local box="" own="" a fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
 	for a in "$@"; do case "$a" in --own) own=1 ;; *) box="$a" ;; esac; done
 	[ -n "$box" ] || { echo "usage: cbxfe <box> [--own]   (--own = the box's own backend tunnel)" >&2; return 1; }
@@ -228,3 +266,242 @@ cbxfe() {
 	echo "cbxfe: $box -> frontend :$fe, backend :$hubport (the box's own)" >&2
 	cbxtun "${box}:${fe}" "${hubport}:${box}:${be}"
 }
+
+# take new commits from origin onto the dev branch, then tell every agent to re-base on them:
+#
+#   cbxsync              # merge origin into the dev branch, then have the agents rebase
+#   cbxsync --rebase     # ...rebasing the hub's branch instead of merging
+#
+# Two steps because they are two different repos: `cbx pull` moves the HUB's branch, `cbx rebase all`
+# types a rebase instruction into each agent's claude session (their branches are their own clones).
+# Deliberately NOT one remote command: `a && b` in the ssh string would run b on the SERVER rather
+# than inside the hub container. Skips the rebase if the pull failed (conflicts to resolve first),
+# since rebasing agents onto a half-merged branch only spreads the mess.
+cbxsync() {
+	cbx pull "$@" || { echo "cbxsync: pull failed — agents NOT notified" >&2; return 1; }
+	cbx rebase all
+	echo "cbxsync: agents were asked to rebase; they act when they pick the message up. 'cbx status' for the queue." >&2
+}
+
+# The `docker exec` into the hub container, resolved by compose labels at call time — same as _cbx_hub
+# but with `docker exec -i` (NO -t): the two commands below MOVE A PATCH over the pipe, and a PTY would
+# translate newlines and corrupt it. We can't reuse the `cbx()` wrapper for that reason (it uses
+# `ssh -t`). ssh runs WITHOUT -t as well, so the byte stream is clean end to end.
+_cbx_hub_pipe() {
+	printf 'docker exec -i $(docker ps -q -f label=com.docker.compose.project=%s -f label=com.docker.compose.service=hub)' "$CBX_PROJECT"
+}
+
+# cbxexport <box> [git am args…] — pull an agent's work onto YOUR checkout as ONE squashed commit.
+# Runs `cbx export` on the hub and pipes its mbox straight into `git am` here, in one command. The
+# commit carries the agent's handoff summary as its message. Run it from inside your local checkout.
+#   cbxexport work1                 # apply the squashed change as a new commit on your branch
+#   cbxexport work1 --3way          # …with 3-way fallback if context is fuzzy
+# To eyeball the patch instead of applying:  cbxexport work1 --show   (writes it to STDOUT, no am)
+cbxexport() {
+	_cbx_need_server || return 1
+	[ -n "${1:-}" ] || { echo "usage: cbxexport <box> [git am args…]   (run inside your local checkout)" >&2; return 2; }
+	local box="$1"; shift
+	if [ "${1:-}" = --show ]; then
+		ssh -T "$CBX_SERVER" "$(_cbx_hub_pipe) cbx export $box"
+		return
+	fi
+	ssh -T "$CBX_SERVER" "$(_cbx_hub_pipe) cbx export $box" | git am "$@"
+}
+
+# cbximport <box> [base-ref] — REPLACE an agent's branch with YOUR change and tell the box to just
+# note it (not act). Collapses everything on HEAD since <base-ref> (default 'dev') into ONE patch —
+# the net change, exactly as it will land on the hub's dev — and pipes it to `cbx import`. Mirrors
+# cbxexport, so it doesn't matter how many commits you made or whether you built on top of the agent's
+# export: only the end state travels. Run it from inside your local checkout, on the branch that holds
+# your final version. Nothing local is modified.
+#   cbximport work1                 # net change of HEAD vs your 'dev' branch replaces the agent branch
+#   cbximport work1 origin/dev      # …measuring the net change against origin/dev instead
+# The hub repoints refs/agents/<box> at your commit, records it as reviewed, and messages the box.
+cbximport() {
+	_cbx_need_server || return 1
+	[ -n "${1:-}" ] || { echo "usage: cbximport <box> [base-ref]   base defaults to 'dev'   (run inside your checkout)" >&2; return 2; }
+	local box="$1" base="${2:-dev}" sq
+	git rev-parse --verify -q "${base}^{commit}" >/dev/null 2>&1 \
+		|| { echo "cbximport: base ref '$base' not found — pass the branch your change sits on top of: cbximport $box <base>" >&2; return 2; }
+	# One throwaway commit whose diff is HEAD's whole tree vs <base> — a single net patch that applies on
+	# the hub's dev by context. commit-tree writes an object referenced by no branch, so HEAD is untouched.
+	sq="$(git commit-tree "HEAD^{tree}" -p "$(git rev-parse "$base")" -m "$(git log -1 --format=%B HEAD)")" \
+		|| { echo "cbximport: could not assemble the patch" >&2; return 1; }
+	git format-patch --stdout --binary -1 "$sq" \
+		| ssh -T "$CBX_SERVER" "$(_cbx_hub_pipe) cbx import $box"
+}
+
+# ---------------------------------------------------------------------------------------------
+# BASH COMPLETION for cbx / cbxbox / cbxfe / cbxtun.
+#
+# Box and service names live on the SERVER, so completing them means an ssh round-trip — far too slow
+# to run on every Tab. So the names are fetched once and cached in a file for $CBX_COMPLETE_TTL
+# seconds (default 60); every Tab inside that window is a local `awk`. `cbxrefresh` busts the cache
+# when you have just spawned or killed a box and don't want to wait the TTL out.
+#
+# The fetch asks the HUB, not docker, for boxes: `cbx ls` gets its list from the broker (authoritative
+# — it knows boxes docker naming conventions wouldn't reveal), and refs/agents/* adds boxes that are
+# no longer running but still have a handoff waiting for review, which is exactly when you want to
+# complete `cbx review <Tab>`. Output is normalised to "svc <name>" / "box <name>" lines remotely, so
+# the laptop side never parses cbx's human-readable table.
+#
+# BatchMode + ConnectTimeout are load-bearing: without them a server that is down or wants a password
+# makes Tab hang the terminal. On any failure we keep the previous cache and complete nothing new.
+
+: "${CBX_COMPLETE_TTL:=60}"
+
+_cbx_cache_file() {
+	printf '%s/cbx-complete.%s.%s' "${TMPDIR:-/tmp}" "${CBX_PROJECT:-none}" "${UID:-0}"
+}
+
+# Loading indicator for the one Tab in sixty that actually goes over the wire. This CANNOT be a
+# printed message: readline owns the line while a completion function runs, so anything written into
+# the display gets overwritten or leaves debris. OSC 9;4 is the escape that exists for exactly this —
+# it drives the TERMINAL's own progress reporting (taskbar/tab indicator), not the text grid, so the
+# command line is never touched. `3` = indeterminate, `0` = clear. Ghostty, WezTerm, Windows Terminal
+# and ConEmu implement it; terminals that don't simply ignore the sequence (it's an OSC, so it is
+# swallowed, not printed). Writes to /dev/tty because completion's stdout is a capture pipe.
+# Set CBX_COMPLETE_PROGRESS=0 to suppress.
+_cbx_progress() {
+	[ "${CBX_COMPLETE_PROGRESS:-1}" = 1 ] && [ -w /dev/tty ] || return 0
+	case "$1" in
+		on)  printf '\033]9;4;3;0\033\\' > /dev/tty 2>/dev/null ;;
+		off) printf '\033]9;4;0;0\033\\' > /dev/tty 2>/dev/null ;;
+	esac
+	return 0
+}
+
+_cbx_complete_fetch() {
+	ssh -o BatchMode=yes -o ConnectTimeout=5 "$CBX_SERVER" bash -s "$CBX_PROJECT" 2>/dev/null <<'REMOTE'
+proj="$1"
+hub=$(docker ps -q -f label=com.docker.compose.project="$proj" -f label=com.docker.compose.service=hub) || exit 0
+[ -n "$hub" ] || exit 0
+# `cbx ls` = services table + broker box table. Tag each section's first column and drop anything that
+# isn't a bare name, which throws away the "(broker unreachable)" / "(none — drop a manifest …)" lines.
+docker exec "$hub" cbx ls 2>/dev/null | awk '
+	/^== services/ { sec="svc"; next }
+	/^== boxes/    { sec="box"; next }
+	/^==/          { sec="";    next }
+	sec != "" && $1 ~ /^[A-Za-z0-9][-A-Za-z0-9_]*$/ { print sec, $1 }'
+# Boxes with a handoff waiting but no running container — review/merge/drop still apply to them.
+docker exec "$hub" git -C /home/dev/repo for-each-ref --format='box %(refname:strip=2)' refs/agents/ 2>/dev/null
+REMOTE
+}
+
+# Cached names, refreshed when the file is older than the TTL. A failed fetch leaves the old cache in
+# place (the write goes to .tmp and is only moved on success), so a brief network blip doesn't wipe
+# completion — and the mv is atomic, so a concurrent Tab never reads a half-written file.
+_cbx_complete_cache() {
+	local f now mtime
+	[ -n "${CBX_SERVER:-}" ] && [ -n "${CBX_PROJECT:-}" ] || return 0
+	f="$(_cbx_cache_file)"
+	now=$(date +%s)
+	mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+	# -e, not -s: a failed fetch leaves an EMPTY cache file behind on purpose (see the touch below), and
+	# testing for size would make every keystroke retry the ssh that just failed.
+	if [ ! -e "$f" ] || [ "$((now - mtime))" -ge "$CBX_COMPLETE_TTL" ]; then
+		_cbx_progress on
+		if _cbx_complete_fetch > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
+			mv -f "$f.tmp" "$f"
+		else
+			rm -f "$f.tmp"
+			touch "$f" 2>/dev/null   # don't retry the failing ssh on every keystroke
+		fi
+		_cbx_progress off
+	fi
+	cat "$f" 2>/dev/null
+}
+
+_cbx_names() { _cbx_complete_cache | awk -v k="$1" '$1==k {print $2}' | sort -u; }
+
+# Force the next Tab to re-fetch — after `cbx box foo`, `cbx kill foo`, or a handoff.
+cbxrefresh() { rm -f "$(_cbx_cache_file)"; _cbx_complete_cache >/dev/null; echo "cbx: completion cache refreshed"; }
+
+_cbx_complete() {
+	local cur cmd sub
+	cur="${COMP_WORDS[COMP_CWORD]}"
+	cmd="${COMP_WORDS[1]:-}"
+	COMPREPLY=()
+
+	if [ "$COMP_CWORD" -eq 1 ]; then
+		COMPREPLY=($(compgen -W "svcs up down logs autostart box kill recreate ls forwards
+			status q review fix prereview merge drop rebase export import pull push
+			golden expose hide" -- "$cur"))
+		return
+	fi
+
+	# Flags first: once the word starts with '-' the positional rules below don't apply.
+	if [[ $cur == -* ]]; then
+		local flags=""
+		case "$cmd" in
+			review)    flags="--full --net" ;;
+			merge)     flags="--squash --edit" ;;
+			fix)       flags="-m --force" ;;
+			prereview) flags="--force" ;;
+			rebase)    flags="--force" ;;
+			recreate)  flags="--fresh" ;;
+			q|queue)   flags="--text --once --no-bell -n" ;;
+			pull)      flags="--rebase" ;;
+			golden)    [ "${COMP_WORDS[2]:-}" = snapshot ] && flags="--prep" ;;
+		esac
+		COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+		return
+	fi
+
+	case "$cmd" in
+		up|down)   COMPREPLY=($(compgen -W "$(_cbx_names svc)" -- "$cur")) ;;
+		logs)      COMPREPLY=($(compgen -W "$(_cbx_names svc) gitd" -- "$cur")) ;;
+		# `box` takes a NEW name (nothing to complete); `import`/`export` and every review-queue verb
+		# take an existing one.
+		kill|forwards|review|fix|prereview|merge|drop|export|import)
+		           COMPREPLY=($(compgen -W "$(_cbx_names box)" -- "$cur")) ;;
+		recreate|rebase)
+		           COMPREPLY=($(compgen -W "$(_cbx_names box) all" -- "$cur")) ;;
+		golden)    [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "snapshot seal ls reap" -- "$cur")) ;;
+		expose|hide) COMPREPLY=($(compgen -f -- "$cur")) ;;
+	esac
+	return 0    # a case arm whose last test failed would otherwise make readline see an error
+}
+
+_cbx_complete_boxonly() {
+	local cur="${COMP_WORDS[COMP_CWORD]}"
+	if [[ $cur == -* ]]; then
+		local flags=""
+		case "${COMP_WORDS[0]}" in cbxfe) flags="--own" ;; cbxexport) flags="--show --3way" ;; esac
+		COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+		return 0
+	fi
+	[ "$COMP_CWORD" -eq 1 ] && COMPREPLY=($(compgen -W "$(_cbx_names box)" -- "$cur"))
+	return 0
+}
+
+# cbximport's second word is a LOCAL base ref (the branch your change sits on top of), so it completes
+# from your own checkout rather than from the server — no cache involved.
+_cbx_complete_import() {
+	local cur="${COMP_WORDS[COMP_CWORD]}"
+	case "$COMP_CWORD" in
+		1) COMPREPLY=($(compgen -W "$(_cbx_names box)" -- "$cur")) ;;
+		2) COMPREPLY=($(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)" -- "$cur")) ;;
+	esac
+	return 0
+}
+
+# cbxtun specs are TARGET:PORT (or LOCAL:TARGET:PORT). We only complete the target half — the port is
+# yours to pick — and suppress the trailing space so you can type the ':PORT' straight on.
+_cbx_complete_tun() {
+	local cur="${COMP_WORDS[COMP_CWORD]}"
+	case "$cur" in
+		*:*) COMPREPLY=() ;;                        # past the target; ports aren't ours to guess
+		*)   COMPREPLY=($(compgen -S : -W "hub $(_cbx_names box)" -- "$cur"))
+		     [ "${#COMPREPLY[@]}" -gt 0 ] && compopt -o nospace ;;
+	esac
+	return 0
+}
+
+if [ -n "${BASH_VERSION:-}" ]; then
+	complete -F _cbx_complete cbx
+	complete -F _cbx_complete_boxonly cbxbox cbxfe cbxexport
+	complete -F _cbx_complete_import cbximport
+	complete -F _cbx_complete_tun cbxtun
+	complete -W '--rebase' cbxsync
+fi

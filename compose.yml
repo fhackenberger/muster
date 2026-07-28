@@ -1,5 +1,5 @@
 # Per-project remote claude-box stack. Copy this directory once per project (each gets its own
-# .env, box-mounts, and ./data), then `docker compose up -d`.
+# .env, mounts, and ./data), then `./gen-hub-mounts.sh && docker compose up -d`.
 #
 # All images are pulled from the acoveo registry (dockerregistry.acoveo.com) by default, so the
 # stack does NOT need to run on the same host as Jenkins. The db (dbtest) and the box / hub /
@@ -10,11 +10,13 @@
 #
 # Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
 # pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
-# holder of the docker socket); they mount only what box-mounts grants and reach the hub by name.
+# holder of the docker socket); they mount only what the `mounts` table grants and reach the hub
+# by name.
 #
 # Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
 # pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
-# holder of the docker socket); they mount only what box-mounts grants and reach the hub by name.
+# holder of the docker socket); they mount only what the `mounts` table grants and reach the hub
+# by name.
 
 name: ${PROJECT_NAME}
 
@@ -40,7 +42,8 @@ services:
     restart: unless-stopped
 
   # The ONLY container with the docker socket. "claude-box.sh as a service": validates the request
-  # (box name + box-mounts, sources confined under the checkout) then runs the modified claude-box.sh.
+  # (the hub passes a box NAME; the mounts come from the root-owned `mounts` table) then runs the
+  # modified claude-box.sh.
   box-broker:
     # Pulled from the acoveo registry if missing (COMPOSE_PULL_POLICY=missing). Set
     # COMPOSE_PULL_POLICY=build to (re)build locally from this dir instead (e.g. on the Jenkins host).
@@ -55,8 +58,8 @@ services:
       BOX_IMAGE: ${BOX_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-infostars:stable}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       # The prepared "golden" checkouts every box overlays (data/golden/current), and the staging dir
-      # the hub prepares a new one in before the broker seals it into place. PROJECT_ROOT confines the
-      # EXTRA mounts from box-mounts; the checkout itself is the overlay volume, not a bind.
+      # the hub prepares a new one in before the broker seals it into place. PROJECT_ROOT confines
+      # golden-relative sources in the mounts table; the checkout itself is the overlay volume.
       GOLDEN_DIR: ${STACK_DIR}/data/golden
       GOLDEN_STAGING: ${STACK_DIR}/data/golden-staging
       PROJECT_ROOT: ${STACK_DIR}/data/golden
@@ -67,19 +70,16 @@ services:
       DEV_BRANCH: ${DEV_BRANCH:-dev}
       HUB_GIT_URL: ${HUB_GIT_URL:-git://hub/repo}
       CLAUDE_HOME: ${STACK_DIR}/data/claude
-      # Shared package caches mounted rw into every box (and the hub) at ~/.npm and ~/.gradle, so
-      # node/gradle artifacts are downloaded once instead of duplicated per box.
-      NPM_CACHE: ${STACK_DIR}/data/npm-cache
-      GRADLE_CACHE: ${STACK_DIR}/data/gradle-cache
-      # The SAME Maven repository the hub mounts (see the hub's volumes below), read-only in every
-      # box so agents resolve deps from Jenkins' cache instead of re-downloading — and can never
-      # mutate it. Must be an absolute HOST path; docker binds an empty dir if it doesn't exist.
-      M2_REPO: ${MAVEN_REPO_HOST:-/var/jenkins_home/.m2/repository}
       BOXROOT: ${STACK_DIR}/data/boxes
-      BOX_MOUNTS: ${STACK_DIR}/box-mounts
+      # The `mounts` table: ONE row per path with a mode for the hub and a mode for the box, so the two
+      # environments cannot drift apart (see mounts.example). The broker reads the box column from
+      # here; the hub's column is rendered into compose.override.yml by gen-hub-mounts.sh. STACK_DIR is
+      # what a './…' source in that table resolves against.
+      STACK_DIR: ${STACK_DIR}
+      MOUNTS_FILE: ${STACK_DIR}/mounts
       PINCHTAB_SERVER: http://hub:9867
       PINCHTAB_TOKEN: ${PT_TOKEN}
-      # Per-project port forwards (like box-mounts): NAME BOX_PORT HUB_BASE_PORT per line. Each box
+      # Per-project port forwards (like `mounts`): NAME BOX_PORT HUB_BASE_PORT per line. Each box
       # gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
       # Project/service settings (KEY=VALUE) handed to every box. The hub gets the SAME file via
       # `env_file:` below, so a backend/frontend is configured identically whether the hub or an
@@ -129,7 +129,10 @@ services:
       GOLDEN_PREP_CMD: ${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}
       BROKER_URL: http://box-broker:8099
       BROKER_TOKEN: ${BROKER_TOKEN}
-      BOX_MOUNTS: /work/box-mounts
+      # The mounts table, read-only — the hub does not apply it (compose.override.yml does that), it
+      # only CHECKS its own mounts against it at boot, so a stale override or a missed
+      # `docker compose up -d hub` shows up as a warning instead of as silent hub/box drift.
+      MOUNTS_FILE: /work/mounts
       # Dev-service manifests (one file per service) that `cbx up/svcs/autostart` read — bind-mounted
       # read-only from the stack's ./hub-services below. Changing a service is a file sync, not a rebuild.
       HUB_SERVICES_DIR: /work/hub-services
@@ -155,20 +158,16 @@ services:
       - ./data/golden-staging:/work/golden-staging
       # Per-box state (which golden, session id, upper layer) — readable for `cbx q`/diagnostics only.
       - ./data/boxes:/work/boxes:ro
-      - ./box-mounts:/work/box-mounts
+      - ./mounts:/work/mounts:ro
       # Dev-service manifests (backend/frontend/pinchtab/…), read-only. Copy hub-services.example ->
       # hub-services once (Ansible templates it on the acoveo host). An empty/absent dir = no services.
       - ./hub-services:/work/hub-services:ro
       - ./data/claude:/home/dev/.claude
       - ./data/pinchtab:/home/dev/.pinchtab
       - ./git-identity:/home/dev/.gitidentity
-      # Shared package caches — the SAME dirs the broker mounts into every box (~/.npm, ~/.gradle) —
-      # so the hub and all boxes download node/gradle artifacts once instead of duplicating them.
-      - ./data/npm-cache:/home/dev/.npm
-      - ./data/gradle-cache:/home/dev/.gradle
-      # Jenkins' pre-populated Maven cache, mounted READ-ONLY at the hub user's default local repo
-      # (~/.m2/repository, since the hub runs as uid 1000 with HOME=/home/dev). Maven/gradle then
-      # resolve dependencies from Jenkins' cache without re-downloading; read-only so a build can
-      # never mutate the shared cache. Host path is overridable via MAVEN_REPO_HOST in .env.
-      - ${MAVEN_REPO_HOST:-/var/jenkins_home/.m2/repository}:/home/dev/.m2/repository:ro
+      # NOTE: the hub's PROJECT mounts (~/.npm, ~/.gradle, ~/.m2/repository — anything a build touches)
+      # are NOT listed here. They come from the `mounts` table via compose.override.yml, which
+      # gen-hub-mounts.sh renders, so the hub and the boxes cannot be configured differently by
+      # accident. What stays here is the stack's own plumbing above: the repo, the goldens, box state,
+      # the manifests, the shared claude/pinchtab/git identity.
     restart: unless-stopped

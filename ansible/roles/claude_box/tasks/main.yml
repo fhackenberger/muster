@@ -14,6 +14,8 @@
       perms: yes
       rsync_opts:
         - "--exclude=.*.swp"
+        # Generated on the HOST from `mounts` (see below) — never ship a developer's local copy.
+        - "--exclude=compose.override.yml"
     tags: [containers-claude-box-files]
   # Take care of setting special permissions: boxes + hub run as uid 1000
   - name: Take care of special permissions
@@ -31,7 +33,8 @@
       # Per-box state: session id, port-forward slot, and the box's overlay upper layer.
       - /virtual_machines/claude-box-docker/data/boxes/
       - /virtual_machines/claude-box-docker/data/pinchtab/
-      # Shared npm + gradle caches (mounted rw into the hub + every box at ~/.npm and ~/.gradle)
+      # Package caches from the `mounts` table: ~/.npm shared rw with every box, ~/.gradle the hub's
+      # own (each box overlays it read-only — gradle's locks cannot be shared across containers).
       - /virtual_machines/claude-box-docker/data/npm-cache/
       - /virtual_machines/claude-box-docker/data/gradle-cache/
     tags: [containers-claude-box-files]
@@ -56,14 +59,32 @@
       force: yes
     tags: [containers-claude-box-files]
 
-  - name: Claude box mounts for intostars
+  # The ONE mount table: what the hub gets and what every box gets, one row per path (see
+  # mounts.example). Root-owned project set-up — nothing inside a container may edit it. World-readable
+  # (it holds paths, no secrets) because the hub runs as uid 1000 and checks its own mounts against it.
+  - name: Claude box mounts table (hub + boxes)
     template:
-      src: templates/docker-compose/claude-box/box-mounts
-      dest: /virtual_machines/claude-box-docker/box-mounts
+      src: templates/docker-compose/claude-box/mounts
+      dest: /virtual_machines/claude-box-docker/mounts
       owner: root
       group: root
-      mode: "u=rw,g=,o="
+      mode: "u=rw,g=r,o=r"
       backup: no
+    tags: [containers-claude-box-files]
+  # The broker reads the box column of that table directly, but compose cannot read it — so the hub's
+  # column is rendered into compose.override.yml here. Skipping this is what would let the hub's mounts
+  # drift from the boxes'; the hub warns at boot if they have.
+  - name: Render the hub's volumes from the mounts table
+    command: ./gen-hub-mounts.sh
+    args:
+      chdir: /virtual_machines/claude-box-docker
+    changed_when: false
+    tags: [containers-claude-box-files]
+  # Superseded by `mounts` above (box-only, and hub-writable via the removed `cbx expose`).
+  - name: Remove the superseded box-mounts manifest
+    file:
+      path: /virtual_machines/claude-box-docker/box-mounts
+      state: absent
     tags: [containers-claude-box-files]
 
   # Settings for the project's services (backend/frontend). Handed to the hub via compose `env_file:`

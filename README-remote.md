@@ -69,7 +69,8 @@ NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 \
 mkdir -p /srv/cbx/myproject && cd /srv/cbx/myproject
 cp -r path/to/infostars/docker-claude/{compose.yml,box-broker,hub} .
 cp path/to/infostars/docker-claude/.env.example      .env
-cp path/to/infostars/docker-claude/box-mounts.example box-mounts
+cp path/to/infostars/docker-claude/mounts.example     mounts
+./gen-hub-mounts.sh                                    # renders the hub's volumes -> compose.override.yml
 cp path/to/infostars/docker-claude/service-env       service-env   # REQUIRED: compose env_file
 cp path/to/infostars/docker-claude/port-forwards.example port-forwards
 cp -r path/to/infostars/docker-claude/hub-services.example hub-services  # dev-service manifests
@@ -198,7 +199,10 @@ changed" comes from doing one and not the other:
 | `hub/cbx`, `hub/entrypoint.sh`, `hub/git-ssh`, `hub/Dockerfile.base` | Jenkins build | `claude-box-hub-base` → `claude-box-hub` |
 | `Dockerfile`, `common-setup.sh`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
 | `box-broker/broker.py`, **`claude-box.sh`** | Jenkins build | `claude-box-broker` |
-| `compose.yml`, `.env`, `service-env`, `box-mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
+| `compose.yml`, `.env`, `service-env`, `mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
+
+A change to `mounts` needs one extra step on the host, `./gen-hub-mounts.sh`, which renders the hub's
+half of the table into `compose.override.yml` (Ansible does it as part of the files tag).
 
 Two traps in that table. **`claude-box.sh` is `COPY`d into the *broker* image**, not the box image —
 a change there needs a broker rebuild. And **each add-on image must be rebuilt after its base**
@@ -210,6 +214,7 @@ The Jenkinsfile orders them correctly.
 # 2. files:  ansible-playbook … --tags containers-claude-box-files
 # 3. on the server:
 cd /virtual_machines/claude-box-docker
+./gen-hub-mounts.sh                                 # if `mounts` changed (Ansible already did it)
 docker compose up -d --pull always hub box-broker   # RECREATES them — env is fixed at creation
 docker compose pull                                 # refresh the box image for the next spawn
 cbx recreate all                                    # boxes: new image + new env/mounts
@@ -227,10 +232,11 @@ cbx recreate all                                    # boxes: new image + new env
 Verify what actually landed, rather than assuming:
 
 ```sh
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' infostars-box-broker-1 | grep -E 'M2_REPO|SERVICE_ENV_FILE'
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' infostars-box-broker-1 | grep -E 'MOUNTS_FILE|SERVICE_ENV_FILE'
 docker exec infostars-box-broker-1 grep -c SERVICE_ENV_FILE /usr/local/bin/broker.py   # code, not env
 docker exec -u dev box-infostars-<name> printenv DB_INFOSTARS_PSQL_URL
 docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' box-infostars-<name>
+docker logs infostars-hub 2>&1 | grep 'MOUNT DRIFT'     # hub's own mounts vs the `mounts` table
 ```
 
 The first two are the useful pair: env comes from the **file sync**, the code from the **image**, and
@@ -270,6 +276,31 @@ That gives you:
   tell the box to just note it, not act (`git format-patch` → `cbx import`). See *Editing an agent's
   work by hand* below.
 
+**Export the two variables as their own commands.** Prefixing them to the `source` — `CBX_SERVER=…
+CBX_PROJECT=… . cbx.bash_aliases` — does *not* work: assignments prefixed to a command are temporary
+in bash, so they are gone by the time an alias runs, and because the file's `:=` defaults did see
+them they don't fall back to the placeholder either. The variable simply ends up unset, and ssh then
+reports `Could not resolve hostname : Name or service not known`, which looks like a DNS fault. The
+aliases now catch this themselves and print the fix.
+
+**Tab completion.** Sourcing the file also registers bash completion: subcommands and flags for `cbx`,
+and **live box names** for `cbx review|merge|drop|fix|rebase|kill|recreate|…`, `cbxbox`, `cbxfe` and
+`cbxtun` (which completes `hub:` / `<box>:` and leaves the cursor on the colon for the port). Service
+names complete for `cbx up|down|logs`.
+
+Names live on the server, so they are fetched once over ssh and cached for **`CBX_COMPLETE_TTL`**
+seconds (default 60) — every Tab inside that window is local. Run **`cbxrefresh`** after spawning or
+killing a box rather than waiting the TTL out. The box list comes from the broker (via `cbx ls`) plus
+`refs/agents/*`, so a box that is no longer running but still has a handoff waiting still completes
+for `cbx review`. A server that is down or wants a password never hangs your Tab: the fetch is
+`BatchMode` with a 5s timeout, and on failure the previous cache stands.
+
+On the one Tab in sixty that does go over the wire, the terminal's own **progress indicator** turns on
+for the duration (OSC `9;4`, indeterminate — Ghostty, WezTerm, Windows Terminal, ConEmu; others ignore
+it silently). It has to be the terminal's indicator rather than a printed message, because readline
+owns the command line while a completion function runs and anything written into the display is
+overwritten or leaves debris. `CBX_COMPLETE_PROGRESS=0` turns it off.
+
 **Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
 **ssh**. Set **`CBX_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
 survives laptop sleep, Wi-Fi→LTE, and IP changes with no frozen-SSH hangs, and composes with the tmux
@@ -305,7 +336,7 @@ cbx up backend        # start one (any service that has a hub-services/<name> ma
 cbx up frontend
 cbx up pinchtab
 cbx logs backend      # attach that service's tmux window to watch logs (Ctrl-b d to detach)
-cbx box work1         # spawn an agent box (mounts per box-mounts)
+cbx box work1         # spawn an agent box (mounts per the `mounts` table)
 cbx ls                # services + boxes
 ```
 
@@ -373,12 +404,13 @@ cbxbox work1                                                                    
 ssh -t "$CBX_SERVER" docker exec -it -u dev "box-${CBX_PROJECT}-work1" tmux attach -t main   # equivalent, raw
 ```
 
-Curate EXTRA paths boxes see (the checkout itself is the overlay, see below); recreate to apply:
+What the hub and the boxes mount is **project set-up, not a runtime knob**: it lives in the stack's
+root-owned `mounts` table (see *One mount table* below), edited on the host and applied by recreating:
 
 ```sh
-cbx expose docs reference ro
-cbx hide  docs
-cbx recreate work1
+$EDITOR mounts                                  # on the host, as root
+./gen-hub-mounts.sh                             # -> compose.override.yml (the hub's side)
+docker compose up -d hub && cbx recreate all    # mounts are fixed at container creation
 ```
 
 ## The review workflow
@@ -556,6 +588,49 @@ cbxtun 4300:work1:4200       # box 'work1' :4200 published on your laptop's :430
 The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`; it drops the stale
 `cbxui` function on load).
 
+## One mount table (`mounts`)
+
+Everything the hub and the boxes mount — the checkout, the toolchain caches, any extra path — is one
+root-owned table in the stack dir, one row per path with **a mode for each side**:
+
+```
+# <src>                              <dst>            <hub>  <box>
+CHECKOUT                             repo             rw
+./data/npm-cache                     .npm             rw     rw
+./data/gradle-cache                  .gradle          rw     overlay
+/var/jenkins_home/.m2/repository     .m2/repository   ro     ro
+docs                                 reference        -      ro
+```
+
+`src` is `./x` (stack-relative), `/x` (an absolute host path), or bare `x` (relative to the golden
+and confined to it — box-side only). `dst` is always relative to `/home/dev`, on both sides, which is
+what keeps hub and box paths identical. Modes are `rw`, `ro`, `overlay` (box-side: `src` as a shared
+read-only lower layer with a per-box upper on top — shared content, private writes, upper in
+`data/boxes/<box>/ovl-<key>/`) and `-` (not mounted here). `CHECKOUT <dst> <rw|ro>` is the box's
+working copy: an overlay of the current golden, or the golden itself read-only.
+
+**Why one file for both sides.** The hub and the boxes must agree path-for-path (installed
+dependencies bake absolute paths in), and while the two lists were maintained separately — the hub's
+in `compose.yml`, the boxes' in `broker.py` — they drifted: both said "rw at `~/.gradle`", nobody
+noticed the two are different *containers*, and the cross-container lock deadlock above followed.
+Adding a per-project cache is now a config change, not an image rebuild.
+
+Compose can't read the table, so the hub's column is rendered into `compose.override.yml`:
+
+```sh
+$EDITOR mounts                                  # on the host, as root
+./gen-hub-mounts.sh                             # -> compose.override.yml
+docker compose up -d hub && cbx recreate all    # mounts are fixed at container creation
+```
+
+Under Ansible both steps are part of `--tags containers-claude-box-files`. Forgetting either is not
+silent: the hub compares its actual mounts against the table at boot and prints `MOUNT DRIFT` lines.
+
+The stack's own plumbing (`data/repo`, the goldens, `data/boxes`, `hub-services`, `data/claude`,
+pinchtab, `git-identity`) stays in `compose.yml` — that's the stack's definition, not this project's
+environment.
+
+
 ## Notes
 
 - **Agent activity:** each box's claude writes `busy` / `waiting` / `idle` to `$HOME/.cbx-state` via
@@ -576,13 +651,14 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
   recreate) ran the login/onboarding flow again. Pointing `CLAUDE_CONFIG_DIR` at the shared dir puts
   the whole config there, so you log in once. Set on the hub in `compose.yml` (Ansible sync) and on
   boxes in `claude-box.sh`'s headless branch (image rebuild) — both paths must land, see *Deploying*.
-- **Isolation:** a box sees its own overlay of the golden plus whatever `box-mounts` adds, has no
+- **Isolation:** a box sees its own overlay of the golden plus whatever the `mounts` table adds, has no
   docker socket, no credentials for the real origin, and can't see the hub's filesystem or another
   box's upper layer. Its only shared surface is the network (`hub:8080/4200/9867/9418`).
-- **Broker policy:** the hub passes a box name + the manifest; the broker fixes image/uid/network/
-  privileges, confines every extra mount source under the golden, and owns the overlay volumes. It
-  is the only socket holder. Its two box-facing operations (`/say`, `/dirty`) run **fixed** commands
-  — there is no arbitrary-exec endpoint.
+- **Broker policy:** the hub passes a box NAME — nothing else. Image, uid, network, privileges, the
+  socket and the mount list are the broker's; the mounts come from the root-owned `mounts` table,
+  which no container can write, and golden-relative sources in it are confined to the golden. It is
+  the only socket holder. Its two box-facing operations (`/say`, `/dirty`) run **fixed** commands —
+  there is no arbitrary-exec endpoint.
 - **git daemon has no auth.** Boxes push over `git://` on the cbx network; the `update` hook in
   `data/repo` (installed by the hub entrypoint) is what bounds that: `refs/agents/*` and
   `refs/notes/cbx` only, so a box can never write `dev` or delete a branch.
@@ -592,17 +668,19 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
   non-writable golden makes every file unwritable inside the box instead of protecting anything.
 - **`cbx kill` keeps the box's upper layer** on disk, so `cbx box <same name>` reattaches to its
   uncommitted work. Only `cbx golden snapshot` (and `cbx recreate --fresh`) discards it.
-- **Shared caches:** the hub and every box mount the SAME `data/npm-cache` and `data/gradle-cache`
-  (rw) at `~/.npm` and `~/.gradle`, so node/gradle artifacts are downloaded once — no per-box
-  duplication on the host. uid 1000 owns them (the `dev`/`gradle` users share it), and npm/gradle
-  both lock the cache for concurrent access. `~/.m2/repository` (`MAVEN_REPO_HOST`, Jenkins' cache)
-  is shared with both as well, but **read-only** — a build must never mutate it, and it is the one
-  shared path that lives outside the stack dir, so a wrong value is silently bound as an empty dir.
+- **One mount table** (`mounts`) — see the section above. The bullet that matters here: `~/.gradle`
+  is shared as an **overlay**, never rw. Gradle holds its cache locks for the *whole build* — and
+  `bootRun` never finishes — handing them over only when the waiting process pings the holder on
+  **localhost**. Between containers that ping cannot arrive, so a `~/.gradle` shared rw with the hub
+  blocked every box's gradle *indefinitely* (`Owner PID: <a pid you can't see>`, waiting on
+  `caches/journal-1`), and "wait and retry" never helped. Any toolchain cache with long-lived locks
+  belongs in `overlay` mode; `~/.npm` is fine shared rw because npm's cacache is content-addressed
+  and concurrency-safe.
 - **Port forwards (pinchtab browser + own-backend dev loops):** the pinchtab server + Chrome run on
   the **hub**, but each agent runs its OWN dev services inside its box (`ng serve`, and optionally its
   own backend). pinchtab's IDPI allowlist has no wildcard and the browser is in a different netns, so
   the box name / box loopback don't work directly. Instead the **`port-forwards`** manifest (grammar
-  `NAME BOX_PORT HUB_BASE_PORT`, like `box-mounts`) tells the broker to publish each box's services on
+  `NAME BOX_PORT HUB_BASE_PORT`, like `mounts`) tells the broker to publish each box's services on
   the **hub's loopback**: a box in slot N gets a socat (in the hub's netns, run from the box image)
   mapping hub `127.0.0.1:(HUB_BASE_PORT + N)` → `box:BOX_PORT`. The box receives `PORT_FORWARDS` +
   `PORT_FORWARD_<NAME>_FROM`/`_TO_HUB`, and the **project's own scripts** turn those into e.g.

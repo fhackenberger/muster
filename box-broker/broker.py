@@ -3,10 +3,16 @@
 
 It is "claude-box.sh as a service": the hub asks it (over the internal compose network, gated by
 a shared token) to create/kill/list agent boxes, and the broker runs the modified claude-box.sh
-with a VETTED environment. The hub can influence only the box name and the curated mount list;
-image, uid, network, privileges and the socket are the broker's. Every curated mount source is
-resolved and confined under the project root, so a compromised hub can expose project files to a
-box but can never mount host paths or gain privilege.
+with a VETTED environment. The hub can influence only the box NAME; image, uid, network,
+privileges, the socket and the mount list are the broker's. What a box sees comes from the
+`mounts` table (MOUNTS_FILE), which is root-owned project config synced by Ansible — the hub
+cannot write it, so a compromised hub cannot add a mount.
+
+MOUNTS IS THE ONE MOUNT TABLE — hub AND box. Same file, one row per path, a mode column per side,
+so the two environments cannot drift apart (they did once: a `~/.gradle` shared rw with the hub
+let its `bootRun` hold gradle's cache locks against every box forever). This broker reads the box
+column; the hub's side of the same table is rendered into compose.override.yml by
+gen-hub-mounts.sh, and the hub's entrypoint warns if what it actually has doesn't match.
 
 THE CHECKOUT IS AN OVERLAY. One prepared "golden" tree (cloned, deps installed, caches warm) is
 shared read-only by every box as an overlayfs lowerdir; each box writes into its own upperdir, so
@@ -31,15 +37,15 @@ Config (env, from compose):
   BOX_NETWORK         docker network the box joins (e.g. cbx-<project>)
   GOLDEN_DIR          HOST path holding the sealed goldens + the `current` symlink
   GOLDEN_STAGING      HOST path the hub prepares new goldens in (sealed via /golden/seal)
-  PROJECT_ROOT        confinement root for box-mounts extras (default: the current golden)
+  PROJECT_ROOT        confinement root for golden-relative mount sources (default: the current golden)
   CHECKOUT_DST        where the overlay is mounted in the box (default /home/dev/repo — must match the hub)
-  NPM_CACHE/GRADLE_CACHE  HOST paths shared rw with the hub at ~/.npm and ~/.gradle
-  M2_REPO             HOST path of the Maven repository, mounted READ-ONLY at ~/.m2/repository
+  STACK_DIR           HOST path of the stack dir, what a './…' mount source resolves against
+  MOUNTS_FILE         HOST path of the `mounts` table — hub + box mounts, one row per path (see
+                      mounts.example for the grammar)
   CLAUDE_HOME         HOST path of the shared ~/.claude (mounted into every box; boxes also get
                       CLAUDE_CONFIG_DIR pointing at it, so .claude.json — the login and the user
                       preferences — is shared too and one login covers the whole stack)
-  BOXROOT             HOST path whose <name>/{home,upper,work} subdirs back each box
-  BOX_MOUNTS          HOST path of the box-mounts manifest (EXTRA mounts only; see box-mounts.example)
+  BOXROOT             HOST path whose <name>/{home,upper,work,ovl-*} subdirs back each box
   DEV_BRANCH          branch agents base their work on (default: dev)
   HUB_GIT_URL         the hub repo as the boxes reach it (default: git://hub/repo)
   PINCHTAB_SERVER     e.g. http://hub:9867     PINCHTAB_TOKEN  the pinchtab token
@@ -69,25 +75,17 @@ GOLDEN_STAGING = os.environ.get("GOLDEN_STAGING", "")
 # is mounted back where it was prepared.
 CHECKOUT_DST = os.environ.get("CHECKOUT_DST", "/home/dev/repo")
 CLAUDE_HOME = os.environ.get("CLAUDE_HOME", "")
-# Shared package caches mounted (rw) into every box AND the hub at ~/.npm and ~/.gradle, so node/gradle
-# artifacts are downloaded once, not duplicated per box. uid 1000 (dev) owns them; npm + gradle both
-# handle concurrent access to a shared cache via their own file locks.
-NPM_CACHE = os.environ.get("NPM_CACHE", "")
-GRADLE_CACHE = os.environ.get("GRADLE_CACHE", "")
-# Jenkins' pre-populated Maven repository, mounted READ-ONLY at ~/.m2/repository in every box — the
-# same mount the hub gets, so a box resolves dependencies from the shared cache instead of
-# re-downloading them. Unlike the caches above this lives OUTSIDE the stack dir and is therefore not
-# visible from this container, so it is never created or chowned here: docker resolves the host path
-# itself. A wrong path is silently bound as an empty directory (docker's behaviour), so if a box
-# suddenly can't resolve deps, check this value first.
-M2_REPO = os.environ.get("M2_REPO", "")
+# The stack dir on the HOST. A './…' source in the mounts table resolves against it, which is what
+# lets the same row be a literal './data/…' in the hub's compose override and an absolute host path
+# in a box's -v — no $VAR that compose and this broker could expand differently.
+STACK_DIR = os.environ.get("STACK_DIR", "")
 BOXROOT = os.environ.get("BOXROOT", "")
-BOX_MOUNTS = os.environ.get("BOX_MOUNTS", "")
+MOUNTS_FILE = os.environ.get("MOUNTS_FILE", "")
 DEV_BRANCH = os.environ.get("DEV_BRANCH", "dev")
 HUB_GIT_URL = os.environ.get("HUB_GIT_URL", "git://hub/repo")
 PT_SERVER = os.environ.get("PINCHTAB_SERVER", "")
 PT_TOKEN = os.environ.get("PINCHTAB_TOKEN", "")
-# Per-project port forwards (like box-mounts). File grammar: 'NAME BOX_PORT HUB_BASE_PORT' per line;
+# Per-project port forwards (like `mounts`). File grammar: 'NAME BOX_PORT HUB_BASE_PORT' per line;
 # each box gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
 PORT_FORWARDS_FILE = os.environ.get("PORT_FORWARDS_FILE", "")
 PORT_FORWARD_SLOTS = int(os.environ.get("PORT_FORWARD_SLOTS", "16"))
@@ -208,7 +206,7 @@ def reap_goldens():
 # --------------------------------------------------------------------------- port forwards
 
 def parse_port_forwards():
-	"""Per-project forwards from PORT_FORWARDS_FILE (like box-mounts). One line each:
+	"""Per-project forwards from PORT_FORWARDS_FILE (like `mounts`). One line each:
 	    NAME BOX_PORT HUB_BASE_PORT      e.g. 'FRONTEND 4200 4300'
 	Returns [(name, box_port, hub_base)]. For a box in slot N, the hub publishes NAME on
 	127.0.0.1:(HUB_BASE_PORT + N). '#'/blank lines ignored; empty/missing file -> no forwards."""
@@ -361,42 +359,78 @@ def confined_src(src, root):
 	return cand
 
 
-def parse_manifest(golden):
-	"""EXTRA mounts from box-mounts, on top of the overlay checkout. Grammar per line:
-	    TREE <dst> <ro|rw>     where the overlay checkout lands (default: repo rw). `ro` mounts the
-	                           golden directly read-only instead of an overlay (no upper, no writes).
-	    <src> <dst> <ro|rw>    golden/<src> bind-mounted at HOME_IN/<dst>
-	Returns (mounts, checkout_dst, checkout_ro). '#'/blank lines ignored; a missing file means just the
-	overlay checkout at CHECKOUT_DST."""
-	mounts, checkout_dst, checkout_ro = [], CHECKOUT_DST, False
-	if not BOX_MOUNTS or not os.path.exists(BOX_MOUNTS):
-		return mounts, checkout_dst, checkout_ro
-	with open(BOX_MOUNTS) as fh:
-		for raw in fh:
+def resolve_src(src, golden):
+	"""A mounts-table source as a HOST path. Three forms, distinguished by the first character:
+	    ./x   relative to the stack dir  (the same row is a literal './x' in the hub's compose override)
+	    /x    an absolute host path outside the stack (e.g. Jenkins' maven repo)
+	    x     relative to the golden — CONFINED to it, so a typo can't reach the socket or another
+	          project. Box-side only: the hub has the real repo, not a golden."""
+	src = src.strip()
+	if src.startswith("./"):
+		if not STACK_DIR:
+			raise ValueError(f"mount source {src!r} needs STACK_DIR")
+		return os.path.normpath(os.path.join(STACK_DIR, src[2:]))
+	if src.startswith("/"):
+		return os.path.normpath(src)
+	return confined_src(src, golden)
+
+
+def overlay_key(dst):
+	"""Stable per-entry key for an overlay row, derived from its destination: '/home/dev/.gradle' ->
+	'gradle'. Names the box's upper dir (data/boxes/<box>/ovl-<key>) and its docker volume."""
+	key = dst[len(HOME_IN):].strip("/") if dst.startswith(HOME_IN) else dst.strip("/")
+	key = re.sub(r"[^a-zA-Z0-9._-]", "-", key.replace("/", "-")).lstrip(".-")
+	return key or "root"
+
+
+def parse_mounts(golden):
+	"""The `mounts` table — the ONE mount list, for the hub and for the boxes. Grammar per line:
+	    CHECKOUT <dst> <rw|ro>            the box's working copy: an overlay of the CURRENT golden at
+	                                      HOME_IN/<dst> (default 'repo rw'). `ro` binds the golden
+	                                      itself instead — no upper layer, no writes, no git bootstrap.
+	                                      Box-side by definition; the hub has the real repo.
+	    <src> <dst> <hub> <box>           one path, a mode per side:
+	                                        rw / ro   plain bind mount
+	                                        overlay   <src> as a read-only LOWER layer with a per-box
+	                                                  upper on top: shared content, private writes.
+	                                                  Box side only.
+	                                        -         not mounted on that side
+	This function reads the BOX column; gen-hub-mounts.sh renders the hub column into
+	compose.override.yml. Returns (rows, checkout_dst, checkout_ro) where each row is
+	(host_src, dst, mode). '#'/blank lines ignored; a missing file means just the overlay checkout."""
+	rows, checkout_dst, checkout_ro = [], CHECKOUT_DST, False
+	if not MOUNTS_FILE or not os.path.exists(MOUNTS_FILE):
+		return rows, checkout_dst, checkout_ro
+	with open(MOUNTS_FILE) as fh:
+		for lineno, raw in enumerate(fh, 1):
 			line = raw.strip()
 			if not line or line.startswith("#"):
 				continue
 			parts = line.split()
-			if parts[0] == "TREE":
-				checkout_dst = safe_dst(parts[1]) if len(parts) > 1 else CHECKOUT_DST
-				checkout_ro = len(parts) > 2 and parts[2] == "ro"
-			else:
-				src, dst = parts[0], (parts[1] if len(parts) > 1 else parts[0])
-				mode = parts[2] if len(parts) > 2 else "rw"
-				suffix = ":ro" if mode == "ro" else ""
-				mounts.append(f"{confined_src(src, golden)}:{safe_dst(dst)}{suffix}")
-	return mounts, checkout_dst, checkout_ro
+			try:
+				if parts[0] == "CHECKOUT":
+					checkout_dst = safe_dst(parts[1]) if len(parts) > 1 else CHECKOUT_DST
+					checkout_ro = len(parts) > 2 and parts[2] == "ro"
+					continue
+				if len(parts) < 4:
+					raise ValueError("expected '<src> <dst> <hub-mode> <box-mode>'")
+				src, dst, box_mode = parts[0], parts[1], parts[3]
+				if box_mode == "-":
+					continue
+				if box_mode not in ("rw", "ro", "overlay"):
+					raise ValueError(f"bad box mode {box_mode!r} (rw|ro|overlay|-)")
+				rows.append((resolve_src(src, golden), safe_dst(dst), box_mode))
+			except ValueError as exc:
+				raise ValueError(f"{MOUNTS_FILE}:{lineno}: {exc}") from None
+	return rows, checkout_dst, checkout_ro
 
 
-def make_overlay_volume(name, golden, fresh_upper=False):
-	"""(Re)create the box's checkout volume: golden as lowerdir, the box's own upperdir on top.
+def _overlay_volume(vol, lower, upper, work, fresh_upper=False):
+	"""(Re)create an overlay volume: `lower` read-only underneath, `upper` on top.
 
 	Docker's local driver performs the mount itself, so no capability is needed here or in the box.
 	Mount options are fixed at create time, so the volume is always recreated (removing a volume does
-	NOT touch upper/ — that's what lets a recreate keep the agent's uncommitted work)."""
-	vol = box_volume(name)
-	box_dir = os.path.join(BOXROOT, name)
-	upper, work = os.path.join(box_dir, "upper"), os.path.join(box_dir, "work")
+	NOT touch upper/ — that's what lets a recreate keep whatever the box had written)."""
 	if fresh_upper:
 		shutil.rmtree(upper, ignore_errors=True)
 		shutil.rmtree(work, ignore_errors=True)
@@ -407,12 +441,59 @@ def make_overlay_volume(name, golden, fresh_upper=False):
 	r = subprocess.run(
 		["docker", "volume", "create", "--driver", "local",
 		 "--opt", "type=overlay", "--opt", "device=overlay",
-		 "--opt", f"o=lowerdir={golden},upperdir={upper},workdir={work}", vol],
+		 "--opt", f"o=lowerdir={lower},upperdir={upper},workdir={work}", vol],
 		capture_output=True, text=True,
 	)
 	if r.returncode != 0:
-		raise RuntimeError(f"creating the overlay volume failed: {r.stderr.strip()}")
+		raise RuntimeError(f"creating the overlay volume {vol} failed: {r.stderr.strip()}")
 	return vol
+
+
+def make_overlay_volume(name, golden, fresh_upper=False):
+	"""The box's checkout volume: golden as lowerdir, the box's own upperdir on top."""
+	box_dir = os.path.join(BOXROOT, name)
+	return _overlay_volume(box_volume(name), golden,
+	                       os.path.join(box_dir, "upper"), os.path.join(box_dir, "work"), fresh_upper)
+
+
+def make_shared_overlay_volume(name, lower, dst):
+	"""An `overlay` row from the mounts table: `lower` shared read-only underneath, this box's own
+	upper layer on top — shared content, private writes.
+
+	This is how a per-toolchain cache is given to a box (`~/.gradle` is the case that forced it).
+	Gradle guards its caches with cross-process locks that are held for the WHOLE build — and
+	`bootRun` never finishes — and are only handed over when the waiting process pings the holder on
+	LOCALHOST. Between containers that ping cannot arrive, so a `~/.gradle` shared rw with the hub let
+	one long-running build block every box's gradle forever ("Owner PID: <a pid in another
+	namespace>", waiting on caches/journal-1). With the overlay the artifacts are still shared (read
+	straight out of the lower layer, never copied), while every lock file, journal entry and daemon
+	registry write is copied up into the box's own upper layer.
+
+	The upper layer SURVIVES kill/recreate (it is the box's warm cache) and dies with the box dir. The
+	lower layer is the hub's live cache, which the hub keeps writing to; overlayfs wants a stable lower
+	layer, but a cache is the one case where that is harmless — artifacts are content-addressed and
+	written by rename, and anything a box finds inconsistent it re-fetches into its own upper."""
+	box_dir = os.path.join(BOXROOT, name)
+	key = overlay_key(dst)
+	return _overlay_volume(f"{box_volume(name)}-{key}", lower,
+	                       os.path.join(box_dir, f"ovl-{key}", "upper"),
+	                       os.path.join(box_dir, f"ovl-{key}", "work"))
+
+
+def record_volumes(name, vols):
+	"""Remember which volumes were created for this box, so kill_box removes exactly those even if the
+	mounts table changed in between. Box names may contain '-', so the volume prefix is ambiguous
+	(box 'a' vs box 'a-b') — a listing filter would be wrong here, a record is not."""
+	with open(os.path.join(BOXROOT, name, "volumes"), "w") as fh:
+		fh.write("\n".join(vols) + "\n")
+
+
+def created_volumes(name):
+	path = os.path.join(BOXROOT, name, "volumes")
+	if not os.path.exists(path):
+		return [box_volume(name)]     # pre-mounts-table box: only the checkout volume existed
+	with open(path) as fh:
+		return [ln.strip() for ln in fh if ln.strip()]
 
 
 # --------------------------------------------------------------------------- boxes
@@ -515,25 +596,32 @@ def create_box(name, resume=False, fresh_upper=False):
 	forwards = parse_port_forwards()
 	slot = alloc_slot(box_dir) if forwards else None
 	svc_env = parse_service_env()
-	mounts, checkout_dst, checkout_ro = parse_manifest(golden)
+	rows, checkout_dst, checkout_ro = parse_mounts(golden)
 	claude_args = session_args(box_dir, resume)
+	mounts, vols = [], []
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
 	if checkout_ro:
-		mounts.insert(0, f"{golden}:{checkout_dst}:ro")
+		mounts.append(f"{golden}:{checkout_dst}:ro")
 	else:
-		mounts.insert(0, f"{make_overlay_volume(name, golden, fresh_upper)}:{checkout_dst}")
+		vols.append(make_overlay_volume(name, golden, fresh_upper))
+		mounts.append(f"{vols[-1]}:{checkout_dst}")
 	with open(os.path.join(box_dir, "golden"), "w") as fh:
 		fh.write(os.path.basename(golden))
-	# Shared package caches (rw) at ~/.npm and ~/.gradle — one copy across the hub + all boxes, so
-	# node/gradle don't re-download per box. The dirs are created + chowned to the box uid here.
-	for cache_host, cache_dst in ((NPM_CACHE, f"{HOME_IN}/.npm"), (GRADLE_CACHE, f"{HOME_IN}/.gradle")):
-		if cache_host:
-			os.makedirs(cache_host, exist_ok=True)
-			os.chown(cache_host, int(BOX_UID), int(BOX_GID))
-			mounts.append(f"{cache_host}:{cache_dst}")
-	# Maven repo: read-only, and NOT created/chowned — see M2_REPO above.
-	if M2_REPO:
-		mounts.append(f"{M2_REPO}:{HOME_IN}/.m2/repository:ro")
+	# Everything else the box sees, straight from the mounts table. Sources INSIDE the stack dir are
+	# created + chowned to the box uid (they are this stack's own data dirs); sources outside it are
+	# passed through untouched — this container cannot even see them, docker resolves them on the host.
+	# A wrong path outside the stack is silently bound as an EMPTY DIR (docker's behaviour), so that is
+	# the first thing to check when a box suddenly can't resolve dependencies.
+	for src, dst, mode in rows:
+		if STACK_DIR and (src == STACK_DIR or src.startswith(STACK_DIR + os.sep)):
+			os.makedirs(src, exist_ok=True)
+			os.chown(src, int(BOX_UID), int(BOX_GID))
+		if mode == "overlay":
+			vols.append(make_shared_overlay_volume(name, src, dst))
+			mounts.append(f"{vols[-1]}:{dst}")
+		else:
+			mounts.append(f"{src}:{dst}" + (":ro" if mode == "ro" else ""))
+	record_volumes(name, vols)
 	env = dict(os.environ)
 	env.update(
 		CLAUDEBOX_HEADLESS="1",
@@ -595,11 +683,13 @@ def create_box(name, resume=False, fresh_upper=False):
 
 
 def kill_box(name):
-	"""Remove the box + its forwarders + its overlay volume. upper/ is deliberately LEFT on disk: it
-	holds any work the agent had not pushed, and `cbx box <same name>` reattaches to it."""
+	"""Remove the box + its forwarders + every overlay volume it was given. The upper layers are
+	deliberately LEFT on disk: they hold any work the agent had not pushed plus its warm caches, and
+	`cbx box <same name>` reattaches to them."""
 	stop_forwarders(name)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True, check=True)
-	subprocess.run(["docker", "volume", "rm", box_volume(name)], capture_output=True, text=True)
+	for vol in created_volumes(name):
+		subprocess.run(["docker", "volume", "rm", vol], capture_output=True, text=True)
 	return {"killed": name}
 
 

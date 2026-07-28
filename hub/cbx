@@ -46,8 +46,10 @@ set -euo pipefail
 #   cbx golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
 #   cbx golden seal <id>                    # finish a staged golden you fixed up by hand
 #   cbx golden ls | reap                    # list snapshots / delete unreferenced ones
-#   cbx expose <src> [dst] [ro]             # add an EXTRA path to box-mounts (dst defaults to src)
-#   cbx hide   <src>                        # remove it
+#
+# What the hub and the boxes MOUNT is project set-up, not a runtime knob: it lives in the stack's
+# root-owned `mounts` table (one row per path, a mode for each side), edited on the host and applied
+# with `./gen-hub-mounts.sh && docker compose up -d hub && cbx recreate all`. See mounts.example.
 #
 # The repo lives at the SAME absolute path here and inside every box (/home/dev/repo), because
 # installed dependencies bake absolute paths in — npm into node_modules/.bin shebangs, gradle into
@@ -58,7 +60,6 @@ DEV="${DEV_BRANCH:-dev}"
 GOLDEN="${GOLDEN_DIR:-/work/golden}"
 STAGING="${GOLDEN_STAGING:-/work/golden-staging}"
 STATE="$REPO/.git/cbx"
-MANIFEST="${BOX_MOUNTS:-/work/box-mounts}"
 TMUX_SESSION="${TMUX_SESSION:-services}"
 BROKER_URL="${BROKER_URL:-http://box-broker:8099}"
 BROKER_TOKEN="${BROKER_TOKEN:-}"
@@ -663,7 +664,11 @@ review() {
 			echo
 			echo "-- changes since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
 			echo
-			git_ range-diff "$DEV..$prev" "$DEV..$ref"
+			# --color=always because delta does NOT understand range-diff (its inner diff is indented by
+			# four spaces and carries a second +/- column, so delta passes every line through verbatim).
+			# Without this, git sees a pipe, drops its own colouring, and the whole range-diff comes out
+			# as flat grey text. git's dual-colour range-diff survives delta untouched.
+			git_ range-diff --color=always "$DEV..$prev" "$DEV..$ref"
 		elif [ -n "$net" ]; then
 			# The branch's NET effect, as it will land: one combined diff, no per-commit split.
 			git_ log --color=always --notes=cbx "$DEV..$ref"
@@ -1009,26 +1014,6 @@ golden_snapshot() {
 	echo "cbx: done. Boxes are on $id and back on their pushed branches."
 }
 
-# ------------------------------------------------------------------ box-mounts extras
-
-expose() {
-	[ $# -ge 1 ] || die "expose needs a repo path"
-	local src="$1" dst mode
-	if [ "${2:-}" = ro ] || [ "${2:-}" = rw ]; then
-		dst="$src"; mode="$2"          # cbx expose <src> <ro|rw>
-	else
-		dst="${2:-$src}"; mode="${3:-rw}"   # cbx expose <src> [dst] [ro|rw]
-	fi
-	printf '%s %s %s\n' "$src" "$dst" "$mode" >> "$MANIFEST"
-	echo "cbx: exposed $src -> $dst ($mode). Apply with: cbx recreate <box>|all (keeps the session)."
-}
-
-hide() {
-	[ $# -ge 1 ] || die "hide needs a repo path"
-	grep -vE "^[[:space:]]*$1[[:space:]]" "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
-	echo "cbx: hid $1. Apply with: cbx recreate <box>|all (keeps the session)."
-}
-
 # ------------------------------------------------------------------ patch bridge (laptop <-> hub)
 
 # The two halves of moving a changeset between the hub and your laptop checkout as PLAIN PATCHES —
@@ -1136,7 +1121,5 @@ case "$cmd" in
 			reap)     golden_reap ;;
 			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap" ;;
 		esac ;;
-	expose) expose "$@" ;;
-	hide)   hide "$@" ;;
-	*) sed -n '4,50p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	*) sed -n '4,48p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac
