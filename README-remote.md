@@ -284,10 +284,11 @@ copying; on ssh it lands in your clipboard. Use mosh when roaming matters more t
 that an exported `CBX_TRANSPORT` in your `~/.bashrc` wins over the file default — `echo "$CBX_TRANSPORT"`
 if a transport change seems ignored.
 
-**One-shot commands** (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) always use **ssh**,
+**One-shot commands** (`cbx --help`, `cbx ls`, `cbx q --text`, `cbx review …`) always use **ssh**,
 regardless of `CBX_TRANSPORT` — their output prints to your terminal and stays in scrollback. mosh is
 an alternate-screen app: it would render the output and then wipe it on exit, and it buys nothing for
-a sub-second command. **`cbxtun` is always ssh** too — mosh can't port-forward.
+a sub-second command. The long-lived ones — `cbxhub`, `cbxbox`, `cbx logs` and the bare `cbx q`
+dashboard — honor `CBX_TRANSPORT`. **`cbxtun` is always ssh** too — mosh can't port-forward.
 
 The hub container is resolved by its compose labels at call time (so it survives compose's `-1`
 suffix and renames); the `$(…)` lookup runs on the server, and trailing args (`up backend`) are
@@ -387,7 +388,8 @@ An agent starts on `agent/<box>`, based on the hub's `dev`. When it's done it ru
 summary as a git note. Nothing else in the stack can write `dev`.
 
 ```sh
-cbx q                       # the queue: who's waiting, how far ahead, conflicts between agents
+cbx q                       # LIVE dashboard: queue + status, and a BELL when something needs you
+cbx q --text                # just the queue table, once, as plain text (pipes, scripts)
 cbx review work1            # diff vs dev — on a SECOND look, only what changed since the last one
 cbx fix    work1 -m "extract the dup mapper, add a test for the null branch"
 cbx merge  work1            # merge into dev (--squash for a single commit) + tell the box to rebase
@@ -396,12 +398,38 @@ cbx push                    # dev -> origin
 
 ```
 $ cbx q
-BOX           AHEAD LAST           STATUS      SUMMARY
-work1             4 12 minutes ago new         Invoice PDF export
-work3             2 40 minutes ago re-review   Fix flaky OrderMapperTest
-             ⚠ conflicts with work1: src/pdf/Renderer.java
+cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
+
+== branch ==
+  dev @ a1b3f0c — 0 behind, 2 ahead of origin
+== queue ==
+  BOX          STATUS     AHEAD BEHIND LAST            SUMMARY
+  work1        new            4      0 12 minutes ago  Invoice PDF export
+  work3        re-review      2      1 40 minutes ago  Fix flaky OrderMapperTest
+               ⚠ conflicts with work1: src/pdf/Renderer.java
+== boxes ==
+  work1        idle      Up 2 hours
+  work3        busy      working for 94s
+== golden ==
+  g-20260726-101500 from a1b3f0c (dev) at 2026-07-26T10:15:00+02:00
+== next ==
+  cbx review work1
+  cbx rebase work3           # 1 commit(s) behind dev
+  cbx push                # 2 commit(s) to origin
+== while you were watching ==
+  14:01:58  work1 stopped working — now idle  (cbx q / cbxbox work1)
+  14:02:06  work3 pushed again — re-review  (cbx review work3)
 ```
 
+- **`cbx q` watches and rings.** It repaints `cbx status` with the queue folded in, and writes a
+  terminal BEL when an agent **stops working** (`busy` → anything else — `waiting` means it is asking
+  *you* something) or when a **handoff lands or moves** (`refs/agents/<box>` appeared or changed =
+  a review request). The bell is a bare byte on stdout, so it rides the `docker exec -it` + `ssh -t`
+  PTY to your laptop's terminal — nothing to install, works through the alias. Everything is polled
+  from the hub's own files, so the interval is cheap; the origin fetch is throttled separately
+  (`CBX_WATCH_FETCH`, 60s). `q` or Ctrl-C quits, Enter refreshes now, `-n SECS` sets the interval
+  (`CBX_WATCH_INTERVAL`), `--no-bell` mutes it. Piped or redirected output is never watched — it
+  prints the table once, exactly like `--text`.
 - **`cbx review` is incremental.** It records what you last saw, so after a `cbx fix` round it shows
   a `git range-diff` — only the new work, correct across the amends and rebases a fix round produces.
   `--full` gives the whole branch.

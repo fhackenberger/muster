@@ -20,7 +20,10 @@ set -euo pipefail
 #   cbx forwards [box]                      # re-establish the hub-loopback socat forwards
 #
 #   cbx status                              # what can be merged / rebased / pushed, with commands
-#   cbx q                                   # the review queue: who is waiting on you
+#   cbx q  [-n SECS] [--no-bell]            # LIVE dashboard: queue + status in one repainted screen,
+#                                           #   and your terminal BELLS when an agent stops working
+#                                           #   or a new handoff lands. 'q'/Ctrl-C quits, Enter refreshes
+#   cbx q  --text                           # the queue table once, as plain text (for pipes/scripts)
 #   cbx review <box> [--full] [--net]       # per-commit patches since your last review
 #                                           #   --full = whole branch, --net = one combined diff
 #   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
@@ -399,26 +402,49 @@ status_overview() {
 	# One screen: everything that can move, and the command that moves it. Each section prints state;
 	# anything actionable is collected into the "next" list at the bottom in the order you'd do it
 	# (pull before merge before push, so agent work never lands on a stale base).
-	local behind ahead box sha st bhd list running gprov gsha todo=()
+	#
+	# `cbx q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
+	# is the origin fetch, which `--no-fetch` skips (the watch loop throttles it to $WATCH_FETCH).
+	local behind ahead box sha st bhd ahd age note conf other list running gprov gsha todo=()
 
 	echo "== branch =="
-	git_ fetch -q origin "$DEV" 2>/dev/null || echo "  (origin unreachable — counts below may be stale)"
+	if [ "${1:-}" = --no-fetch ]; then
+		:
+	else
+		git_ fetch -q origin "$DEV" 2>/dev/null || echo "  (origin unreachable — counts below may be stale)"
+	fi
 	read -r behind ahead <<< "$(divergence)"
 	printf '  %s @ %s — %s behind, %s ahead of origin\n' \
 		"$DEV" "$(git_ rev-parse --short "$DEV")" "$behind" "$ahead"
 	[ "$behind" != 0 ] && todo+=("cbx pull                # take $behind commit(s) from origin first")
 
-	echo "== agent branches =="
+	# The queue lives INSIDE the overview (rather than beside it) so one screen answers both "who is
+	# waiting on me" and "what do I do about it" — `cbx q --text` still prints the bare table.
+	echo "== queue =="
 	list="$(agent_refs)"
 	if [ -z "$list" ]; then
-		echo "  (none pushed — an agent publishes with 'handoff \"summary\"')"
+		echo "  (nothing waiting — an agent publishes with 'handoff \"summary\"')"
+	else
+		printf '  %-12s %-10s %5s %6s %-15s %s\n' BOX STATUS AHEAD BEHIND LAST SUMMARY
 	fi
 	for box in $list; do
 		sha="$(git_ rev-parse --short "refs/agents/$box")"
 		st="$(box_status "$box")"
+		ahd="$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')"
 		bhd="$(git_ rev-list --count "refs/agents/$box..$DEV" 2>/dev/null || echo '?')"
-		printf '  %-12s %-10s %s  %s commit(s) ahead, %s behind %s\n' "$box" "$st" "$sha" \
-			"$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')" "$bhd" "$DEV"
+		age="$(git_ log -1 --format=%cr "refs/agents/$box")"
+		note="$(note_of "$box")"
+		printf '  %-12s %-10s %5s %6s %-15s %s\n' "$box" "$st" "$ahd" "$bhd" "$age" "${note:-—}"
+		# Conflicts are the shared-checkout collision awareness, moved earlier: you learn that two
+		# agents touched the same lines when they push, not when you merge the second one.
+		conf="$(conflicts_between "$DEV" "refs/agents/$box")"
+		[ -n "$conf" ] && printf '  %-12s ⚠ conflicts with %s: %s\n' "" "$DEV" "$conf"
+		for other in $list; do
+			[ "$other" = "$box" ] && continue
+			[[ "$other" > "$box" ]] || continue          # report each pair once
+			conf="$(conflicts_between "refs/agents/$box" "refs/agents/$other")"
+			[ -n "$conf" ] && printf '  %-12s ⚠ conflicts with %s: %s\n' "" "$other" "$conf"
+		done
 		case "$st" in
 			new|re-review) todo+=("cbx review $box") ;;
 			rebased)       todo+=("cbx merge $box            # rebased only, nothing new to read") ;;
@@ -467,6 +493,135 @@ status_overview() {
 		[ "$ahead" != 0 ] && [ "$behind" = 0 ] && echo "  cbx push                # $ahead commit(s) to origin"
 	fi
 	return 0
+}
+
+# ------------------------------------------------------------------ live watch (`cbx q`)
+#
+# Repaints status_overview on an interval and RINGS THE TERMINAL BELL on the two things worth
+# looking up from what you were doing:
+#   * an agent stopped working (busy -> anything else — 'waiting' means it is asking YOU something)
+#   * a handoff landed or was updated: refs/agents/<box> appeared or moved = a review request
+# The bell is a bare BEL byte on stdout, so it rides the `docker exec -it` + `ssh -t` PTY straight to
+# your laptop's terminal — no notification daemon anywhere in the chain, works over the laptop alias.
+#
+# Everything here is polled, never pushed: the box activity file and the agent refs are both local
+# reads on the hub, so a short interval is cheap. The ONE network call in a frame is the origin fetch
+# in status_overview, which is throttled to $WATCH_FETCH (the rest of the frames pass --no-fetch).
+WATCH_INTERVAL="${CBX_WATCH_INTERVAL:-5}"
+WATCH_FETCH="${CBX_WATCH_FETCH:-60}"
+WATCH_EVENTS=()
+WATCH_RING=0
+
+watch_event() {
+	WATCH_EVENTS+=("$(date +%H:%M:%S)  $*")
+	# Keep the tail only: the frame has to fit on a screen, and old events are scrollback, not state.
+	[ "${#WATCH_EVENTS[@]}" -le 8 ] || WATCH_EVENTS=("${WATCH_EVENTS[@]: -8}")
+	WATCH_RING=1
+}
+
+# "<box> <state>" per running box — what status_overview reads, without the rendering.
+activity_snapshot() {
+	local resp box st age
+	resp="$(broker GET /box 2>/dev/null || true)"
+	[ -n "$resp" ] || return 0
+	for box in $(printf '%s' "$resp" | jqr '.boxes[]?.box'); do
+		read -r st age <<< "$(box_activity "$box")"
+		printf '%s %s\n' "$box" "$st"
+	done
+	return 0
+}
+
+# "<box> <sha>" per pushed agent branch. The sha (not the review status) is the trigger: it moves
+# exactly once per handoff, whereas the status also flips when YOU review, which is not news.
+ref_snapshot() {
+	local box
+	for box in $(agent_refs); do
+		printf '%s %s\n' "$box" "$(git_ rev-parse "refs/agents/$box")"
+	done
+	return 0
+}
+
+watch_queue() {
+	local interval="$WATCH_INTERVAL" bell=1 key frame fa hint now fetched=0 first=1
+	local box st prev sha
+	local -A act=() ref=() now_act=() now_ref=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-n|--interval)  shift; interval="${1:-}" ;;
+			-n*)            interval="${1#-n}" ;;
+			--interval=*)   interval="${1#*=}" ;;
+			--no-bell)      bell=0 ;;
+			*) die "q: unknown option '$1' (--text | -n SECS | --no-bell)" ;;
+		esac
+		shift
+	done
+	case "$interval" in ''|*[!0-9]*) die "q: -n wants whole seconds (e.g. cbx q -n 10)" ;; esac
+	[ "$interval" -ge 1 ] || die "q: -n must be at least 1 second"
+	# Nothing to watch when the output is a pipe or a file — repainting would just append frames
+	# forever. Options are still parsed above, so a typo is an error either way.
+	[ -t 1 ] || { queue; return 0; }
+
+	while :; do
+		now_act=(); now_ref=()
+		while read -r box st;  do [ -n "$box" ] && now_act["$box"]="$st"; done < <(activity_snapshot)
+		while read -r box sha; do [ -n "$box" ] && now_ref["$box"]="$sha"; done < <(ref_snapshot)
+
+		# The first frame establishes the baseline: without this every box you are ALREADY watching
+		# would ring on startup, which trains you to ignore the bell.
+		if [ "$first" = 0 ]; then
+			for box in "${!now_act[@]}"; do
+				st="${now_act[$box]}"; prev="${act[$box]-}"
+				if [ "$prev" = busy ] && [ "$st" != busy ]; then
+					if [ "$st" = waiting ]; then
+						watch_event "$box stopped working and is ASKING YOU something  (cbxbox $box)"
+					else
+						watch_event "$box stopped working — now $st  (cbx q / cbxbox $box)"
+					fi
+				elif [ "$prev" != waiting ] && [ -n "$prev" ] && [ "$st" = waiting ]; then
+					watch_event "$box wants your input  (cbxbox $box)"
+				fi
+			done
+			for box in "${!now_ref[@]}"; do
+				if [ -z "${ref[$box]-}" ]; then
+					watch_event "$box HANDED OFF — review request  (cbx review $box)"
+				elif [ "${ref[$box]}" != "${now_ref[$box]}" ]; then
+					watch_event "$box pushed again — re-review  (cbx review $box)"
+				fi
+			done
+		fi
+		act=(); ref=()
+		for box in "${!now_act[@]}"; do act["$box"]="${now_act[$box]}"; done
+		for box in "${!now_ref[@]}"; do ref["$box"]="${now_ref[$box]}"; done
+
+		now="$(date +%s)"
+		if [ "$((now - fetched))" -ge "$WATCH_FETCH" ]; then fetched="$now"; fa=""; else fa=--no-fetch; fi
+		# Render into a variable first, then clear + print in one go: a frame built directly onto the
+		# screen flickers for as long as the git plumbing takes, which is most of the interval.
+		frame="$(status_overview ${fa:+"$fa"} 2>&1)" || true
+
+		hint="refresh ${interval}s · Enter now · q quits"
+		[ "$bell" = 1 ] || hint="$hint · bell OFF"
+		printf '\033[H\033[2J'
+		printf 'cbx q — live  (%s)   %s\n\n' "$hint" "$(date +%H:%M:%S)"
+		printf '%s\n' "$frame"
+		if [ "${#WATCH_EVENTS[@]}" -gt 0 ]; then
+			echo "== while you were watching =="
+			printf '  %s\n' "${WATCH_EVENTS[@]}"
+		fi
+		if [ "$WATCH_RING" = 1 ] && [ "$bell" = 1 ]; then printf '\a'; fi
+		WATCH_RING=0
+		first=0
+
+		# read doubles as the sleep, so a keypress lands within milliseconds instead of at the end of
+		# the interval. Timeout returns non-zero — harmless here, `if` disarms errexit.
+		if [ -t 0 ]; then
+			if read -rsn1 -t "$interval" key; then
+				case "$key" in q|Q) echo; echo "cbx: stopped watching."; return 0 ;; esac
+			fi
+		else
+			sleep "$interval"
+		fi
+	done
 }
 
 review() {
@@ -954,7 +1109,13 @@ case "$cmd" in
 	recreate) box_recreate "$@" ;;
 	ls)       box_ls ;;
 	forwards) forwards_refresh "${1:-}" ;;
-	q|queue)  queue ;;
+	# Default is the LIVE dashboard; --text (or a non-terminal stdout, i.e. a pipe) gives the plain
+	# one-shot table, so `cbx q | grep …` and scripts behave as they always did.
+	q|queue)
+		case "${1:-}" in
+			--text|--once|-1) queue ;;
+			*) watch_queue "$@" ;;   # falls back to the one-shot table when stdout is not a terminal
+		esac ;;
 	status|st) status_overview ;;
 	review)   review "$@" ;;
 	fix)      fix "$@" ;;
@@ -977,5 +1138,5 @@ case "$cmd" in
 		esac ;;
 	expose) expose "$@" ;;
 	hide)   hide "$@" ;;
-	*) sed -n '4,47p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	*) sed -n '4,50p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac

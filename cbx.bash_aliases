@@ -10,10 +10,10 @@
 # while $CBX_SERVER / $CBX_PROJECT are substituted locally.
 #
 # Two kinds of invocation, deliberately on different transports:
-#   * one-shot commands (`cbx --help`, `cbx ls`, `cbx q`, `cbx review …`) ALWAYS use ssh, so their
+#   * one-shot commands (`cbx --help`, `cbx ls`, `cbx q --text`, `cbx review …`) ALWAYS use ssh, so their
 #     output prints to your terminal and stays in scrollback. mosh is an alternate-screen app — it
 #     would render the output and then WIPE it on exit — and it buys nothing for a sub-second command.
-#   * long-lived interactive sessions (`cbxhub`, `cbxbox`, `cbx logs`) honor CBX_TRANSPORT, default
+#   * long-lived interactive sessions (`cbxhub`, `cbxbox`, `cbx logs`, `cbx q`) honor CBX_TRANSPORT, default
 #     ssh. Set CBX_TRANSPORT=mosh — per call (`CBX_TRANSPORT=mosh cbxhub`) or globally — for roaming
 #     (survives laptop sleep, Wi-Fi→LTE, IP changes, no frozen sessions). Trade-off: mosh can't carry
 #     the clipboard (OSC 52), so terminal copy from claude only reaches your laptop clipboard on ssh.
@@ -82,12 +82,18 @@ _cbx_hub() {
 
 # run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1 / cbx --help
 # %q re-quotes each arg so it survives the server-side shell re-parse (e.g. cbx fix work1 -m "a b c").
-# `cbx logs` attaches a live tmux window (interactive) → routed through the mosh-able transport; every
-# other subcommand is one-shot text output → ssh, so it prints and stays on your terminal.
+# `cbx logs` attaches a live tmux window and bare `cbx q` is the live dashboard — both are long-lived
+# and interactive → routed through the mosh-able transport; every other subcommand is one-shot text
+# output → ssh, so it prints and stays on your terminal. `cbx q --text` is one-shot, so it stays on
+# ssh with the rest. Either transport carries the dashboard's bell (it's a plain BEL byte).
 cbx() {
-	local args=''
+	local args='' live=''
 	[ "$#" -gt 0 ] && printf -v args ' %q' "$@"
-	if [ "${1:-}" = logs ]; then
+	case "${1:-}" in
+		logs) live=1 ;;
+		q|queue) case "${2:-}" in --text|--once|-1) ;; *) live=1 ;; esac ;;
+	esac
+	if [ -n "$live" ]; then
 		_cbx_session "$(_cbx_hub) cbx$args"
 	else
 		_cbx_ssh "$(_cbx_hub) cbx$args"
