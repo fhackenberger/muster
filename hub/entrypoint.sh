@@ -125,8 +125,12 @@ if [ -n "${BROKER_URL:-}" ]; then
 	) &
 fi
 
-echo "hub: ready. Services are on-demand:" >&2
-echo "  cbx up backend | frontend | pinchtab      (cbx down <svc> to stop)" >&2
+# Start any service whose manifest sets autostart=true (best-effort — a service that fails to launch
+# must never wedge the hub's boot). Everything else stays on-demand via `cbx up`.
+cbx autostart || true
+
+echo "hub: ready. Services are declared in hub-services/ (cbx svcs), started on-demand:" >&2
+echo "  cbx up <service> | cbx down <service> | cbx svcs   (autostart=true starts one at boot)" >&2
 echo "  cbx box [name] | cbx ls | cbx kill <name> (agent boxes, via the broker)" >&2
 echo "  cbx q | cbx review <box> | cbx merge <box>  (the review queue)" >&2
 echo "  docker exec -it \$HOSTNAME tmux attach     (to watch services / open a shell)" >&2

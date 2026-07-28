@@ -1,0 +1,7 @@
+# Service manifest — `cbx up frontend`. See backend for the full field reference.
+description=Angular dev server (ng serve) with live reload
+# frontend-dev-restart.sh writes generated files into the repo, so guard the golden snapshot too.
+writes_repo=true
+# The script backgrounds ng serve and returns; the `tail -f` keeps the tmux window live so `cbx logs
+# frontend` streams the dev log. Relative path resolves against the repo (the window's cwd).
+command=./infostarsFrontend/scripts/frontend-dev-restart.sh && tail -f /tmp/infostarsFrontend-dev.log

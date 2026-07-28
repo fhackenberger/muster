@@ -72,6 +72,7 @@ cp path/to/infostars/docker-claude/.env.example      .env
 cp path/to/infostars/docker-claude/box-mounts.example box-mounts
 cp path/to/infostars/docker-claude/service-env       service-env   # REQUIRED: compose env_file
 cp path/to/infostars/docker-claude/port-forwards.example port-forwards
+cp -r path/to/infostars/docker-claude/hub-services.example hub-services  # dev-service manifests
 mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
 chown -R 1000:1000 data                                 # boxes + hub run as uid 1000
 $EDITOR .env            # set PROJECT_NAME, STACK_DIR=$(pwd), REPO_URL, tokens, API keys
@@ -197,7 +198,7 @@ changed" comes from doing one and not the other:
 | `hub/cbx`, `hub/entrypoint.sh`, `hub/git-ssh`, `hub/Dockerfile.base` | Jenkins build | `claude-box-hub-base` → `claude-box-hub` |
 | `Dockerfile`, `common-setup.sh`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
 | `box-broker/broker.py`, **`claude-box.sh`** | Jenkins build | `claude-box-broker` |
-| `compose.yml`, `.env`, `service-env`, `box-mounts`, `port-forwards`, `git-identity/*` | file sync (Ansible / rsync) | — |
+| `compose.yml`, `.env`, `service-env`, `box-mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
 
 Two traps in that table. **`claude-box.sh` is `COPY`d into the *broker* image**, not the box image —
 a change there needs a broker rebuild. And **each add-on image must be rebuilt after its base**
@@ -298,7 +299,8 @@ appended to the remote `cbx` automatically. See the file's comments for the per-
 Start dev services on demand and manage boxes — all via the `cbx` alias:
 
 ```sh
-cbx up backend        # start dev services on demand
+cbx svcs              # list the dev services declared in hub-services/ + their state
+cbx up backend        # start one (any service that has a hub-services/<name> manifest)
 cbx up frontend
 cbx up pinchtab
 cbx logs backend      # attach that service's tmux window to watch logs (Ctrl-b d to detach)
@@ -306,9 +308,48 @@ cbx box work1         # spawn an agent box (mounts per box-mounts)
 cbx ls                # services + boxes
 ```
 
+### Dev-service manifests (`hub-services/`)
+
+Which services the hub can run is **not baked into the image** — each is one file in the stack's
+`hub-services/` directory (bind-mounted read-only into the hub), so adding, editing, or removing a
+service is a file sync, never an image rebuild. The **filename is the service name**: `hub-services/backend`
+defines `cbx up backend`. `cbx svcs` lists them with their running state and flags.
+
+A manifest is `key=value`, one per line (`#` and blanks ignored):
+
+```sh
+# hub-services/backend
+description=Spring backend (bootRun) + aspectj javaagent
+writes_repo=true          # cbx golden snapshot refuses to run while this is up
+autostart=false           # true → started at hub boot (cbx autostart, from the entrypoint)
+command=gradle -x test build && gradle :app:bootRun -PbootRunExtraJvmArgs="-javaagent:$(find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ... | sort -V | tail -1)"
+```
+
+| Field | Meaning |
+|---|---|
+| `command` | **Required.** The shell cbx runs, via `bash -lc` in a tmux window with cwd = the repo. Everything after the first `=` is **verbatim** — quotes, `&&`, and `$(…)` all reach the launch shell. |
+| `workdir` | Optional cwd override (`$VAR` expands). Default is the repo root. |
+| `writes_repo` | Optional. `true` → the service writes into the checkout, so `cbx golden snapshot` refuses while it's up (a mid-run snapshot would be torn). This replaced the old hard-coded backend/frontend guard. |
+| `autostart` | Optional. `true` → started automatically when the hub boots. |
+| `description` | Optional. Shown by `cbx svcs`. |
+
+Two things make this work where the old `*_CMD` env vars did:
+
+- **Substitutions resolve at launch, inside the container.** cbx never parses `command`; it hands it to
+  `bash -lc` when you run `cbx up`. So the backend's `-javaagent:$(find … | sort -V | tail -1)` finds the
+  aspectjweaver jar *after* the `&&`-chained `build` has pulled it into the cache — a path nobody knows at
+  config time — and picks the highest version across the gradle and Jenkins (`~/.m2`) caches.
+- **`$VAR` is safe here.** Unlike `service-env` (which compose interpolates against the *host* environment
+  as root), a manifest is read only by cbx, so `$REPO`, `$HOME`, and `$(…)` mean what you'd expect. Service
+  *settings* (ports, DB, keys) still belong in `service-env` — those are shared with the agent boxes; the
+  command that starts a service is the hub's alone.
+
+On the acoveo host these are Ansible-managed: edit `templates/docker-compose/claude-box/hub-services/<name>`
+(add the file to the loop in `tasks/containers-claude-box.yml`), not the copy on the server.
+
 ### Viewing service logs
 
-Each service (`backend` / `frontend` / `pinchtab`) runs in its own hub tmux window. `cbx logs`
+Each service (one per `hub-services/` manifest) runs in its own hub tmux window. `cbx logs`
 **attaches** that window — it's a live, streaming view, not a one-shot dump:
 
 ```sh
@@ -542,15 +583,16 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
   Format is compose's (`KEY=VALUE`, `#` comments, literal values, no `${}` expansion). It is
   **required** — compose refuses to start the hub if the file is missing. Apply with
   `docker compose up -d hub` and `cbx recreate <box>`.
-- **Service commands** (`BACKEND_CMD`/`FRONTEND_CMD`/`PINCHTAB_CMD`) are overridden in
-  **`service-env`**, not `.env` — `.env` only feeds compose interpolation and never reaches the hub
-  container, so an override there is silently ignored. Each runs through `bash -lc` in a tmux window
-  with the cwd set to the repo, so values may use relative paths **and shell substitutions evaluated
-  at launch inside the container** — that is how the backend command can pass
-  `-javaagent:$(find … aspectjweaver-*.jar …)` for a jar whose path only exists after the build
-  (note it uses two `gradle` calls so the substitution runs *after* the dependency is resolved).
-  Each service runs in its own hub tmux window that stays alive after the process exits, so
-  `cbx logs <svc>` can always attach to read the output.
+- **Service commands** are declared as **manifests in `hub-services/`** (one file per service, filename
+  = service name), not as `*_CMD` env vars — see *Dev-service manifests* above. Each `command` runs
+  through `bash -lc` in a tmux window with the cwd set to the repo, so values may use relative paths
+  **and shell substitutions evaluated at launch inside the container** — that is how the backend command
+  passes `-javaagent:$(find … aspectjweaver-*.jar …)` for a jar whose path only exists after the build
+  (it uses two `gradle` calls so the substitution runs *after* the dependency is resolved). Because a
+  manifest is read only by cbx, `$VAR`/`$REPO` are safe in it (unlike `service-env`). Each service runs
+  in its own hub tmux window that stays alive after the process exits, so `cbx logs <svc>` can always
+  attach to read the output; `writes_repo=true` guards `cbx golden snapshot`, and `autostart=true`
+  brings a service up at hub boot.
 - **Images** are built by the `Jenkinsfile` (box / hub / box-broker); the stack reuses them by
   default and only builds locally when `COMPOSE_PULL_POLICY=build`. Flip `PUSH_TO_REGISTRY` in the
   Jenkins job to also publish them for pulling on another host.

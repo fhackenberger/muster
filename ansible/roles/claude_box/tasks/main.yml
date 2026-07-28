@@ -89,6 +89,32 @@
       backup: no
     tags: [containers-claude-box-files]
 
+  # Dev-service manifests (one file per service) that the hub's `cbx up/svcs/autostart` reads —
+  # compose bind-mounts hub-services/ read-only. owner 1000 because the hub runs as uid 1000 and must
+  # read them. Not secret (no vault vars); still a directory of its own so adding/removing a service
+  # is just a file drop, no image rebuild. To add one, add a file here and to the loop below.
+  - name: Ensure claude-box hub-services directory exists (dev-service manifests)
+    file:
+      path: /virtual_machines/claude-box-docker/hub-services/
+      state: directory
+      owner: 1000
+      group: root
+      mode: "u=rwx,g=rx,o="
+    tags: [containers-claude-box-files]
+  - name: Claude box hub-service manifests (backend/frontend/pinchtab)
+    template:
+      src: "templates/docker-compose/claude-box/hub-services/{{ item }}"
+      dest: "/virtual_machines/claude-box-docker/hub-services/{{ item }}"
+      owner: 1000
+      group: root
+      mode: "u=rw,g=r,o="
+      backup: no
+    loop:
+      - backend
+      - frontend
+      - pinchtab
+    tags: [containers-claude-box-files]
+
   # pinchtab server config for the hub (mounted at ~/.pinchtab). Holds the vault
   # token; bound to 0.0.0.0:9867 so the agent boxes reach it by name (hub:9867).
   - name: Template pinchtab config.json to the remote

@@ -130,6 +130,9 @@ services:
       BROKER_URL: http://box-broker:8099
       BROKER_TOKEN: ${BROKER_TOKEN}
       BOX_MOUNTS: /work/box-mounts
+      # Dev-service manifests (one file per service) that `cbx up/svcs/autostart` read — bind-mounted
+      # read-only from the stack's ./hub-services below. Changing a service is a file sync, not a rebuild.
+      HUB_SERVICES_DIR: /work/hub-services
       GIT_CONFIG_GLOBAL: /home/dev/.gitidentity/gitconfig
     # Everything PROJECT-specific (backend/frontend wiring, API keys) lives in `service-env` instead
     # of here, because the box-broker hands the very same file to every agent box. That is what makes
@@ -148,6 +151,9 @@ services:
       # Per-box state (which golden, session id, upper layer) — readable for `cbx q`/diagnostics only.
       - ./data/boxes:/work/boxes:ro
       - ./box-mounts:/work/box-mounts
+      # Dev-service manifests (backend/frontend/pinchtab/…), read-only. Copy hub-services.example ->
+      # hub-services once (Ansible templates it on the acoveo host). An empty/absent dir = no services.
+      - ./hub-services:/work/hub-services:ro
       - ./data/claude:/home/dev/.claude
       - ./data/pinchtab:/home/dev/.pinchtab
       - ./git-identity:/home/dev/.gitidentity

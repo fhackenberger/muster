@@ -2,19 +2,21 @@
 set -euo pipefail
 
 # cbx — hub-side control CLI. Three jobs:
-#   * start/stop the on-demand dev services in the hub's tmux (backend / frontend / pinchtab)
+#   * start/stop the on-demand dev services in the hub's tmux (declared in hub-services/, e.g. backend)
 #   * spawn/kill/list agent boxes via the box-broker (the hub itself never touches the docker socket)
 #   * THE REVIEW QUEUE: each agent works on its own branch (agent/<box>) in an overlay of a shared
 #     prepared "golden" checkout and pushes to refs/agents/<box> here; you review and merge into dev.
 #
 # Usage:
-#   cbx up   backend|frontend|pinchtab      # start a service in its tmux window
-#   cbx down backend|frontend|pinchtab      # stop it
-#   cbx logs backend|frontend|pinchtab|gitd # attach that service window (Ctrl-b d to detach)
+#   cbx svcs                                # list dev services (declared in hub-services/) + state
+#   cbx up   <service>                      # start a service in its tmux window
+#   cbx down <service>                      # stop it
+#   cbx logs <service>|gitd                 # attach that service window (Ctrl-b d to detach)
+#   cbx autostart                           # start every service whose manifest sets autostart=true
 #   cbx box  [name]                         # spawn an agent box (own branch, overlay checkout)
 #   cbx kill <name>                         # remove an agent box (its upper layer is kept)
 #   cbx recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
-#   cbx ls                                  # list services (tmux) + boxes (broker)
+#   cbx ls                                  # list services + boxes (broker)
 #   cbx forwards [box]                      # re-establish the hub-loopback socat forwards
 #
 #   cbx status                              # what can be merged / rebased / pushed, with commands
@@ -63,15 +65,13 @@ BROKER_TOKEN="${BROKER_TOKEN:-}"
 # and whatever it installs is captured at the path it will actually be used from.
 GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}"
 
-# Service commands. Override them in SERVICE-ENV, not in .env: .env only feeds compose interpolation
-# and never reaches this container, so an override there is silently ignored. Each runs through
-# `bash -lc` in a tmux window with the cwd set to $REPO, so a value may use relative paths and shell
-# substitutions — those are evaluated at launch, INSIDE the container, which is how a project can
-# point at e.g. a jar whose path only exists after the build. Wrapped so the tmux window survives the
-# process exiting, and so backgrounding dev scripts still leave a live window to read logs from.
-BACKEND_CMD="${BACKEND_CMD:-gradle --project-dir '$REPO/infostars/' -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default'}"
-FRONTEND_CMD="${FRONTEND_CMD:-'$REPO/infostarsFrontend/scripts/frontend-dev-restart.sh' && tail -f /tmp/infostarsFrontend-dev.log}"
-PINCHTAB_CMD="${PINCHTAB_CMD:-pinchtab server}"
+# Dev services are declared as MANIFESTS — one file per service in this directory (bind-mounted from
+# the stack's hub-services/, so a service can be added or edited by a file sync, no image rebuild).
+# See svc_load() for the format. Nothing here parses the command: it is handed VERBATIM to `bash -lc`
+# in a tmux window at `cbx up` time, INSIDE the container, so relative paths resolve against the repo
+# and shell substitutions ($(…), $VAR) are evaluated then — which is how the backend's aspectj
+# `-javaagent:$(find …)` gets a path nobody knows until after the build.
+HUB_SERVICES_DIR="${HUB_SERVICES_DIR:-/work/hub-services}"
 
 die() { echo "cbx: $*" >&2; exit 1; }
 git_() { git -C "$REPO" "$@"; }
@@ -122,21 +122,68 @@ review_pager() {
 }
 
 # ------------------------------------------------------------------ services
+#
+# A service is one manifest file in $HUB_SERVICES_DIR; the FILENAME is the service name. Fields are
+# `key=value`, one per line, '#' comments and blanks ignored:
+#   command      (required) the shell run in a tmux window via `bash -lc`. Everything after the first
+#                '=' is taken VERBATIM — quotes, &&, and $(…) all survive to the launch shell, so the
+#                dynamic aspectj path keeps working. Unlike service-env, $VAR is SAFE here (this file
+#                is read only by cbx; compose/the broker never interpolate it).
+#   workdir      (optional) cwd for the command; default is the repo ($REPO). $VAR is expanded.
+#   writes_repo  (optional) true = the service writes into the repo, so `cbx golden snapshot` refuses
+#                to run while it is up (a torn snapshot otherwise). Was the hard-coded backend/frontend.
+#   autostart    (optional) true = started automatically at hub boot (`cbx autostart`, from entrypoint).
+#   description  (optional) shown by `cbx svcs`.
 
-svc_cmd() {
-	case "$1" in
-		backend)  printf '%s' "$BACKEND_CMD" ;;
-		frontend) printf '%s' "$FRONTEND_CMD" ;;
-		pinchtab) printf '%s' "$PINCHTAB_CMD" ;;
-		*) die "unknown service '$1' (backend|frontend|pinchtab)" ;;
-	esac
+# Parse one manifest into SVC_* globals. Returns 1 (no such manifest) / 2 (no command) / 0 (ok).
+svc_load() {
+	local name="$1" file line key val
+	file="$HUB_SERVICES_DIR/$name"
+	SVC_COMMAND=""; SVC_WORKDIR=""; SVC_WRITES_REPO=""; SVC_AUTOSTART=""; SVC_DESCRIPTION=""
+	[ -f "$file" ] || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in ''|'#'*) continue ;; esac
+		key="${line%%=*}"
+		[ "$key" != "$line" ] || continue          # no '=' on the line — not a field
+		val="${line#*=}"
+		key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"   # trim the KEY only
+		case "$key" in
+			command)     SVC_COMMAND="$val" ;;
+			workdir)     SVC_WORKDIR="$val" ;;
+			writes_repo) SVC_WRITES_REPO="$val" ;;
+			autostart)   SVC_AUTOSTART="$val" ;;
+			description) SVC_DESCRIPTION="$val" ;;
+		esac
+	done < "$file"
+	[ -n "$SVC_COMMAND" ] || return 2
+	return 0
 }
 
+# true/1/yes/on -> success; anything else (incl. empty) -> failure.
+svc_truthy() { case "$1" in 1|true|yes|on|TRUE|Yes|On) return 0 ;; *) return 1 ;; esac; }
+
+# Every manifest name in the dir, sorted. Dotfiles/editor turds are skipped by the glob.
+svc_names() {
+	local f
+	[ -d "$HUB_SERVICES_DIR" ] || return 0
+	for f in "$HUB_SERVICES_DIR"/*; do
+		[ -f "$f" ] || continue
+		printf '%s\n' "${f##*/}"
+	done
+	return 0
+}
+
+svc_running() { tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$1"; }
+
 svc_up() {
-	local svc="$1" cmd; cmd="$(svc_cmd "$svc")"
-	if tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$svc"; then
+	local svc="$1" cmd
+	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc ('cbx svcs' lists them)"
+	if svc_running "$svc"; then
 		echo "cbx: $svc already running (cbx logs $svc to view)"; return 0
 	fi
+	cmd="$SVC_COMMAND"
+	# workdir overrides the window's default cwd; unquoted so $REPO/$VAR expand in the launch shell.
+	[ -n "$SVC_WORKDIR" ] && cmd="cd $SVC_WORKDIR && $cmd"
 	# keep the window alive after the command exits so failures stay readable
 	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$REPO" \
 		"bash -lc $(printf '%q' "$cmd; echo; echo '[cbx] $svc exited — press enter to close'; read _")"
@@ -151,6 +198,35 @@ svc_down() {
 
 svc_logs() {
 	exec tmux attach -t "${TMUX_SESSION}" \; select-window -t "${TMUX_SESSION}:$1"
+}
+
+# List every defined service with its running state, flags and description.
+svc_list() {
+	local svc any=0 flags
+	echo "== services (from $HUB_SERVICES_DIR) =="
+	for svc in $(svc_names); do
+		svc_load "$svc" || { printf '  %-12s %-5s (no command — bad manifest)\n' "$svc" "----"; any=1; continue; }
+		any=1
+		flags=""
+		svc_truthy "$SVC_AUTOSTART"   && flags="${flags}autostart "
+		svc_truthy "$SVC_WRITES_REPO" && flags="${flags}writes-repo "
+		printf '  %-12s %-5s %s%s\n' "$svc" "$(svc_running "$svc" && echo up || echo down)" \
+			"${flags:+[$flags] }" "${SVC_DESCRIPTION:-}"
+	done
+	[ "$any" = 1 ] || echo "  (none — drop a manifest in $HUB_SERVICES_DIR; see hub-services.example)"
+}
+
+# Start every service whose manifest sets autostart=true. Called from the hub entrypoint at boot.
+svc_autostart() {
+	local svc n=0
+	for svc in $(svc_names); do
+		svc_load "$svc" || continue
+		svc_truthy "$SVC_AUTOSTART" || continue
+		echo "cbx: autostart $svc" >&2
+		svc_up "$svc" || echo "cbx: autostart of $svc failed (continuing)" >&2
+		n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] || echo "cbx: no services marked autostart in $HUB_SERVICES_DIR" >&2
 }
 
 # ------------------------------------------------------------------ broker
@@ -207,8 +283,7 @@ forwards_refresh() {
 }
 
 box_ls() {
-	echo "== services (tmux) =="
-	tmux list-windows -t "$TMUX_SESSION" -F '  #W' 2>/dev/null || echo "  (none)"
+	svc_list
 	echo "== boxes (broker) =="
 	local resp box st age
 	if resp="$(broker GET "/box" 2>/dev/null)"; then
@@ -715,9 +790,12 @@ golden_snapshot() {
 	[ "${1:-}" = --prep ] && prep=1
 
 	# A build running in the hub's tmux writes into $REPO while we copy it — the snapshot would be a
-	# torn mixture of before and after. Cheap to avoid, miserable to debug.
-	for svc in backend frontend; do
-		if tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$svc"; then
+	# torn mixture of before and after. Cheap to avoid, miserable to debug. Any service whose manifest
+	# sets writes_repo=true counts (this replaced the hard-coded backend/frontend list).
+	for svc in $(svc_names); do
+		svc_load "$svc" || continue
+		svc_truthy "$SVC_WRITES_REPO" || continue
+		if svc_running "$svc"; then
 			die "'$svc' is running and writing into $REPO — 'cbx down $svc' first, then snapshot"
 		fi
 	done
@@ -866,9 +944,11 @@ import_patch() {
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
-	up)     [ $# -ge 1 ] || die "up needs a service"; svc_up "$1" ;;
-	down)   [ $# -ge 1 ] || die "down needs a service"; svc_down "$1" ;;
-	logs)   [ $# -ge 1 ] || die "logs needs a service"; svc_logs "$1" ;;
+	up)     [ $# -ge 1 ] || die "up needs a service (cbx svcs to list)"; svc_up "$1" ;;
+	down)   [ $# -ge 1 ] || die "down needs a service (cbx svcs to list)"; svc_down "$1" ;;
+	logs)   [ $# -ge 1 ] || die "logs needs a service (cbx svcs to list)"; svc_logs "$1" ;;
+	svcs|services) svc_list ;;
+	autostart)     svc_autostart ;;
 	box)      box_new "$@" ;;
 	kill)     box_kill "$@" ;;
 	recreate) box_recreate "$@" ;;
@@ -897,5 +977,5 @@ case "$cmd" in
 		esac ;;
 	expose) expose "$@" ;;
 	hide)   hide "$@" ;;
-	*) sed -n '4,44p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	*) sed -n '4,47p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac

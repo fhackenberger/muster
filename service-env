@@ -40,25 +40,14 @@ FRONTEND_DEV_BACKEND_PATH=/infostarsWeb/app
 # NEVER use $VAR or ${VAR} in this file. Compose INTERPOLATES them when it loads env_file — against
 # the HOST's environment, as root — so "$HOME" reaches the hub as /root, while the broker reads this
 # file raw and a box gets the literal text. Same file, two different values, and the hub's is wrong.
-# $(command substitution) is NOT interpolated and survives to both, which is why the lookups below
-# use $( ) with absolute paths. (Verified with `docker compose config`.)
-# ---- service commands (what `cbx up backend|frontend|pinchtab` runs) ----
-# These OVERRIDE the defaults baked into hub/cbx. They must live here, not in .env: .env only feeds
-# compose interpolation and is never passed into the hub container, so an override there is ignored.
+# (Command substitution $(…) is not interpolated, but service COMMANDS no longer live here — see next.)
 #
-# cbx runs each through `bash -lc` in a tmux window, with the cwd set to the repo — so a value may
-# use relative paths AND shell substitutions, and the substitutions are evaluated AT LAUNCH, inside
-# the container. That is how the aspectj agent below gets a path nobody knows at config time.
-#
-# Note the TWO gradle invocations. Bash expands each command of an `&&` list immediately before
-# running it, so the $(find …) runs only after `build` has resolved the dependency. Folding it into
-# one `gradle build :…:bootRun` call would expand the path before the jar exists on a cold cache.
-# Both caches are searched (absolute paths, no $HOME): gradle resolves into ~/.gradle/caches,
-# while ~/.m2/repository is
-# Jenkins' read-only cache — the jar may be in either, so take the highest version found.
-#BACKEND_CMD=gradle --project-dir infostars/ -x test -x buildFrontend build && { find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | grep -q . || { echo 'cbx: aspectjweaver jar not found under /home/dev/.gradle/caches or /home/dev/.m2/repository — did the build resolve it?' >&2; exit 1; }; } && gradle --project-dir infostars/ -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default' -PbootRunExtraJvmArgs="-javaagent:$(find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | sort -V | tail -1)"
-#FRONTEND_CMD=./infostarsFrontend/scripts/frontend-dev-restart.sh && tail -f /tmp/infostarsFrontend-dev.log
-#PINCHTAB_CMD=pinchtab server
+# ---- service commands moved to hub-services/ ----
+# What `cbx up <service>` runs is now a MANIFEST per service in the stack's hub-services/ directory
+# (bind-mounted into the hub), NOT a *_CMD variable here. Manifests are read only by cbx, so a command
+# may freely use $REPO / $VAR / $(…) — evaluated at LAUNCH, inside the container — which is where the
+# backend's aspectj `-javaagent:$(find …)` path now lives. This file keeps only the SETTINGS a service
+# reads (ports, DB, keys); those are shared with the agent boxes by the broker, which commands are not.
 
 # ---- backend wiring (config.properties keys; env overrides the baked-in defaults) ----
 DB_INFOSTARS_PSQL_URL=jdbc:postgresql://db:5432/infotrack_dev

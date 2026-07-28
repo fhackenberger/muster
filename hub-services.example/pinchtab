@@ -1,0 +1,6 @@
+# Service manifest — `cbx up pinchtab`. See backend for the full field reference.
+description=pinchtab server (headless Chrome bridge)
+# No writes_repo: pinchtab does not touch the checkout, so it never blocks a golden snapshot.
+# To have it come up with the hub, uncomment:
+#autostart=true
+command=pinchtab server
