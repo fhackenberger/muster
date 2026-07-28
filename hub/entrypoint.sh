@@ -112,6 +112,19 @@ tmux new-window -t "$TMUX_SESSION" -n gitd -c "$GIT_BASE_PATH" \
 		--base-path='$GIT_BASE_PATH' --listen=0.0.0.0 --port=${GIT_DAEMON_PORT} '$CHECKOUT'; \
 	 echo; echo '[cbx] git daemon exited — press enter to close'; read _"
 
+# The boxes' port-forwards are socat containers running in THIS container's network namespace, so
+# they died when this container was replaced. Ask the broker to re-establish them — in the background
+# and best-effort, so a slow or absent broker can never delay or fail the hub's boot.
+if [ -n "${BROKER_URL:-}" ]; then
+	(
+		for _ in 1 2 3 4 5; do
+			sleep 2
+			curl -fsS -m 5 -X POST -H "X-Broker-Token: ${BROKER_TOKEN:-}" "${BROKER_URL}/forwards" \
+				>/dev/null 2>&1 && { echo "hub: port-forwards re-established" >&2; break; }
+		done
+	) &
+fi
+
 echo "hub: ready. Services are on-demand:" >&2
 echo "  cbx up backend | frontend | pinchtab      (cbx down <svc> to stop)" >&2
 echo "  cbx box [name] | cbx ls | cbx kill <name> (agent boxes, via the broker)" >&2

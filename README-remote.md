@@ -256,11 +256,18 @@ That gives you:
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
 - **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql infotrack_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
-- **`cbxfe <box>`** — project shorthand: open **one agent's** frontend at `http://localhost:4211`,
-  with that box's own backend tunnelled on the port its JS actually asks for. Two forwards, because
-  `FRONTEND_DEV_BACKEND_URL` is resolved by your browser, not by the box.
+- **`cbxfe <box>` / `cbxfe <box> --own`** — project shorthand: open **one agent's** frontend at
+  `http://localhost:4211`, with the **hub's** backend tunnelled alongside it (the default setup).
+  `--own` tunnels that box's own backend instead, for an agent that switched
+  `FRONTEND_DEV_BACKEND_URL` to `$FRONTEND_DEV_BACKEND_URL_OWN`. Two forwards either way, because
+  that URL is resolved by your browser, not by the box.
 - **`cbxsync [--rebase]`** — take new origin commits onto the dev branch (`cbx pull`) and then tell
   every agent to rebase onto them (`cbx rebase all`). Skips the notify if the pull hit conflicts.
+- **`cbxexport <box>`** — pull an agent's work down as **one squashed commit** on your current branch
+  (`cbx export` → local `git am`). `cbxexport <box> --show` prints the raw patch instead of applying it.
+- **`cbximport <box> [base]`** — the reverse: **replace** an agent's branch with *your* net change and
+  tell the box to just note it, not act (`git format-patch` → `cbx import`). See *Editing an agent's
+  work by hand* below.
 
 **Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
 **ssh**. Set **`CBX_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
@@ -371,6 +378,48 @@ work3             2 40 minutes ago re-review   Fix flaky OrderMapperTest
 Inside a box the agent has three commands: `mydiff` (exactly what it will hand over, its branch
 only), `handoff "summary"`, and ordinary git. It has no credentials for the real origin and the
 hub's `update` hook rejects any push outside `refs/agents/*`.
+
+### Editing an agent's work by hand
+
+`cbx fix` sends the box *back to work*. Sometimes you'd rather take the wheel — pull the change onto
+your laptop, fix it in your own editor, and either keep it there or push your version back as the
+authoritative one. Two commands move a changeset over a **plain pipe** (patches, not git transport, so
+neither side has to share the other's exact base sha):
+
+```sh
+# 1. bring an agent's work down as ONE squashed commit on a review branch
+git switch -c review/work1 dev     # a branch OFF dev, not dev itself
+cbxexport work1                    # its whole branch, squashed, applied here via `git am`
+#    …edit, test, commit as much as you like…
+
+# 2a. keep it local and land it the normal way (merge/push from your laptop), OR
+# 2b. push YOUR version back as the agent's branch and tell the box to stand down:
+cbximport work1                    # net change of HEAD vs your `dev`, squashed, replaces refs/agents/work1
+cbx merge work1                    # …then land it on the hub's dev as usual (it's pre-marked reviewed)
+```
+
+- **`cbxexport <box>`** runs `cbx export` on the hub: it assembles the agent's whole branch
+  (`dev..refs/agents/<box>`) into a single throwaway commit — carrying the handoff summary as its
+  message — and streams it as an mbox. Your side pipes that straight into `git am`, so it lands as one
+  commit on whatever branch you're on. Nothing on the hub is touched; re-running it is harmless. Use
+  `--show` to eyeball the patch (or redirect it) instead of applying.
+- **`cbximport <box> [base]`** is the mirror. It collapses everything on your `HEAD` since `base`
+  (default your local **`dev`** branch) into one patch — *the end state*, so it doesn't matter how many
+  commits you made or that you built on top of the agent's export — and pipes it to `cbx import`. The
+  hub applies it in a throwaway worktree, **repoints `refs/agents/<box>` at your commit**, records it as
+  already-reviewed (so `cbx status` offers `cbx merge` straight away), and messages the box:
+
+  > I replaced the changes on your branch with my own commit. `git fetch hub && git reset --hard
+  > hub-agents/<box>`. This is FYI only — just **note** that your earlier edits were superseded; do
+  > **not** re-apply them or act on this.
+
+  Run `cbximport` from **inside your local checkout, on the branch that holds your final version**.
+  Because `base` defaults to `dev`, review on a branch *off* `dev` (as above) — if you `git am` the
+  export straight onto `dev` itself, `dev..HEAD` is empty and there's nothing to send. Pass an explicit
+  base (`cbximport work1 origin/dev`) when your change sits on top of something else.
+
+Both use `docker exec -i` over ssh with **no PTY** — a pseudo-terminal would translate newlines and
+corrupt the patch bytes — which is why they're separate aliases and not the PTY-based `cbx` wrapper.
 
 ## Goldens: the shared prepared checkout
 

@@ -15,6 +15,7 @@ set -euo pipefail
 #   cbx kill <name>                         # remove an agent box (its upper layer is kept)
 #   cbx recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
 #   cbx ls                                  # list services (tmux) + boxes (broker)
+#   cbx forwards [box]                      # re-establish the hub-loopback socat forwards
 #
 #   cbx status                              # what can be merged / rebased / pushed, with commands
 #   cbx q                                   # the review queue: who is waiting on you
@@ -22,9 +23,15 @@ set -euo pipefail
 #                                           #   --full = whole branch, --net = one combined diff
 #   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
 #   cbx prereview <box>                     # ask the agent to self-review its diff before you look
-#   cbx merge  <box> [--squash]             # merge the agent branch into dev
+#   cbx merge  <box> [--squash] [--edit]    # merge the agent branch into dev
+#                                           #   --squash = one commit, --edit = reword it yourself
 #   cbx drop   <box>                        # discard an agent branch (tells the box)
 #   cbx rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
+#
+#   cbx export <box>                        # the agent's work, SQUASHED, as one mbox patch on STDOUT
+#                                           #   (laptop: `cbxexport <box>` pipes it into a local git am)
+#   cbx import <box>                        # read a patch on STDIN, REPLACE the agent's branch with it,
+#                                           #   and tell the box to note it — not act (laptop: cbximport)
 #
 # Commands that TYPE into an agent's session (fix / prereview / rebase) refuse while that agent is
 # working — `cbx ls` and `cbx status` show busy | waiting | idle per box. Add --force to interrupt.
@@ -188,6 +195,15 @@ box_recreate() {
 		resp="$(broker POST "/recreate/${target}${q}")" || die "recreate '$target' failed: $resp"
 		echo "cbx: box '$target' recreated as '$(printf '%s' "$resp" | jqr '.container // empty')'."
 	fi
+}
+
+forwards_refresh() {
+	# The socat forwarders live in the HUB's netns, so replacing the hub container (any `docker compose
+	# up -d hub`) kills them and agent frontends silently stop being reachable from pinchtab. The hub
+	# does this on boot; run it by hand if a box's dev server went unreachable without being restarted.
+	local resp
+	resp="$(broker POST "/forwards${1:+/$1}")" || die "refreshing forwards failed: $resp"
+	echo "cbx: re-established forwards for: $(printf '%s' "$resp" | jqr '.forwards | join(", ") // "(none running)"')"
 }
 
 box_ls() {
@@ -463,7 +479,15 @@ prereview() {
 
 merge() {
 	[ $# -ge 1 ] || die "merge needs a box name"
-	local box="$1" squash="${2:-}" ref msg
+	local box="$1" squash="" edit="" a ref msg
+	shift
+	for a in "$@"; do
+		case "$a" in
+			--squash) squash=1 ;;
+			--edit|-e) edit=1 ;;
+			*) die "merge: unknown option '$a' (--squash | --edit)" ;;
+		esac
+	done
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
 	# The hub tree is EXPECTED to carry local setup work (it's what goldens are snapshotted from), so a
@@ -495,11 +519,25 @@ merge() {
 	echo "cbx: merging refs/agents/$box ($(git_ rev-list --count "$DEV..$ref") commit(s)) into $DEV"
 	git_ checkout -q "$DEV"
 	before="$(git_ rev-parse HEAD)"
-	if [ "$squash" = --squash ]; then
+	# --edit opens an editor on the message. For a squash that message is git's SQUASH_MSG, which
+	# lists EVERY squashed commit — so you rewrite the agent's history into one message starting from
+	# what it actually wrote, rather than from a blank buffer. git falls back to `vi` when nothing is
+	# configured; common-setup.sh puts vim in both images, so name it explicitly.
+	local -a ed=()
+	[ -n "$edit" ] && ed=(env GIT_EDITOR="${EDITOR:-${VISUAL:-vim}}")
+	if [ -n "$squash" ]; then
 		git_ merge --squash "$ref" || die "merge conflicts — resolve in $REPO, then commit"
-		git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
+		if [ -n "$edit" ]; then
+			# Append the trailer to SQUASH_MSG so it's in the buffer you edit (and can be removed).
+			printf '\n%s\n' "Cbx-Box: $box" >> "$REPO/.git/SQUASH_MSG"
+			"${ed[@]}" git -C "$REPO" commit \
+				|| die "commit aborted (empty message?) — the squash is staged, finish it in $REPO"
+		else
+			git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
+		fi
 	else
-		git_ merge --no-ff "$ref" -m "$msg" -m "Cbx-Box: $box" \
+		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$ref" \
+			-m "$msg" -m "Cbx-Box: $box" \
 			|| die "merge conflicts — resolve in $REPO, then 'git commit'"
 	fi
 	after="$(git_ rev-parse HEAD)"
@@ -758,6 +796,74 @@ hide() {
 	echo "cbx: hid $1. Apply with: cbx recreate <box>|all (keeps the session)."
 }
 
+# ------------------------------------------------------------------ patch bridge (laptop <-> hub)
+
+# The two halves of moving a changeset between the hub and your laptop checkout as PLAIN PATCHES —
+# not git transport. Patches apply by context, so neither side has to share the other's exact base
+# sha; the laptop's `dev` can be anywhere. STDOUT/STDIN are the payload here, so every diagnostic in
+# these two goes to STDERR (via die / >&2) and nothing else is printed — the stream stays clean for a
+# pipe. The laptop aliases (cbxexport / cbximport) drive both without a PTY, which would corrupt bytes.
+
+export_patch() {
+	# The agent's whole branch, squashed to ONE commit, streamed as an mbox on STDOUT. `git am` on the
+	# laptop replays it as a single commit carrying the handoff summary. We assemble the squash with
+	# commit-tree so NOTHING here is touched — no ref, no worktree, no index — and re-running is a no-op.
+	[ $# -ge 1 ] || die "export needs a box name"
+	local box="$1" ref tip base tree msg squash
+	ref="refs/agents/$box"
+	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box' (has it run handoff?)"
+	tip="$(git_ rev-parse "$ref")"
+	base="$(git_ merge-base "$DEV" "$ref")" || die "no common base between $DEV and $ref"
+	tree="$(git_ rev-parse "$ref^{tree}")"
+	# A branch whose tree equals its base's tree is all no-op commits — there is no diff to send.
+	[ "$(git_ rev-parse "$base^{tree}")" != "$tree" ] || die "'$box' has no net change against $DEV — nothing to export"
+	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
+	squash="$(printf '%s\n\nCbx-Box: %s\nCbx-Src: %s\n' "$msg" "$box" "$tip" | git_ commit-tree "$tree" -p "$base")" \
+		|| die "could not assemble the squashed commit (is a git identity configured on the hub?)"
+	# -1 emits just this commit; its parent is $base, so the patch IS the branch's net diff. --binary so
+	# binary files survive git am on the far end.
+	git_ format-patch --stdout --binary -1 "$squash"
+}
+
+import_patch() {
+	# Replace refs/agents/<box> with a patch read from STDIN (your `git format-patch` mbox), then tell
+	# the box its old edits were superseded — to NOTE it, not redo it. We `git am` the patch in a throwaway
+	# detached worktree based on $DEV so the hub's own checkout (often dirty) is never touched.
+	[ $# -ge 1 ] || die "import needs a box name"
+	local box="$1" ref pf wt new
+	ref="refs/agents/$box"
+	pf="$(mktemp "${TMPDIR:-/tmp}/cbx-import-XXXXXX.mbox")"
+	cat > "$pf"
+	[ -s "$pf" ] || { rm -f "$pf"; die "no patch on STDIN — pipe a 'git format-patch' mbox in (see cbximport)"; }
+	wt="$(mktemp -u "${TMPDIR:-/tmp}/cbx-import-wt-XXXXXX")"
+	git_ worktree add -q --detach "$wt" "$DEV" || { rm -f "$pf"; die "could not create a temporary worktree"; }
+	if ! git -C "$wt" am --3way "$pf" >&2; then
+		git -C "$wt" am --abort >/dev/null 2>&1 || true
+		git_ worktree remove --force "$wt" >/dev/null 2>&1 || true
+		rm -f "$pf"
+		die "your patch did not apply onto $DEV — is your laptop checkout based on the same history? (try 'cbx pull' first)"
+	fi
+	new="$(git -C "$wt" rev-parse HEAD)"
+	git_ worktree remove --force "$wt" >/dev/null 2>&1 || true
+	rm -f "$pf"
+	[ "$new" != "$(git_ rev-parse "$DEV")" ] || die "the patch added nothing on top of $DEV — refs/agents/$box left unchanged"
+
+	git_ update-ref "$ref" "$new"
+	# It is YOUR vetted commit, so record it as already reviewed — 'cbx status' then offers merge directly.
+	mkdir -p "$STATE"
+	printf '%s %s' "$new" "$(git_ rev-parse "$DEV")" > "$STATE/$box.reviewed"
+	echo "cbx: refs/agents/$box now points at your commit $(git_ rev-parse --short "$new") ($(git_ rev-list --count "$DEV..$ref") on top of $DEV)." >&2
+	echo "cbx: next — 'cbx merge $box' to land it on $DEV (or push from your laptop as usual)." >&2
+
+	# FYI to the box, exactly like drop/merge: unconditional (the point is to stop it re-pushing its old
+	# version), and it must NOT act. The box fetches refs/agents/* as refs/remotes/hub-agents/*.
+	if say_to_box "$box" "Heads up: I replaced the changes on your branch (agent/$box) with my own commit. Sync your local branch to it with: git fetch hub && git reset --hard hub-agents/$box . This is FYI ONLY — just NOTE that your earlier edits were superseded by my version; do NOT re-apply your previous work or take any action on this. Wait for new instructions."; then
+		echo "cbx: told $box to reset onto your commit and just note it." >&2
+	else
+		echo "cbx: (box $box not reachable — it will pick up your commit next time it fetches: git reset --hard hub-agents/$box)" >&2
+	fi
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
 	up)     [ $# -ge 1 ] || die "up needs a service"; svc_up "$1" ;;
@@ -767,6 +873,7 @@ case "$cmd" in
 	kill)     box_kill "$@" ;;
 	recreate) box_recreate "$@" ;;
 	ls)       box_ls ;;
+	forwards) forwards_refresh "${1:-}" ;;
 	q|queue)  queue ;;
 	status|st) status_overview ;;
 	review)   review "$@" ;;
@@ -775,6 +882,8 @@ case "$cmd" in
 	merge)    merge "$@" ;;
 	drop)     drop "$@" ;;
 	rebase)   rebase "$@" ;;
+	export)   export_patch "$@" ;;
+	import)   import_patch "$@" ;;
 	pull)     pull "$@" ;;
 	push)     push ;;
 	golden)
@@ -788,5 +897,5 @@ case "$cmd" in
 		esac ;;
 	expose) expose "$@" ;;
 	hide)   hide "$@" ;;
-	*) sed -n '4,40p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	*) sed -n '4,44p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac

@@ -205,32 +205,20 @@ REMOTE
 # Ports come from service-env: FRONTEND_DEV_PORT / SERVER_PORT. Override per call with
 # CBX_FRONTEND_PORT / CBX_BACKEND_PORT if a stack uses different ones.
 cbxfe() {
-	local box="${1:-}" fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
-	[ -n "$box" ] || { echo "usage: cbxfe <box>   (e.g. cbxfe work1)" >&2; return 1; }
-	hubport=$(ssh "$CBX_SERVER" "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' box-${CBX_PROJECT}-${box} 2>/dev/null | sed -n 's/^PORT_FORWARD_BACKEND_TO_HUB=//p'")
-	if [ -n "$hubport" ]; then
-		echo "cbxfe: $box -> frontend :$fe, backend :$hubport (its own)" >&2
-		cbxtun "${box}:${fe}" "${hubport}:${box}:${be}"
-	else
-		# No BACKEND line in port-forwards (or the box is down): the frontend then talks to the hub's
-		# backend, so tunnel that instead — same localhost port the page will ask for.
-		echo "cbxfe: $box has no BACKEND forward — using the hub's backend on :$be" >&2
+	local box="" own="" a fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
+	for a in "$@"; do case "$a" in --own) own=1 ;; *) box="$a" ;; esac; done
+	[ -n "$box" ] || { echo "usage: cbxfe <box> [--own]   (--own = the box's own backend tunnel)" >&2; return 1; }
+	if [ -z "$own" ]; then
+		# Default, matching the default setup: the page comes from the box, the backend from the HUB.
+		echo "cbxfe: $box -> frontend :$fe, backend :$be (hub)" >&2
 		cbxtun "${box}:${fe}" "hub:${be}"
+		return
 	fi
-}
-
-# take new commits from origin onto the dev branch, then tell every agent to re-base on them:
-#
-#   cbxsync              # merge origin into the dev branch, then have the agents rebase
-#   cbxsync --rebase     # ...rebasing the hub's branch instead of merging
-#
-# Two steps because they are two different repos: `cbx pull` moves the HUB's branch, `cbx rebase all`
-# types a rebase instruction into each agent's claude session (their branches are their own clones).
-# Deliberately NOT one remote command: `a && b` in the ssh string would run b on the SERVER rather
-# than inside the hub container. Skips the rebase if the pull failed (conflicts to resolve first),
-# since rebasing agents onto a half-merged branch only spreads the mess.
-cbxsync() {
-	cbx pull "$@" || { echo "cbxsync: pull failed — agents NOT notified" >&2; return 1; }
-	cbx rebase all
-	echo "cbxsync: agents were asked to rebase; they act when they pick the message up. 'cbx status' for the queue." >&2
+	# --own: the agent switched FRONTEND_DEV_BACKEND_URL to its box's own backend, so its JS asks for
+	# localhost:<8900+slot>. Tunnel that port straight to the box (the hub-side socat binds the hub's
+	# loopback, which ssh -L cannot reach).
+	hubport=$(ssh "$CBX_SERVER" "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' box-${CBX_PROJECT}-${box} 2>/dev/null | sed -n 's/^PORT_FORWARD_BACKEND_TO_HUB=//p'")
+	[ -n "$hubport" ] || { echo "cbxfe: no BACKEND forward for '$box' (is it running?)" >&2; return 1; }
+	echo "cbxfe: $box -> frontend :$fe, backend :$hubport (the box's own)" >&2
+	cbxtun "${box}:${fe}" "${hubport}:${box}:${be}"
 }

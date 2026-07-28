@@ -286,6 +286,10 @@ def start_forwarders(name, slot, forwards):
 	allowlisted by default, Host stays localhost. socat runs FROM the box image (--entrypoint socat) in
 	the hub's netns (--network container:<hub>), so bind=127.0.0.1 is the hub loopback and the box name
 	resolves via the hub's cbx-network DNS."""
+	# Rebuild this box's set from scratch. Recreating only the CURRENT manifest entries would leave a
+	# forward whose NAME was deleted from port-forwards still running and still bound on the hub
+	# loopback — pointing into a box where nothing listens, which looks exactly like a broken tunnel.
+	stop_forwarders(name)
 	if not forwards:
 		return
 	hub = hub_container()
@@ -295,7 +299,6 @@ def start_forwarders(name, slot, forwards):
 	for fwd_name, box_port, hub_base in forwards:
 		hub_port = hub_base + slot
 		c = pf_container(name, fwd_name)
-		subprocess.run(["docker", "rm", "-f", c], capture_output=True, text=True)
 		r = subprocess.run(
 			["docker", "run", "-d", "--name", c, "--network", f"container:{hub}",
 			 "--entrypoint", "socat", BOX_IMAGE,
@@ -316,6 +319,27 @@ def stop_forwarders(name):
 
 
 # --------------------------------------------------------------------------- mounts
+
+def refresh_forwarders(name=None):
+	"""(Re)establish the socat forwarders for one box, or every running box.
+
+	Needed because the forwarders run in the HUB's network namespace (--network container:<hub>): if
+	the hub container is REPLACED — which `docker compose up -d hub` does on any config change — its
+	netns goes with it and every forwarder dies. Nothing notices until an agent's frontend stops being
+	reachable. The hub asks for this on boot, and `cbx forwards` triggers it by hand."""
+	forwards = parse_port_forwards()
+	done = []
+	for r in list_boxes()["boxes"]:
+		n = r["box"]
+		if name and n != name:
+			continue
+		if not r["status"].startswith("Up"):
+			continue          # forwarding into a stopped box is pointless
+		slot = alloc_slot(os.path.join(BOXROOT, n)) if forwards else None
+		start_forwarders(n, slot, forwards)
+		done.append(n)
+	return {"forwards": done}
+
 
 def safe_dst(dst):
 	"""Container-side destination under HOME_IN; reject absolute / traversal."""
@@ -545,19 +569,19 @@ def create_box(name, resume=False, fresh_upper=False):
 			forward_ports[fwd_name] = hub_port
 			env[f"PORT_FORWARD_{fwd_name}_FROM"] = str(box_port)
 			env[f"PORT_FORWARD_{fwd_name}_TO_HUB"] = str(hub_port)
-	# A box's frontend must call ITS OWN backend, which lives on the hub loopback at the BACKEND
-	# forward — so the service-env value (correct for the hub) is rebuilt here. It must stay a FULL
-	# app URL, not just host:port: the frontend derives its REST base by stripping /app[-suffix]/* off
-	# this value, so dropping the path segment silently sends every REST call to the wrong place.
-	# The path comes from FRONTEND_DEV_BACKEND_PATH in service-env, so this stays project-agnostic.
+	# The BACKEND forward is provisioned for every box but NOT used by default: the frontend keeps
+	# pointing at the HUB's backend (the service-env value), which is the one actually running. The
+	# tunnel just sits there ready, so an agent that decides to run its own backend switches with a
+	# single variable — we hand it the finished URL rather than making it work out its slot port:
+	#     export FRONTEND_DEV_BACKEND_URL="$FRONTEND_DEV_BACKEND_URL_OWN"   # then restart the dev loop
+	# It must be a FULL app URL, not host:port — the frontend derives its REST base by stripping
+	# /app[-suffix]/* off it, so a missing path segment sends every REST call to the wrong place.
 	if "BACKEND" in forward_ports:
 		path = ""
 		for e in svc_env:
 			if e.startswith("FRONTEND_DEV_BACKEND_PATH="):
 				path = e.split("=", 1)[1]
-		url = f"http://localhost:{forward_ports['BACKEND']}{path}"
-		svc_env = [e for e in svc_env if not e.startswith("FRONTEND_DEV_BACKEND_URL=")]
-		svc_env.append(f"FRONTEND_DEV_BACKEND_URL={url}")
+		svc_env.append(f"FRONTEND_DEV_BACKEND_URL_OWN=http://localhost:{forward_ports['BACKEND']}{path}")
 		env["CLAUDEBOX_EXTRA_ENV"] = "\n".join(svc_env)
 	proc = subprocess.run([CLAUDEBOX_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
@@ -725,6 +749,14 @@ class Handler(BaseHTTPRequestHandler):
 				return self._reply(200, seal_golden(path[len("/golden/seal/"):]))
 			if path == "/golden/reap":
 				return self._reply(200, reap_goldens())
+			# Re-establish the hub-netns socat forwarders (they die with the hub container).
+			if path == "/forwards":
+				return self._reply(200, refresh_forwarders())
+			if path.startswith("/forwards/"):
+				fname = path[len("/forwards/"):]
+				if not NAME_RE.match(fname):
+					return self._reply(400, {"error": "bad box name"})
+				return self._reply(200, refresh_forwarders(fname))
 			# Recreate (newest image + respawn resuming each box's session). /recreate = every box.
 			if path == "/recreate":
 				return self._reply(200, recreate_all(fresh_upper=fresh))
