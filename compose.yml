@@ -134,6 +134,11 @@ services:
       # read-only from the stack's ./hub-services below. Changing a service is a file sync, not a rebuild.
       HUB_SERVICES_DIR: /work/hub-services
       GIT_CONFIG_GLOBAL: /home/dev/.gitidentity/gitconfig
+      # Keep the WHOLE claude config in the one dir that hub + every box share (./data/claude below,
+      # which the broker also mounts into each box as ~/.claude). By default the login and the user
+      # preferences live in ~/.claude.json — OUTSIDE ~/.claude — so they would be container-local here
+      # and per-box there: recreating the hub or starting a second box asked for the login again.
+      CLAUDE_CONFIG_DIR: /home/dev/.claude
     # Everything PROJECT-specific (backend/frontend wiring, API keys) lives in `service-env` instead
     # of here, because the box-broker hands the very same file to every agent box. That is what makes
     # a backend an AGENT starts behave like the one the hub starts. Keep this `environment:` block for

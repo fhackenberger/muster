@@ -110,6 +110,16 @@ ORIG_PWD="$(pwd)"
 # user's; the broker points every box at one shared dir so a single login covers all boxes.
 CLAUDE_DIR="${CLAUDEBOX_CLAUDE_DIR:-$HOME/.claude}"
 
+# Server mode: the login itself (oauthAccount / hasCompletedOnboarding) and the user preferences do
+# NOT live in ~/.claude — they live in ~/.claude.json, one level up, and each box has its own private
+# home anchor. Sharing only ~/.claude therefore shared the credentials but not the account, so every
+# new box ran the login/onboarding flow again. CLAUDE_CONFIG_DIR relocates .claude.json INTO that dir,
+# so the whole config (credentials + account + preferences) sits in the one shared mount.
+# Laptop mode keeps the default layout — there claude-box.sh bind-mounts the host's real
+# ~/.claude.json below, which already shares the host user's login 1:1.
+CONFIG_ENV=()
+[ "$HEADLESS" = 1 ] && CONFIG_ENV=(-e CLAUDE_CONFIG_DIR="$HOME_IN/.claude")
+
 # Per-box identity. Several boxes can bind-mount and `ng serve` THIS repo at once; the frontend
 # dev loop keys its Angular manualRebuild trigger file off CLAUDEBOX_ID (see
 # infostarsFrontend/scripts/frontend-dev-lib.sh) so forcing a rebuild in one box never fires every
@@ -426,6 +436,7 @@ $DOCKER run "${RUN_FLAGS[@]}" \
 	-e TERM="${TERM:-xterm-256color}" \
 	-e COLORTERM="${COLORTERM:-truecolor}" \
 	-e DISABLE_AUTOUPDATER=1 \
+	"${CONFIG_ENV[@]}" \
 	"${ROOT_ENV[@]}" \
 	"${PT_ENV[@]}" \
 	"${DEV_ENV[@]}" \

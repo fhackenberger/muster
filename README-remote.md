@@ -539,6 +539,15 @@ The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`
   claude is asking *you* something. A `busy` older than `CBX_ACTIVITY_STALE` (default 900s) reads as
   `stale` and does not block, so missing or broken hooks can only cost you the protection, never the
   ability to work.
+- **One claude login for the whole stack:** the hub and every box run with
+  `CLAUDE_CONFIG_DIR=/home/dev/.claude`, the single host dir `${STACK_DIR}/data/claude` that compose
+  mounts into the hub and the broker mounts into each box. That env var matters because claude keeps
+  the *credentials* in `~/.claude/.credentials.json` but the *account and preferences* in
+  `~/.claude.json`, one level up — and each box has its own private home anchor. Sharing only
+  `~/.claude` therefore shared the token but not the account, so every additional box (and every hub
+  recreate) ran the login/onboarding flow again. Pointing `CLAUDE_CONFIG_DIR` at the shared dir puts
+  the whole config there, so you log in once. Set on the hub in `compose.yml` (Ansible sync) and on
+  boxes in `claude-box.sh`'s headless branch (image rebuild) — both paths must land, see *Deploying*.
 - **Isolation:** a box sees its own overlay of the golden plus whatever `box-mounts` adds, has no
   docker socket, no credentials for the real origin, and can't see the hub's filesystem or another
   box's upper layer. Its only shared surface is the network (`hub:8080/4200/9867/9418`).

@@ -35,7 +35,9 @@ Config (env, from compose):
   CHECKOUT_DST        where the overlay is mounted in the box (default /home/dev/repo — must match the hub)
   NPM_CACHE/GRADLE_CACHE  HOST paths shared rw with the hub at ~/.npm and ~/.gradle
   M2_REPO             HOST path of the Maven repository, mounted READ-ONLY at ~/.m2/repository
-  CLAUDE_HOME         HOST path of the shared ~/.claude (mounted into every box)
+  CLAUDE_HOME         HOST path of the shared ~/.claude (mounted into every box; boxes also get
+                      CLAUDE_CONFIG_DIR pointing at it, so .claude.json — the login and the user
+                      preferences — is shared too and one login covers the whole stack)
   BOXROOT             HOST path whose <name>/{home,upper,work} subdirs back each box
   BOX_MOUNTS          HOST path of the box-mounts manifest (EXTRA mounts only; see box-mounts.example)
   DEV_BRANCH          branch agents base their work on (default: dev)
