@@ -310,8 +310,9 @@ initial handshake, so key auth is unchanged.
 
 The reason ssh is the default: **mosh can't carry the clipboard.** Terminal copy from claude reaches
 your laptop clipboard via an OSC 52 escape sequence, which ssh passes through transparently but mosh's
-predictive terminal drops (a long-standing mosh gap). So on mosh a mouse-selection clears without
-copying; on ssh it lands in your clipboard. Use mosh when roaming matters more than copy-paste. Note
+predictive terminal drops (a long-standing mosh gap). tmux forwards the sequence either way
+(`set-clipboard external`), so on ssh a copy from claude lands in your laptop clipboard and on mosh it
+vanishes. Use mosh when roaming matters more than copy-paste. Note
 that an exported `CBX_TRANSPORT` in your `~/.bashrc` wins over the file default — `echo "$CBX_TRANSPORT"`
 if a transport change seems ignored.
 
@@ -403,6 +404,23 @@ Attach / detach a box (a box is a separate container, not reached through the hu
 cbxbox work1                                                                                # Ctrl-b d to detach
 ssh -t "$CBX_SERVER" docker exec -it -u dev "box-${CBX_PROJECT}-work1" tmux attach -t main   # equivalent, raw
 ```
+
+**Inside that tmux** (config: `tmux.conf`, installed as `/etc/tmux.conf` by `common-setup.sh`, so it
+applies to the hub too) the aim is that claude feels the same as running it locally:
+
+| | |
+|---|---|
+| `Shift+Enter` | newline in claude's prompt — needs `extended-keys` + the `extkeys` terminal feature, both set |
+| `Shift-PgUp` / `Shift-PgDn` | scrollback; PgUp enters copy mode, PgDn leaves it again at the bottom |
+| wheel | scrollback too (that's what `mouse on` buys) |
+| drag | tmux copy-mode selection → the **tmux paste buffer**, pasted with **middle-click** |
+| `Shift`+drag, `Shift`+middle-click | **bypasses** tmux's mouse reporting → your terminal's own X PRIMARY selection and paste |
+| `Ctrl-Shift-C` / `Ctrl-Shift-V` | your terminal's clipboard; never reaches tmux at all |
+
+`mouse on` and native X selection are mutually exclusive — with mouse reporting active the terminal
+never sees the drag or the middle click, which is why `Shift` (the standard bypass) is the escape
+hatch rather than something configurable here. tmux is set to `set-clipboard external`, so a drag
+selection stays local and does **not** overwrite your laptop clipboard; only a deliberate copy does.
 
 What the hub and the boxes mount is **project set-up, not a runtime knob**: it lives in the stack's
 root-owned `mounts` table (see *One mount table* below), edited on the host and applied by recreating:
