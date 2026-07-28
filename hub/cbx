@@ -24,12 +24,15 @@ set -euo pipefail
 #                                           #   and your terminal BELLS when an agent stops working
 #                                           #   or a new handoff lands. 'q'/Ctrl-C quits, Enter refreshes
 #   cbx q  --text                           # the queue table once, as plain text (for pipes/scripts)
+#                                           #   colour: CBX_COLOR=always|never|auto (auto = 'cbx status'
+#                                           #   colours a terminal only; the live dashboard always does)
 #   cbx review <box> [--full] [--net]       # per-commit patches since your last review
 #                                           #   --full = whole branch, --net = one combined diff
 #   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
 #   cbx prereview <box>                     # ask the agent to self-review its diff before you look
 #   cbx merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
+#                                           #   (--edit on a 1-commit branch: no merge commit)
 #   cbx drop   <box>                        # discard an agent branch (tells the box)
 #   cbx rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
 #
@@ -41,7 +44,8 @@ set -euo pipefail
 # Commands that TYPE into an agent's session (fix / prereview / rebase) refuse while that agent is
 # working — `cbx ls` and `cbx status` show busy | waiting | idle per box. Add --force to interrupt.
 #   cbx pull [--rebase]                     # bring dev up to date with origin (merge by default)
-#   cbx push                                # push dev to the real origin
+#   cbx push [-y]                           # push dev to the real origin (shows a --stat preview and
+#                                           #   asks first; -y skips the question)
 #
 #   cbx golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
 #   cbx golden seal <id>                    # finish a staged golden you fixed up by hand
@@ -113,6 +117,92 @@ guard_busy() {
 	fi
 	return 0
 }
+# ---- terminal presentation ------------------------------------------------------------------
+# Colour is decided ONCE, by colors_init, from $CBX_COLOR (auto|always|never) — never by a `[ -t 1 ]`
+# test at print time. `cbx q` renders a whole frame inside "$(status_overview)", where stdout is a
+# pipe, so a print-time auto-detect would silently strip every attribute from the live dashboard.
+C_RESET=; C_B=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_MAG=; C_CYA=
+
+colors_init() {
+	local mode="${1:-${CBX_COLOR:-auto}}"
+	case "$mode" in
+		never|off|0) mode=off ;;
+		always|on|1) mode=on ;;
+		*) if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then mode=on; else mode=off; fi ;;
+	esac
+	if [ "$mode" = on ]; then
+		C_RESET=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+		C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+		C_BLU=$'\033[34m'; C_MAG=$'\033[35m'; C_CYA=$'\033[36m'
+	else
+		C_RESET=; C_B=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_MAG=; C_CYA=
+	fi
+}
+
+# A section title plus a rule to the right margin, so the screen reads as bands instead of a wall of
+# text. The rule is built with a parameter expansion, not `tr`: tr is byte-oriented and would emit
+# the first byte of a multi-byte box-drawing char once per column.
+hdr() {
+	local n bar
+	n=$(( $(term_cols) - ${#1} - 4 ))
+	[ "$n" -ge 2 ] || n=2
+	printf -v bar '%*s' "$n" ''
+	printf '%s── %s %s%s\n' "$C_B$C_BLU" "$1" "${bar// /─}" "$C_RESET"
+}
+
+# Pad THEN colour: escape sequences are zero-width but printf's %-*s counts them, so colouring first
+# would shorten every padded cell by the length of its attribute string and skew the whole table.
+cell() { printf '%s%-*s%s' "$1" "$2" "$3" "$C_RESET"; }
+
+# How wide we may draw. $CBX_COLS is set by the watch loop (where stdout IS a terminal); everywhere
+# else we ask tput and fall back to a sane 100 rather than wrapping a table nobody can read.
+term_cols() {
+	local c="${CBX_COLS:-}"
+	[ -n "$c" ] || c="$(tput cols 2>/dev/null || true)"
+	case "$c" in ''|*[!0-9]*) c=100 ;; esac
+	[ "$c" -ge 60 ] || c=100
+	printf '%s' "$c"
+}
+
+# 20011s is not a duration anyone reads — 5h33m is. Keeps two significant units, never wider than 6.
+human_age() {
+	local s="${1:-}"
+	case "$s" in ''|*[!0-9]*) printf '%s' "${s:--}"; return 0 ;; esac
+	if   [ "$s" -lt 60 ];    then printf '%ds' "$s"
+	elif [ "$s" -lt 3600 ];  then printf '%dm%02ds' "$((s / 60))" "$((s % 60))"
+	elif [ "$s" -lt 86400 ]; then printf '%dh%02dm' "$((s / 3600))" "$((s % 3600 / 60))"
+	else printf '%dd%02dh' "$((s / 86400))" "$((s % 86400 / 3600))"; fi
+}
+
+trunc() {
+	local w="$1" t="$2"
+	[ "$w" -ge 8 ] || w=8
+	if [ "${#t}" -le "$w" ]; then printf '%s' "$t"; else printf '%s…' "${t:0:$((w - 1))}"; fi
+}
+
+# Colour by what the state MEANS to you: yellow = the machine is working (leave it alone), magenta =
+# it is blocked on you, green = free, red = something is wrong.
+act_color() {
+	case "$1" in
+		busy)    printf '%s' "$C_YEL" ;;
+		waiting) printf '%s' "$C_B$C_MAG" ;;
+		idle)    printf '%s' "$C_GRN" ;;
+		stale)   printf '%s' "$C_RED" ;;
+		*)       printf '%s' "$C_DIM" ;;
+	esac
+}
+
+# Same idea for the review queue: green/magenta = your move, cyan = ready to land, dim = done.
+q_color() {
+	case "$1" in
+		new)       printf '%s' "$C_B$C_MAG" ;;
+		re-review) printf '%s' "$C_YEL" ;;
+		reviewed)  printf '%s' "$C_B$C_GRN" ;;
+		rebased)   printf '%s' "$C_CYA" ;;
+		*)         printf '%s' "$C_DIM" ;;
+	esac
+}
+
 have_delta() { command -v delta >/dev/null 2>&1; }
 
 # One pager for a whole review (commits + notes + diff), so nothing gets painted over. delta renders
@@ -407,44 +497,78 @@ status_overview() {
 	# `cbx q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
 	# is the origin fetch, which `--no-fetch` skips (the watch loop throttles it to $WATCH_FETCH).
 	local behind ahead box sha st bhd ahd age note conf other list running gprov gsha todo=()
+	local cols nw=3 sumw rows=() row bname bstatus bgolden bstate bage detail
 
-	echo "== branch =="
+	cols="$(term_cols)"
+
+	# Both tables key on the box name, so they share ONE name column: the eye then reads straight down
+	# from "who handed off" to "who is still running". That needs the broker list before the queue is
+	# printed, which is why the call sits up here rather than in the boxes section below.
+	list="$(agent_refs)"
+	running="$(broker GET /box 2>/dev/null || true)"
+	if [ -n "$running" ]; then
+		while IFS=$'\t' read -r bname bstatus bgolden; do
+			[ -n "$bname" ] || continue
+			rows+=("$bname"$'\t'"$bstatus")
+		done < <(printf '%s' "$running" | jq -r '.boxes[]? | "\(.box)\t\(.status)\t\(.golden)"' 2>/dev/null)
+	fi
+	for box in $list; do [ "${#box}" -gt "$nw" ] && nw="${#box}"; done
+	for row in ${rows[@]+"${rows[@]}"}; do
+		bname="${row%%$'\t'*}"
+		[ "${#bname}" -gt "$nw" ] && nw="${#bname}"
+	done
+	[ "$nw" -le $(( cols / 3 )) ] || nw=$(( cols / 3 ))   # one pathological name must not eat the table
+
+	hdr branch
 	if [ "${1:-}" = --no-fetch ]; then
 		:
 	else
-		git_ fetch -q origin "$DEV" 2>/dev/null || echo "  (origin unreachable — counts below may be stale)"
+		git_ fetch -q origin "$DEV" 2>/dev/null \
+			|| printf '  %s(origin unreachable — counts below may be stale)%s\n' "$C_YEL" "$C_RESET"
 	fi
 	read -r behind ahead <<< "$(divergence)"
-	printf '  %s @ %s — %s behind, %s ahead of origin\n' \
-		"$DEV" "$(git_ rev-parse --short "$DEV")" "$behind" "$ahead"
+	printf '  %s%s%s @ %s%s%s — %s%s behind%s, %s%s ahead%s of origin\n' \
+		"$C_B" "$DEV" "$C_RESET" "$C_YEL" "$(git_ rev-parse --short "$DEV")" "$C_RESET" \
+		"$([ "$behind" = 0 ] && printf '%s' "$C_DIM" || printf '%s' "$C_B$C_RED")" "$behind" "$C_RESET" \
+		"$([ "$ahead" = 0 ] && printf '%s' "$C_DIM" || printf '%s' "$C_GRN")" "$ahead" "$C_RESET"
 	[ "$behind" != 0 ] && todo+=("cbx pull                # take $behind commit(s) from origin first")
 
 	# The queue lives INSIDE the overview (rather than beside it) so one screen answers both "who is
 	# waiting on me" and "what do I do about it" — `cbx q --text` still prints the bare table.
-	echo "== queue =="
-	list="$(agent_refs)"
+	hdr queue
+	# 2 indent + name + status(9) + ahead(5) + behind(6) + last(13), each with a space after it.
+	sumw=$(( cols - nw - 39 ))
 	if [ -z "$list" ]; then
-		echo "  (nothing waiting — an agent publishes with 'handoff \"summary\"')"
+		printf '  %s(nothing waiting — an agent publishes with '"'"'handoff "summary"'"'"')%s\n' "$C_DIM" "$C_RESET"
 	else
-		printf '  %-12s %-10s %5s %6s %-15s %s\n' BOX STATUS AHEAD BEHIND LAST SUMMARY
+		printf '  %s%-*s %-9s %5s %6s %-13s %s%s\n' \
+			"$C_DIM" "$nw" BOX STATUS AHEAD BEHIND LAST SUMMARY "$C_RESET"
 	fi
 	for box in $list; do
 		sha="$(git_ rev-parse --short "refs/agents/$box")"
 		st="$(box_status "$box")"
 		ahd="$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')"
 		bhd="$(git_ rev-list --count "refs/agents/$box..$DEV" 2>/dev/null || echo '?')"
-		age="$(git_ log -1 --format=%cr "refs/agents/$box")"
+		age="$(git_ log -1 --format=%cr "refs/agents/$box")"; age="${age% ago}"
 		note="$(note_of "$box")"
-		printf '  %-12s %-10s %5s %6s %-15s %s\n' "$box" "$st" "$ahd" "$bhd" "$age" "${note:-—}"
+		printf '  %s %s %s%5s%s %s%6s%s %s%-13s%s %s\n' \
+			"$(cell "$C_B" "$nw" "$(trunc "$nw" "$box")")" "$(cell "$(q_color "$st")" 9 "$st")" \
+			"$C_GRN" "$ahd" "$C_RESET" \
+			"$([ "$bhd" = 0 ] && printf '%s' "$C_DIM" || printf '%s' "$C_YEL")" "$bhd" "$C_RESET" \
+			"$C_DIM" "$(trunc 13 "$age")" "$C_RESET" \
+			"$(trunc "$sumw" "${note:-—}")"
 		# Conflicts are the shared-checkout collision awareness, moved earlier: you learn that two
 		# agents touched the same lines when they push, not when you merge the second one.
+		# 22 = the two-space indent, the space after the name column, and "⚠ conflicts with <x>: ".
 		conf="$(conflicts_between "$DEV" "refs/agents/$box")"
-		[ -n "$conf" ] && printf '  %-12s ⚠ conflicts with %s: %s\n' "" "$DEV" "$conf"
+		[ -n "$conf" ] && printf '  %*s %s⚠ conflicts with %s:%s %s\n' \
+			"$nw" "" "$C_B$C_RED" "$DEV" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#DEV}))" "$conf")"
 		for other in $list; do
 			[ "$other" = "$box" ] && continue
 			[[ "$other" > "$box" ]] || continue          # report each pair once
 			conf="$(conflicts_between "refs/agents/$box" "refs/agents/$other")"
-			[ -n "$conf" ] && printf '  %-12s ⚠ conflicts with %s: %s\n' "" "$other" "$conf"
+			[ -n "$conf" ] && printf '  %*s %s⚠ conflicts with %s:%s %s\n' \
+				"$nw" "" "$C_B$C_RED" "$other" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#other}))" "$conf")"
 		done
 		case "$st" in
 			new|re-review) todo+=("cbx review $box") ;;
@@ -454,46 +578,65 @@ status_overview() {
 		[ "$bhd" != 0 ] && [ "$bhd" != '?' ] && todo+=("cbx rebase $box           # $bhd commit(s) behind $DEV")
 	done
 
-	echo "== boxes =="
-	running="$(broker GET /box 2>/dev/null || true)"
-	if [ -n "$running" ]; then
-		local bstate bage bstatus bgolden bname
-		while IFS=$'\t' read -r bname bstatus bgolden; do
-			[ -n "$bname" ] || continue
-			read -r bstate bage <<< "$(box_activity "$bname")"
-			case "$bstate" in
-				busy)    printf '  %-12s %-9s working for %ss\n' "$bname" "$bstate" "$bage" ;;
-				waiting) printf '  %-12s %-9s wants your input (%ss)\n' "$bname" "$bstate" "$bage" ;;
-				*)       printf '  %-12s %-9s %s\n' "$bname" "$bstate" "$bstatus" ;;
-			esac
-		done < <(printf '%s' "$running" | jq -r '.boxes[]? | "\(.box)\t\(.status)\t\(.golden)"' 2>/dev/null)
-	else
-		echo "  (broker unreachable)"
+	hdr boxes
+	if [ -z "$running" ]; then
+		printf '  %s(broker unreachable)%s\n' "$C_RED" "$C_RESET"
+	elif [ "${#rows[@]}" -eq 0 ]; then
+		printf '  %s(no boxes running — cbx box <name> to start one)%s\n' "$C_DIM" "$C_RESET"
 	fi
+	for row in ${rows[@]+"${rows[@]}"}; do
+		bname="${row%%$'\t'*}"; bstatus="${row#*$'\t'}"
+		read -r bstate bage <<< "$(box_activity "$bname")"
+		# The right-hand column answers "and how long has that been true", which is the whole reason to
+		# look: a 3s 'waiting' is the agent thinking out loud, a 5h33m one is a session you forgot.
+		case "$bstate" in
+			busy)    detail="${C_DIM}working for${C_RESET} $(human_age "$bage")" ;;
+			waiting) detail="${C_B}${C_MAG}wants your input${C_RESET} ${C_DIM}for${C_RESET} $(human_age "$bage")" ;;
+			idle)    detail="${C_DIM}$bstatus, quiet for${C_RESET} $(human_age "$bage")" ;;
+			stale)   detail="${C_RED}no hook activity for $(human_age "$bage")${C_RESET} ${C_DIM}($bstatus)${C_RESET}" ;;
+			*)       detail="${C_DIM}$bstatus${C_RESET}" ;;
+		esac
+		printf '  %s %s%s %-8s%s %s\n' \
+			"$(cell "$C_B" "$nw" "$(trunc "$nw" "$bname")")" "$(act_color "$bstate")" "●" "$bstate" "$C_RESET" "$detail"
+	done
 
-	echo "== golden =="
+	hdr golden
 	gprov="$(cat "$GOLDEN/current/.git/cbx-golden" 2>/dev/null || true)"
 	if [ -z "$gprov" ]; then
-		echo "  (none yet)"
+		printf '  %s(none yet)%s\n' "$C_DIM" "$C_RESET"
 		todo+=("cbx golden snapshot     # no base for boxes to overlay")
 	else
-		echo "  $gprov"
+		printf '  %s%s%s\n' "$C_DIM" "$gprov" "$C_RESET"
 		# Field 3 of "g-<id> from <sha> (<branch>) at <date>" — a hint only, so it is never fatal.
 		gsha="$(printf '%s' "$gprov" | awk '{print $3}')"
 		if [ -n "$gsha" ] && ! git_ merge-base --is-ancestor "$DEV" "$gsha" 2>/dev/null; then
-			echo "  ($DEV has moved since — a snapshot would give new boxes a fresher base)"
+			printf '  %s(%s has moved since — a snapshot would give new boxes a fresher base)%s\n' \
+				"$C_YEL" "$DEV" "$C_RESET"
 		fi
 	fi
 
-	echo "== next =="
+	hdr next
 	if [ "${#todo[@]}" -eq 0 ]; then
-		[ "$ahead" != 0 ] && echo "  cbx push                # $ahead commit(s) to origin" \
-			|| echo "  (nothing to do)"
+		[ "$ahead" != 0 ] && todo_line "cbx push                # $ahead commit(s) to origin" \
+			|| printf '  %s(nothing to do)%s\n' "$C_DIM" "$C_RESET"
 	else
-		printf '  %s\n' "${todo[@]}"
-		[ "$ahead" != 0 ] && [ "$behind" = 0 ] && echo "  cbx push                # $ahead commit(s) to origin"
+		for row in "${todo[@]}"; do todo_line "$row"; done
+		[ "$ahead" != 0 ] && [ "$behind" = 0 ] && todo_line "cbx push                # $ahead commit(s) to origin"
 	fi
 	return 0
+}
+
+# One "next" entry: the command in green (it is meant to be copied), the trailing "# why" dimmed so
+# the column of commands stays scannable.
+todo_line() {
+	local t="$1" cmd why
+	case "$t" in
+		*'#'*) cmd="${t%%#*}"; why="#${t#*#}" ;;
+		*)     cmd="$t"; why="" ;;
+	esac
+	cmd="${cmd%"${cmd##*[![:space:]]}"}"
+	printf '  %s▸%s %s%s%s%s\n' "$C_DIM" "$C_RESET" "$C_GRN" "$cmd" "$C_RESET" \
+		"${why:+ $C_DIM$why$C_RESET}"
 }
 
 # ------------------------------------------------------------------ live watch (`cbx q`)
@@ -513,8 +656,12 @@ WATCH_FETCH="${CBX_WATCH_FETCH:-60}"
 WATCH_EVENTS=()
 WATCH_RING=0
 
+# watch_event <colour> <text…>. The colour is stored WITH the event rather than applied at print
+# time, because only the caller knows whether "box stopped working" was a handoff (good) or a box
+# that quietly went idle on you (not).
 watch_event() {
-	WATCH_EVENTS+=("$(date +%H:%M:%S)  $*")
+	local color="$1"; shift
+	WATCH_EVENTS+=("$(date +%H:%M:%S)"$'\t'"$color"$'\t'"$*")
 	# Keep the tail only: the frame has to fit on a screen, and old events are scrollback, not state.
 	[ "${#WATCH_EVENTS[@]}" -le 8 ] || WATCH_EVENTS=("${WATCH_EVENTS[@]: -8}")
 	WATCH_RING=1
@@ -544,7 +691,7 @@ ref_snapshot() {
 
 watch_queue() {
 	local interval="$WATCH_INTERVAL" bell=1 key frame fa hint now fetched=0 first=1
-	local box st prev sha
+	local box st prev sha clock pad ev ets ecol emsg
 	local -A act=() ref=() now_act=() now_ref=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -561,8 +708,17 @@ watch_queue() {
 	# Nothing to watch when the output is a pipe or a file — repainting would just append frames
 	# forever. Options are still parsed above, so a typo is an error either way.
 	[ -t 1 ] || { queue; return 0; }
+	# We KNOW stdout is a terminal here, and the frame is rendered through a command substitution
+	# where nothing downstream could work that out — so decide colour and width once, up here, and
+	# let status_overview inherit both.
+	colors_init "${CBX_COLOR:-always}"
 
 	while :; do
+		# Re-read every frame: the window can be resized between repaints, and a stale width would
+		# either wrap the table or leave a ragged right margin until the next restart.
+		CBX_COLS="$(tput cols 2>/dev/null || echo 100)"
+		case "$CBX_COLS" in ''|*[!0-9]*) CBX_COLS=100 ;; esac
+		[ "$CBX_COLS" -ge 60 ] || CBX_COLS=100
 		now_act=(); now_ref=()
 		while read -r box st;  do [ -n "$box" ] && now_act["$box"]="$st"; done < <(activity_snapshot)
 		while read -r box sha; do [ -n "$box" ] && now_ref["$box"]="$sha"; done < <(ref_snapshot)
@@ -574,19 +730,19 @@ watch_queue() {
 				st="${now_act[$box]}"; prev="${act[$box]-}"
 				if [ "$prev" = busy ] && [ "$st" != busy ]; then
 					if [ "$st" = waiting ]; then
-						watch_event "$box stopped working and is ASKING YOU something  (cbxbox $box)"
+						watch_event "$C_B$C_MAG" "$box stopped working and is ASKING YOU something  (cbxbox $box)"
 					else
-						watch_event "$box stopped working — now $st  (cbx q / cbxbox $box)"
+						watch_event "$C_YEL" "$box stopped working — now $st  (cbx q / cbxbox $box)"
 					fi
 				elif [ "$prev" != waiting ] && [ -n "$prev" ] && [ "$st" = waiting ]; then
-					watch_event "$box wants your input  (cbxbox $box)"
+					watch_event "$C_B$C_MAG" "$box wants your input  (cbxbox $box)"
 				fi
 			done
 			for box in "${!now_ref[@]}"; do
 				if [ -z "${ref[$box]-}" ]; then
-					watch_event "$box HANDED OFF — review request  (cbx review $box)"
+					watch_event "$C_B$C_GRN" "$box HANDED OFF — review request  (cbx review $box)"
 				elif [ "${ref[$box]}" != "${now_ref[$box]}" ]; then
-					watch_event "$box pushed again — re-review  (cbx review $box)"
+					watch_event "$C_GRN" "$box pushed again — re-review  (cbx review $box)"
 				fi
 			done
 		fi
@@ -602,12 +758,22 @@ watch_queue() {
 
 		hint="refresh ${interval}s · Enter now · q quits"
 		[ "$bell" = 1 ] || hint="$hint · bell OFF"
+		clock="$(date +%H:%M:%S)"
+		# Title bar: name + hints on the left, clock hard against the right margin. The pad is computed
+		# from the PLAIN text (15 = " cbx q · live " plus the space before the hint), never from the
+		# printed string — that one carries attribute bytes that occupy no columns.
+		pad=$(( CBX_COLS - ${#hint} - ${#clock} - 15 ))
+		[ "$pad" -ge 1 ] || pad=1
 		printf '\033[H\033[2J'
-		printf 'cbx q — live  (%s)   %s\n\n' "$hint" "$(date +%H:%M:%S)"
+		printf '%s cbx q · live %s %s%s%s%*s%s%s%s\n\n' \
+			"$C_B$C_CYA" "$C_RESET" "$C_DIM" "$hint" "$C_RESET" "$pad" "" "$C_B" "$clock" "$C_RESET"
 		printf '%s\n' "$frame"
 		if [ "${#WATCH_EVENTS[@]}" -gt 0 ]; then
-			echo "== while you were watching =="
-			printf '  %s\n' "${WATCH_EVENTS[@]}"
+			hdr "while you were watching"
+			for ev in "${WATCH_EVENTS[@]}"; do
+				IFS=$'\t' read -r ets ecol emsg <<< "$ev"
+				printf '  %s%s%s  %s%s%s\n' "$C_DIM" "$ets" "$C_RESET" "$ecol" "$emsg" "$C_RESET"
+			done
 		fi
 		if [ "$WATCH_RING" = 1 ] && [ "$bell" = 1 ]; then printf '\a'; fi
 		WATCH_RING=0
@@ -714,7 +880,7 @@ prereview() {
 
 merge() {
 	[ $# -ge 1 ] || die "merge needs a box name"
-	local box="$1" squash="" edit="" a ref msg
+	local box="$1" squash="" edit="" single="" a ref msg
 	shift
 	for a in "$@"; do
 		case "$a" in
@@ -751,7 +917,16 @@ merge() {
 		die "refusing to merge onto a stale $DEV"
 	fi
 
-	echo "cbx: merging refs/agents/$box ($(git_ rev-list --count "$DEV..$ref") commit(s)) into $DEV"
+	local ncommits
+	ncommits="$(git_ rev-list --count "$DEV..$ref")"
+	echo "cbx: merging refs/agents/$box ($ncommits commit(s)) into $DEV"
+	# `--edit` on a single commit means "let me fix up that commit's message" — a merge commit wrapping
+	# one commit is pure noise there, and having to remember `--squash` for it is a papercut. So take
+	# the squash path and seed the editor with the agent's own message (see below).
+	if [ -n "$edit" ] && [ -z "$squash" ] && [ "$ncommits" = 1 ]; then
+		squash=1 single=1
+		echo "cbx: one commit — landing it directly (no merge commit); its message is what you'll edit"
+	fi
 	git_ checkout -q "$DEV"
 	before="$(git_ rev-parse HEAD)"
 	# --edit opens an editor on the message. For a squash that message is git's SQUASH_MSG, which
@@ -763,10 +938,19 @@ merge() {
 	if [ -n "$squash" ]; then
 		git_ merge --squash "$ref" || die "merge conflicts — resolve in $REPO, then commit"
 		if [ -n "$edit" ]; then
-			# Append the trailer to SQUASH_MSG so it's in the buffer you edit (and can be removed).
-			printf '\n%s\n' "Cbx-Box: $box" >> "$REPO/.git/SQUASH_MSG"
-			"${ed[@]}" git -C "$REPO" commit \
-				|| die "commit aborted (empty message?) — the squash is staged, finish it in $REPO"
+			if [ -n "$single" ]; then
+				# One commit: SQUASH_MSG's "Squashed commit of the following:" preamble is noise, so
+				# open the commit's own message instead — you are editing that commit, not summarising.
+				"${ed[@]}" git -C "$REPO" commit -e \
+					--author="$(git_ log -1 --format='%an <%ae>' "$ref")" \
+					-m "$(git_ log -1 --format=%B "$ref")" -m "Cbx-Box: $box" \
+					|| die "commit aborted (empty message?) — the change is staged, finish it in $REPO"
+			else
+				# Append the trailer to SQUASH_MSG so it's in the buffer you edit (and can be removed).
+				printf '\n%s\n' "Cbx-Box: $box" >> "$REPO/.git/SQUASH_MSG"
+				"${ed[@]}" git -C "$REPO" commit \
+					|| die "commit aborted (empty message?) — the squash is staged, finish it in $REPO"
+			fi
 		else
 			git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
 		fi
@@ -878,7 +1062,13 @@ pull() {
 }
 
 push() {
-	local ahead behind
+	local ahead behind yes="" a reply
+	for a in "$@"; do
+		case "$a" in
+			-y|--yes) yes=1 ;;
+			*) die "push: unknown option '$a' (-y | --yes)" ;;
+		esac
+	done
 	read -r behind ahead <<< "$(divergence)"
 	[ "$behind" = 0 ] || die "origin has $behind commit(s) $DEV doesn't — run 'cbx pull' (or 'cbx pull --rebase') first"
 	# Don't report "pushed" when there was nothing to push — that reads as "my merge went out" when
@@ -887,6 +1077,21 @@ push() {
 		echo "cbx: nothing to push — $DEV already matches origin ($(git_ rev-parse --short "$DEV"))."
 		echo "cbx: expecting an agent's work here? It is merged only after 'cbx merge <box>' succeeds — check 'cbx q'."
 		return 0
+	fi
+	# Show exactly what leaves the hub before it leaves. A push is the one irreversible step in the
+	# loop (agents' work is public from here on), and it is easy to have merged more than you meant —
+	# so the per-commit --stat is the last chance to notice a stray file or a second box's work.
+	echo "cbx: $ahead commit(s) would go to origin/$DEV:"
+	# `|| true`: quitting the pager early SIGPIPEs git, and pipefail would otherwise abort the push
+	# right there — pressing 'q' must mean "seen enough", not "cancelled".
+	git_ log --stat --oneline "origin/$DEV..$DEV" | review_pager || true
+	# Only ask when someone is there to answer: piped/cron use keeps the old non-interactive behaviour.
+	if [ -z "$yes" ] && [ -t 0 ] && [ -t 1 ]; then
+		read -r -p "cbx: push these $ahead commit(s) to origin/$DEV? [y/N] " reply
+		case "$reply" in
+			y|Y|yes|YES) ;;
+			*) echo "cbx: not pushed ($DEV is unchanged; nothing was sent)"; return 1 ;;
+		esac
 	fi
 	echo "cbx: pushing $DEV ($ahead commit(s) ahead of origin) -> $(git_ remote get-url origin)"
 	if git_ push origin "$DEV"; then
@@ -1101,7 +1306,9 @@ case "$cmd" in
 			--text|--once|-1) queue ;;
 			*) watch_queue "$@" ;;   # falls back to the one-shot table when stdout is not a terminal
 		esac ;;
-	status|st) status_overview ;;
+	# Colour auto-detects here: `cbx status | less` or a redirect gets plain text, a terminal gets the
+	# same rendering as the live dashboard. CBX_COLOR=always|never overrides.
+	status|st) colors_init; status_overview ;;
 	review)   review "$@" ;;
 	fix)      fix "$@" ;;
 	prereview) prereview "$@" ;;
@@ -1111,7 +1318,7 @@ case "$cmd" in
 	export)   export_patch "$@" ;;
 	import)   import_patch "$@" ;;
 	pull)     pull "$@" ;;
-	push)     push ;;
+	push)     push "$@" ;;
 	golden)
 		sub="${1:-}"; shift || true
 		case "$sub" in
@@ -1121,5 +1328,5 @@ case "$cmd" in
 			reap)     golden_reap ;;
 			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap" ;;
 		esac ;;
-	*) sed -n '4,48p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	*) sed -n '4,52p' "$0" | sed 's/^# \?//'; exit 1 ;;
 esac
