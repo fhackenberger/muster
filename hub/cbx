@@ -233,6 +233,7 @@ act_color() {
 # Same idea for the review queue: green/magenta = your move, cyan = ready to land, dim = done.
 q_color() {
 	case "$1" in
+		merged)    printf '%s' "$C_B$C_CYA" ;;
 		new)       printf '%s' "$C_B$C_MAG" ;;
 		re-review) printf '%s' "$C_YEL" ;;
 		reviewed)  printf '%s' "$C_B$C_GRN" ;;
@@ -504,12 +505,18 @@ rebase_only() {
 	[ -n "$old" ] && [ "$old" = "$new" ]
 }
 
-# new | reviewed | rebased | re-review
+# merged | new | reviewed | rebased | re-review
 box_status() {
 	local box="$1" sha prev
 	sha="$(git_ rev-parse "refs/agents/$box")"
 	prev="$(reviewed_ref "$box")"
-	if [ -z "$prev" ]; then echo new
+	# Nothing on top of $DEV = this branch is already contained in it: it was merged, and only the ref
+	# and the review state were left behind (a conflicted `cbx merge` that you finished by hand does
+	# exactly that). Say so FIRST — otherwise the box sits in the queue as 'new' or 're-review'
+	# forever, `cbx review` has an empty range to show, and there is no obvious way out.
+	if [ "$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo 1)" = 0 ]; then
+		echo merged
+	elif [ -z "$prev" ]; then echo new
 	elif [ "$prev" = "$sha" ]; then echo reviewed
 	elif rebase_only "$box"; then echo rebased
 	else echo re-review
@@ -625,11 +632,15 @@ status_overview() {
 				"$nw" "" "$C_B$C_RED" "$other" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#other}))" "$conf")"
 		done
 		case "$st" in
+			merged)        act="cbx merge $box            # already in $DEV — retires the branch, tells the box" ;;
 			new|re-review) act="cbx review $box" ;;
 			rebased)       act="cbx merge $box            # rebased only, nothing new to read" ;;
 			reviewed)      act="cbx merge $box" ;;
 			*)             act="" ;;
 		esac
+		# 'merged' outranks the conflict check below: there is nothing left to rebase or review, and
+		# the conflict is against work of its own that already landed.
+		if [ "$st" = merged ]; then todo+=("$act"); continue; fi
 		# ORDER MATTERS HERE — this list is read as "do the top one next".
 		#
 		# A branch that CONFLICTS with $DEV has to rebase before anything else: the rebase rewrites the
@@ -1029,6 +1040,14 @@ review() {
 	sha="$(git_ rev-parse "$ref")"
 	prev="$(reviewed_ref "$box")"
 	mkdir -p "$STATE"
+	# Nothing on top of $DEV: the work is already in, so there is no diff to show. Without this you get
+	# an empty range-diff ("1: abc123 < -: ---------") and no hint that the way out is a merge that
+	# only does bookkeeping.
+	if [ "$(git_ rev-list --count "$DEV..$ref")" = 0 ]; then
+		echo "cbx: $box has nothing on top of $DEV — its work is already merged."
+		echo "cbx: nothing to review. Retire the branch and tell the box with: cbx merge $box"
+		return 0
+	fi
 	# A rebase rewrites every sha, so the branch looks changed even when the agent added nothing. Say
 	# so up front — otherwise the range-diff below (one '=' line per carried-over commit) reads like
 	# new work you have to re-read.

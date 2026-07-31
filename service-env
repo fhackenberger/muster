@@ -64,7 +64,7 @@ REDIS_PORT=6379
 # only translates '.' and '-' to '_' when matching a property name against the environment. Use
 # SPRING_APPLICATION_JSON — a high-precedence property source whose keys are taken literally. Put ALL
 # such properties in this ONE variable; a second SPRING_APPLICATION_JSON line would replace the first.
-#SPRING_APPLICATION_JSON={"AnonymousLogin/enabled":"true","AnonymousLogin/isDefault":"true","AnonymousLogin/userId":"1"}
+#SPRING_APPLICATION_JSON={"AnonymousLogin/enabled":"true","AnonymousLogin/isDefault":"true","AnonymousLogin/userId":"1","AnonymousLogin/password":"secret"}
 
 # ---- API keys (fill in, or let Ansible template them from the vault) ----
 FRONTEND_GOOGLE_MAPS_API_KEY=

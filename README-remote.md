@@ -549,6 +549,10 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   this holds with or without `--squash`, and the agent stays the author. **Several commits** open all
   of them verbatim and unindented, separated by a `# ── 2/3 · <sha> ──` banner; git drops `#` lines on
   save, so leaving the buffer untouched gives you the messages one blank line apart and no banners.
+- **A branch whose work is already in `dev` shows up as `merged`.** `cbx q` lists it with `0` ahead and
+  the one action that applies (`cbx merge <box>` — which does only bookkeeping), and `cbx review <box>`
+  says so instead of paging an empty range-diff at you. Without that, a box left over from a
+  hand-finished merge sits in the queue as `re-review` forever with no way out.
 - **A conflicted `cbx merge` is finished by re-running it.** When the merge hits conflicts, cbx stops
   and leaves them in the hub's repo for you — which means it also never got to retire
   `refs/agents/<box>` or clear the review state. So after you resolve and commit, run **`cbx merge
