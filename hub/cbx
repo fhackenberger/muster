@@ -543,7 +543,7 @@ status_overview() {
 	#
 	# `cbx q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
 	# is the origin fetch, which `--no-fetch` skips (the watch loop throttles it to $WATCH_FETCH).
-	local behind ahead box sha st bhd ahd age note conf other list running gprov gsha todo=()
+	local behind ahead box sha st bhd ahd age note conf dconf act other list running gprov gsha todo=()
 	local cols nw=3 sumw rows=() row bname bstatus bgolden bstate bage detail
 
 	cols="$(term_cols)"
@@ -607,9 +607,11 @@ status_overview() {
 		# Conflicts are the shared-checkout collision awareness, moved earlier: you learn that two
 		# agents touched the same lines when they push, not when you merge the second one.
 		# 22 = the two-space indent, the space after the name column, and "⚠ conflicts with <x>: ".
-		conf="$(conflicts_between "$DEV" "refs/agents/$box")"
-		[ -n "$conf" ] && printf '  %*s %s⚠ conflicts with %s:%s %s\n' \
-			"$nw" "" "$C_B$C_RED" "$DEV" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#DEV}))" "$conf")"
+		# Kept in its own variable: `conf` is reused by the box-vs-box loop below, and the suggestion
+		# built afterwards needs to know specifically whether this branch collides with $DEV.
+		dconf="$(conflicts_between "$DEV" "refs/agents/$box")"
+		[ -n "$dconf" ] && printf '  %*s %s⚠ conflicts with %s:%s %s\n' \
+			"$nw" "" "$C_B$C_RED" "$DEV" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#DEV}))" "$dconf")"
 		for other in $list; do
 			[ "$other" = "$box" ] && continue
 			[[ "$other" > "$box" ]] || continue          # report each pair once
@@ -618,11 +620,27 @@ status_overview() {
 				"$nw" "" "$C_B$C_RED" "$other" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#other}))" "$conf")"
 		done
 		case "$st" in
-			new|re-review) todo+=("cbx review $box") ;;
-			rebased)       todo+=("cbx merge $box            # rebased only, nothing new to read") ;;
-			reviewed)      todo+=("cbx merge $box") ;;
+			new|re-review) act="cbx review $box" ;;
+			rebased)       act="cbx merge $box            # rebased only, nothing new to read" ;;
+			reviewed)      act="cbx merge $box" ;;
+			*)             act="" ;;
 		esac
-		[ "$bhd" != 0 ] && [ "$bhd" != '?' ] && todo+=("cbx rebase $box           # $bhd commit(s) behind $DEV")
+		# ORDER MATTERS HERE — this list is read as "do the top one next".
+		#
+		# A branch that CONFLICTS with $DEV has to rebase before anything else: the rebase rewrites the
+		# very lines you would be reading, so a review done first is read twice, and `cbx merge` would
+		# stop halfway through with conflicts in the hub's worktree. So the rebase replaces the
+		# review/merge suggestion rather than trailing it — reviewing is not the next step, it is the
+		# step after. Merely being BEHIND is different: the patches still apply, so the review stands
+		# and the rebase is the follow-up (cheap, and `cbx merge` does it for you anyway).
+		if [ -n "$dconf" ]; then
+			todo+=("cbx rebase $box           # CONFLICTS with $DEV — rebase before reviewing/merging")
+		else
+			if [ -n "$act" ]; then todo+=("$act"); fi
+			if [ "$bhd" != 0 ] && [ "$bhd" != '?' ]; then
+				todo+=("cbx rebase $box           # $bhd commit(s) behind $DEV")
+			fi
+		fi
 	done
 
 	hdr boxes
@@ -916,13 +934,30 @@ review_session_guess() {
 		| sort_by(.updated_at) | last | .slug // empty' 2>/dev/null || true
 }
 
-# THE CONFIRM STEP: show what you wrote, and only then let it reach the agent. Nothing is sent by
-# quitting the TUI — send is an explicit 's' here, so a review you abandoned halfway stays yours.
-review_confirm_send() {
-	local box="$1" slug="$2" md ids tmp ans
-	review_harvest "$slug" "$box"
+# "You have looked at this branch, up to <sha>, while $DEV was at <sha>." Drives the queue status
+# (new / re-review / reviewed) and the incremental range-diff.
+mark_reviewed() { printf '%s %s' "$2" "$(git_ rev-parse "$DEV")" > "$STATE/$1.reviewed"; }
+
+# THE CONFIRM STEP, and the ONLY place a TUI review becomes real. Quitting the TUI decides nothing:
+# not whether the comments are sent, and not whether the review is recorded at all. That matters
+# because "I opened it, looked at the first hunk and backed out" has to be indistinguishable from
+# never having run `cbx review` — otherwise the box silently leaves the 'new' queue and you lose the
+# one signal that says nobody has read this yet.
+review_finish() {
+	local box="$1" sha="$2" slug="$3" md ids tmp ans
+	if [ -z "$slug" ]; then REVIEW_MD=""; REVIEW_IDS=""; else review_harvest "$slug" "$box"; fi
 	md="$REVIEW_MD"; ids="$REVIEW_IDS"
-	[ -n "$md" ] || { echo "cbx: no new comments in the review — nothing to send."; return 0; }
+	if [ -z "$md" ]; then
+		# Nothing written. Still a decision: reviewed-and-happy, or "I did not really look".
+		printf 'cbx: no comments. [m]ark %s reviewed  [l]eave it unreviewed ? ' "$box"
+		read -r ans </dev/tty || ans=l
+		case "$ans" in
+			l|L) echo "cbx: left alone — $box is still '$(box_status "$box")'." ;;
+			*)   mark_reviewed "$box" "$sha"
+			     echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx merge $box | cbx fix $box -m '...' | cbx drop $box" ;;
+		esac
+		return 0
+	fi
 	while :; do
 		echo
 		printf '%s── feedback for %s ───────────────────────────────%s\n' "$C_B$C_CYA" "$box" "$C_RESET"
@@ -930,6 +965,7 @@ review_confirm_send() {
 		printf '%s──────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
 		printf '[s]end to %s  [e]dit  [d]iscard ? ' "$box"
 		read -r ans </dev/tty || ans=d
+		# NB an EOF/read failure lands on 'd' — the option that changes nothing.
 		case "$ans" in
 			s|S|"")
 				guard_busy "$box" || { echo "cbx: not sent — the review is still saved, re-run 'cbx review $box'."; return 1; }
@@ -942,6 +978,7 @@ Please address each point on your branch, then run: handoff" \
 					     echo "cbx: the review is still saved; re-run 'cbx review $box' to retry." >&2; return 1; }
 				# Sent = consumed, recorded HERE rather than by touching tuicr's store (see review_harvest).
 				if [ -n "$ids" ]; then printf '%s\n' "$ids" >> "$STATE/$box.sent"; fi
+				mark_reviewed "$box" "$sha"
 				echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
 				return 0
 				;;
@@ -955,8 +992,12 @@ Please address each point on your branch, then run: handoff" \
 				[ -n "${md//[[:space:]]/}" ] || { echo "cbx: emptied — nothing to send."; return 0; }
 				;;
 			d|D)
-				echo "cbx: not sent. The comments stay in tuicr — 're-run cbx review $box' to pick them up,"
-				echo "     or drop them with: tuicr review list --repo $REPO"
+				# Deliberately records NOTHING: no feedback to the box and no .reviewed, so the queue
+				# looks exactly as it did before you ran `cbx review`. The comments stay in tuicr, so
+				# re-running it picks the same review back up.
+				echo "cbx: nothing sent, nothing recorded — $box is still '$(box_status "$box")'."
+				echo "     Your comments stay in tuicr; 'cbx review $box' picks them up again."
+				echo "     To throw them away: tuicr review list --repo $REPO   (then delete that session's file)"
 				return 0
 				;;
 			*) echo "cbx: answer s (send), e (edit) or d (discard)." ;;
@@ -1016,18 +1057,32 @@ review() {
 	fi
 
 	if [ -n "$use_tui" ]; then
-		if run_review_tui "$DEV..$ref"; then
-			printf '%s %s' "$sha" "$(git_ rev-parse "$DEV")" > "$STATE/$box.reviewed"
+		# THE FORK POINT, not $DEV. A TUI's `A..B` is a two-dot DIFF (`git diff A B`), not git's
+		# commit-range: point it at `$DEV..$ref` while the agent is behind and it renders everything
+		# $DEV gained since the fork as REMOVED by the agent — a one-commit branch showed up as 309
+		# changed files. Diffing from the merge base is what `git diff $DEV...$ref` (and every code
+		# review UI) shows: what this branch ADDS, independent of how far $DEV has moved. The two are
+		# identical when the branch is up to date, so this only ever removes noise.
+		local base rc=0 slug
+		base="$(git_ merge-base "$DEV" "$ref" 2>/dev/null || true)"
+		[ -n "$base" ] || base="$DEV"      # unrelated histories: nothing better to offer
+		run_review_tui "$base..$ref" || rc=$?
+		# Interrupted (Ctrl-C, SIGHUP, the terminal going away) is NOT a broken TUI: you bailed out.
+		# Fall through to neither the pager nor the confirm step, and leave the queue untouched.
+		if [ "$rc" -ge 128 ]; then
+			echo "cbx: review interrupted — nothing sent, nothing recorded ($box is still '$(box_status "$box")')."
+			return 0
+		fi
+		if [ "$rc" -eq 0 ]; then
 			if tui_is_tuicr; then
-				local slug="$TUI_SESSION"
+				slug="$TUI_SESSION"
 				[ -n "$slug" ] || slug="$(review_session_guess)"
-				if [ -n "$slug" ]; then
-					review_confirm_send "$box" "$slug" || true
-				else
-					echo "cbx: no comments in the review — nothing to send."
-				fi
+				review_finish "$box" "$sha" "$slug"
+			else
+				# A viewer with no comments to harvest: nothing to confirm, so record it like the pager.
+				mark_reviewed "$box" "$sha"
+				echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
 			fi
-			echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
 			return 0
 		fi
 		echo "cbx: falling back to the plain pager." >&2
@@ -1066,7 +1121,9 @@ review() {
 		fi
 	} | review_pager
 
-	printf '%s %s' "$sha" "$(git_ rev-parse "$DEV")" > "$STATE/$box.reviewed"
+	# The pager has nothing to confirm, so it still records on exit (unchanged behaviour). Only the
+	# TUI path asks first — that is where "I opened it and backed out" is a thing that happens.
+	mark_reviewed "$box" "$sha"
 	echo
 	echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
 }

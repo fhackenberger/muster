@@ -436,6 +436,10 @@ cbxexec() {
 # seconds (default 60); every Tab inside that window is a local `awk`. `cbxrefresh` busts the cache
 # when you have just spawned or killed a box and don't want to wait the TTL out.
 #
+# Once there IS a cache, Tab never waits again: an expired cache is still used for the answer and the
+# refetch is detached into the background for the NEXT Tab (see _cbx_refresh_bg). Only the very first
+# completion in a terminal — with no cache file to answer from — goes over the wire synchronously.
+#
 # The fetch asks the HUB, not docker, for boxes: `cbx ls` gets its list from the broker (authoritative
 # — it knows boxes docker naming conventions wouldn't reveal), and refs/agents/* adds boxes that are
 # no longer running but still have a handoff waiting for review, which is exactly when you want to
@@ -485,9 +489,45 @@ docker exec "$hub" git -C /home/dev/repo for-each-ref --format='box %(refname:st
 REMOTE
 }
 
-# Cached names, refreshed when the file is older than the TTL. A failed fetch leaves the old cache in
-# place (the write goes to .tmp and is only moved on success), so a brief network blip doesn't wipe
-# completion — and the mv is atomic, so a concurrent Tab never reads a half-written file.
+# Refresh the cache in the BACKGROUND, for the next Tab. Detached from this shell entirely, so the
+# completion that triggered it returns immediately.
+#
+# The lock is a directory because mkdir is the atomic test-and-set every filesystem agrees on: hold
+# Tab down and you get ONE refresher, not one per keystroke. It is also stale-swept — a shell killed
+# mid-fetch would otherwise leave the lock behind and no Tab would ever refresh again, which is the
+# worst kind of bug here (silent, permanent, and it looks like the server is stuck).
+_cbx_refresh_bg() {
+	local f="$1" lock now lockage
+	lock="$f.lock"
+	now=$(date +%s)
+	if [ -d "$lock" ]; then
+		lockage=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo "$now")
+		[ "$((now - lockage))" -lt 120 ] && return 0     # a refresh really is in flight
+		rmdir "$lock" 2>/dev/null                        # …or a dead one left this behind
+	fi
+	mkdir "$lock" 2>/dev/null || return 0
+	# Stamp the cache NOW so the Tabs during this fetch see a fresh file and don't queue more work.
+	touch "$f" 2>/dev/null
+	{
+		if _cbx_complete_fetch > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
+			mv -f "$f.tmp" "$f"
+		else
+			rm -f "$f.tmp"
+		fi
+		rmdir "$lock" 2>/dev/null
+	} >/dev/null 2>&1 &
+	disown 2>/dev/null || true
+	return 0
+}
+
+# Cached names. CACHE FIRST: if we have a list at all, Tab answers from it immediately and any refresh
+# happens in the background — so exactly one Tab in the life of a terminal can ever block on ssh (the
+# first, when there is nothing to answer with). The old behaviour re-fetched synchronously the moment
+# the TTL expired, which meant a laggy Tab every minute for a list that changes when YOU spawn a box.
+#
+# A failed fetch leaves the old cache in place (the write goes to .tmp and is only moved on success),
+# so a brief network blip doesn't wipe completion — and the mv is atomic, so a concurrent Tab never
+# reads a half-written file.
 _cbx_complete_cache() {
 	local f now mtime
 	[ -n "${CBX_SERVER:-}" ] && [ -n "${CBX_PROJECT:-}" ] || return 0
@@ -496,7 +536,8 @@ _cbx_complete_cache() {
 	mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
 	# -e, not -s: a failed fetch leaves an EMPTY cache file behind on purpose (see the touch below), and
 	# testing for size would make every keystroke retry the ssh that just failed.
-	if [ ! -e "$f" ] || [ "$((now - mtime))" -ge "$CBX_COMPLETE_TTL" ]; then
+	if [ ! -e "$f" ]; then
+		# Cold start only: nothing to complete from, so this one has to wait for the wire.
 		_cbx_progress on
 		if _cbx_complete_fetch > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
 			mv -f "$f.tmp" "$f"
@@ -505,6 +546,8 @@ _cbx_complete_cache() {
 			touch "$f" 2>/dev/null   # don't retry the failing ssh on every keystroke
 		fi
 		_cbx_progress off
+	elif [ "$((now - mtime))" -ge "$CBX_COMPLETE_TTL" ]; then
+		_cbx_refresh_bg "$f"         # answer from what we have; the next Tab gets the new list
 	fi
 	cat "$f" 2>/dev/null
 }

@@ -326,13 +326,17 @@ and **live box names** for `cbx review|merge|drop|fix|rebase|kill|recreate|…`,
 names complete for `cbx up|down|logs`.
 
 Names live on the server, so they are fetched once over ssh and cached for **`CBX_COMPLETE_TTL`**
-seconds (default 60) — every Tab inside that window is local. Run **`cbxrefresh`** after spawning or
-killing a box rather than waiting the TTL out. The box list comes from the broker (via `cbx ls`) plus
+seconds (default 60). **Tab never waits on the network once that cache exists**: past the TTL the
+cached list still answers immediately and the refetch is detached into the background for the *next*
+Tab. Only the very first completion in a terminal — with nothing to answer from — goes over the wire
+synchronously. Run **`cbxrefresh`** after spawning or killing a box when you want the new name now
+rather than one Tab later. Concurrent refreshes are collapsed by a lock (held at most 120s, so a
+shell killed mid-fetch can't wedge completion permanently). The box list comes from the broker (via `cbx ls`) plus
 `refs/agents/*`, so a box that is no longer running but still has a handoff waiting still completes
 for `cbx review`. A server that is down or wants a password never hangs your Tab: the fetch is
 `BatchMode` with a 5s timeout, and on failure the previous cache stands.
 
-On the one Tab in sixty that does go over the wire, the terminal's own **progress indicator** turns on
+On the one cold-start Tab that does go over the wire, the terminal's own **progress indicator** turns on
 for the duration (OSC `9;4`, indeterminate — Ghostty, WezTerm, Windows Terminal, ConEmu; others ignore
 it silently). It has to be the terminal's indicator rather than a printed message, because readline
 owns the command line while a completion function runs and anything written into the display is
@@ -519,7 +523,12 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   (`CBX_WATCH_INTERVAL`), `--no-bell` mutes it. Piped or redirected output is never watched — it
   prints the table once, exactly like `--text`.
 - **`cbx review` opens a review TUI** — [tuicr](https://tuicr.dev), installed into the hub image by
-  `common-setup.sh` — on `dev..refs/agents/<box>`. Scroll the diff (`j`/`k`, `]` next hunk, `{`/`}`
+  `common-setup.sh` — on the branch's work since it **forked** from `dev`
+  (`$(git merge-base dev refs/agents/<box>)..refs/agents/<box>`, i.e. what `git diff dev...<box>`
+  shows). The fork point rather than `dev` itself, because a TUI's `A..B` is a two-dot *diff*, not
+  git's commit range: aimed at `dev..<box>` while the agent is behind, it renders everything `dev`
+  gained since the fork as deleted by the agent — a one-commit branch came out as 309 changed files.
+  Scroll the diff (`j`/`k`, `]` next hunk, `{`/`}`
   next file), press `c` on a line or `v`…`c` over a range to leave a comment, `C` for a file-level one,
   `?` for the full keymap. Quit with `q` and cbx reads the comments back out. See *The confirm step*
   below — nothing reaches the agent until you say so.
@@ -562,12 +571,21 @@ session, prints them as the markdown the agent would receive, and asks:
 ```
 
 - **`s`** delivers it into the box's claude session (the same one-way channel `cbx fix` uses) with
-  "Please address each point on your branch, then run: handoff" appended. Refused while the agent is
-  `busy`, like every other command that types at an agent.
+  "Please address each point on your branch, then run: handoff" appended, and records the review.
+  Refused while the agent is `busy`, like every other command that types at an agent.
 - **`e`** opens the text in `$EDITOR` first — reword, delete a point, add one the TUI had no anchor
   for. What you save is what is sent.
-- **`d`** sends nothing. The comments stay in tuicr, so re-running `cbx review <box>` picks the same
-  review back up where you left it.
+- **`d`** does **nothing at all**: no feedback, and no review recorded — the queue looks exactly as it
+  did before you ran `cbx review`, so the box stays `new`. The comments stay in tuicr, so re-running
+  `cbx review <box>` picks the same review back up where you left it.
+
+**Quitting the TUI decides nothing.** The prompt is the only place a review becomes real, which is
+what makes "I opened it, read one hunk and backed out" indistinguishable from never having run
+`cbx review` — otherwise the box quietly leaves the `new` queue and you lose the one signal that says
+nobody has read this yet. Interrupting the TUI (Ctrl-C) is treated the same way: nothing sent,
+nothing recorded, no fallback to the pager. If you left no comments at all, the prompt is just
+`[m]ark <box> reviewed / [l]eave it unreviewed`. (`--plain` is unchanged — the pager has nothing to
+confirm, so it still records on exit.)
 
 Two details worth knowing:
 
