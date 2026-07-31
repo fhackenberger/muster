@@ -238,12 +238,23 @@ REMOTE
 #
 #   cbxfe work1        -> http://localhost:4211 serves box 'work1' ng serve
 #
-# Two forwards are needed, not one. The page comes from the box's dev server, but its JS calls
-# FRONTEND_DEV_BACKEND_URL — which claude-box.sh points at that box's BACKEND port-forward on the
-# hub loopback (http://localhost:<8900+slot>). Your BROWSER resolves that URL, so the same port has
-# to exist on your laptop and lead to that box's backend. We read the box's own
-# PORT_FORWARD_BACKEND_TO_HUB to learn the number, then tunnel it straight to the box (the hub-side
-# socat binds the hub's loopback, which ssh -L cannot reach).
+# More than one forward is needed. The page comes from the box's dev server, but its JS calls
+# FRONTEND_DEV_BACKEND_URL — and YOUR BROWSER resolves that URL, so whatever host:port it names has to
+# exist on your laptop and lead to the right backend. There are two possibilities and the agent picks
+# freely between them at runtime, so we tunnel BOTH rather than make you guess:
+#   * the HUB's backend            -> http://localhost:8091   (the default)
+#   * the box's OWN backend        -> http://localhost:<8900+slot>, i.e. that box's BACKEND
+#                                     port-forward, which is what $FRONTEND_DEV_BACKEND_URL_OWN is
+# Getting this wrong is not obvious from the browser: the page loads fine and only its API calls fail
+# (ERR_CONNECTION_REFUSED on e.g. http://localhost:8904/infostarsWeb/rest/config), which reads like a
+# broken backend rather than a missing tunnel. Hence: forward both, always.
+#
+# We read the box's own PORT_FORWARD_BACKEND_TO_HUB to learn the 8900+slot number, then tunnel it
+# straight to the BOX (the hub-side socat binds the hub's loopback, which ssh -L cannot reach). The
+# two backend ports never collide, so both can be up at once.
+#
+# --own tunnels ONLY the box's own backend, leaving :8091 free on your laptop — for when you are
+# running a backend of your own there and cannot give the port up.
 #
 # Ports come from service-env: FRONTEND_DEV_PORT / SERVER_PORT. Override per call with
 # CBX_FRONTEND_PORT / CBX_BACKEND_PORT if a stack uses different ones.
@@ -251,20 +262,22 @@ cbxfe() {
 	_cbx_need_server || return 1
 	local box="" own="" a fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
 	for a in "$@"; do case "$a" in --own) own=1 ;; *) box="$a" ;; esac; done
-	[ -n "$box" ] || { echo "usage: cbxfe <box> [--own]   (--own = the box's own backend tunnel)" >&2; return 1; }
-	if [ -z "$own" ]; then
-		# Default, matching the default setup: the page comes from the box, the backend from the HUB.
-		echo "cbxfe: $box -> frontend :$fe, backend :$be (hub)" >&2
-		cbxtun "${box}:${fe}" "hub:${be}"
-		return
-	fi
-	# --own: the agent switched FRONTEND_DEV_BACKEND_URL to its box's own backend, so its JS asks for
-	# localhost:<8900+slot>. Tunnel that port straight to the box (the hub-side socat binds the hub's
-	# loopback, which ssh -L cannot reach).
+	[ -n "$box" ] || { echo "usage: cbxfe <box> [--own]   (--own = the box's own backend only, no :$be)" >&2; return 1; }
+	# The box's own BACKEND forward (8900+slot). Set on every running box by claude-box.sh, so an empty
+	# result means the box isn't up rather than that it has no such backend.
 	hubport=$(ssh "$CBX_SERVER" "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' box-${CBX_PROJECT}-${box} 2>/dev/null | sed -n 's/^PORT_FORWARD_BACKEND_TO_HUB=//p'")
-	[ -n "$hubport" ] || { echo "cbxfe: no BACKEND forward for '$box' (is it running?)" >&2; return 1; }
-	echo "cbxfe: $box -> frontend :$fe, backend :$hubport (the box's own)" >&2
-	cbxtun "${box}:${fe}" "${hubport}:${box}:${be}"
+	local -a specs=("${box}:${fe}"); local desc=""
+	[ -n "$own" ] || { specs+=("hub:${be}"); desc=" :${be} (hub)"; }
+	if [ -n "$hubport" ]; then
+		specs+=("${hubport}:${box}:${be}"); desc="${desc} :${hubport} (the box's own)"
+	elif [ -n "$own" ]; then
+		echo "cbxfe: no BACKEND forward for '$box' (is it running?)" >&2; return 1
+	else
+		# Non-fatal: the hub backend is still tunneled, and that is the URL the frontend uses by default.
+		echo "cbxfe: no BACKEND forward for '$box' (is it running?) — tunneling the hub backend only" >&2
+	fi
+	echo "cbxfe: $box -> frontend :$fe, backend${desc}" >&2
+	cbxtun "${specs[@]}"
 }
 
 # take new commits from origin onto the dev branch, then tell every agent to re-base on them:

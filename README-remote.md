@@ -264,10 +264,14 @@ That gives you:
 - **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql infotrack_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
 - **`cbxfe <box>` / `cbxfe <box> --own`** — project shorthand: open **one agent's** frontend at
-  `http://localhost:4211`, with the **hub's** backend tunnelled alongside it (the default setup).
-  `--own` tunnels that box's own backend instead, for an agent that switched
-  `FRONTEND_DEV_BACKEND_URL` to `$FRONTEND_DEV_BACKEND_URL_OWN`. Two forwards either way, because
-  that URL is resolved by your browser, not by the box.
+  `http://localhost:4211`, with **both** candidate backends tunnelled alongside it — the hub's
+  (`:8091`, the default) *and* that box's own (`:<8900+slot>`, what `$FRONTEND_DEV_BACKEND_URL_OWN`
+  points at). Several forwards, because `FRONTEND_DEV_BACKEND_URL` is resolved by **your browser**,
+  not by the box, and the agent may have switched it to its own backend at any point. Tunnelling both
+  means you never have to know which: a missed one shows up only as failing API calls
+  (`ERR_CONNECTION_REFUSED` on e.g. `http://localhost:8904/infostarsWeb/rest/config`) on a page that
+  otherwise loads fine. `--own` tunnels *only* the box's own backend, leaving `:8091` free on your
+  laptop for a backend of your own.
 - **`cbxsync [--rebase]`** — take new origin commits onto the dev branch (`cbx pull`) and then tell
   every agent to rebase onto them (`cbx rebase all`). Skips the notify if the pull hit conflicts.
 - **`cbxexport <box>`** — pull an agent's work down as **one squashed commit** on your current branch

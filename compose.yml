@@ -28,6 +28,9 @@ services:
   db:
     image: ${DB_IMAGE:-dockerregistry.acoveo.com/infostars/dbtest:latest}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
+    # The anonymised dev data dump, available inside the container for data/reset-db.sh to import.
+    volumes:
+      - ./db-init/infostars_filtered_data_dump.sql.gz:/db-init/infostars_filtered_data_dump.sql.gz:ro
     restart: unless-stopped
 
   activemq:
