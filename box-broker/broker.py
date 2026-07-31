@@ -738,6 +738,39 @@ def box_say(name, text):
 	return {"box": name, "sent": text}
 
 
+def box_paste(name, text):
+	"""Deliver a MULTI-LINE message into the box's claude session as a single prompt. Also a FIXED
+	command pair, like /say — the payload is data, never a shell.
+
+	send-keys (box_say) cannot do this: claude submits the prompt on every newline it receives, so an
+	N-line review would arrive as N separate half-prompts, each acted on before the next lands. The
+	fix is the same one your terminal uses for a real paste — bracketed paste: `load-buffer` puts the
+	text in a tmux buffer, `paste-buffer -p` wraps it in the ESC[200~ / ESC[201~ markers that tell
+	claude "this is pasted text, not typing", and the whole block goes into the composer intact. The
+	Enter afterwards is then the only thing that submits it.
+
+	-b cbx names the buffer (so a paste never disturbs your own tmux buffer stack) and -d drops it
+	once pasted. Trailing newlines are stripped: they would land as blank lines before the submit.
+
+	-p only emits the markers when the pane's application has ENABLED bracketed paste (DECSET 2004),
+	which claude does. If some other program is in the window it degrades to a plain paste — i.e. to
+	exactly what /say does today — so this is never worse than the alternative."""
+	c = box_container(name)
+	r = subprocess.run(["docker", "exec", "-i", "-u", "dev", c,
+	                    "tmux", "load-buffer", "-b", "cbx", "-"],
+	                   input=text.rstrip("\n"), capture_output=True, text=True)
+	if r.returncode != 0:
+		raise RuntimeError(r.stderr.strip() or "load-buffer failed")
+	r = subprocess.run(["docker", "exec", "-u", "dev", c,
+	                    "tmux", "paste-buffer", "-d", "-p", "-b", "cbx", "-t", "main"],
+	                   capture_output=True, text=True)
+	if r.returncode != 0:
+		raise RuntimeError(r.stderr.strip() or "paste-buffer failed")
+	subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", "main", "Enter"],
+	               capture_output=True, text=True)
+	return {"box": name, "pasted": len(text)}
+
+
 def pull_box_image(wait=False):
 	"""Pull BOX_IMAGE so spawns use a recent image. Best-effort + coalesced: a bare local tag is
 	skipped and failures are logged (not raised). wait=False (spawns) skips if a pull is already in
@@ -866,6 +899,16 @@ class Handler(BaseHTTPRequestHandler):
 				if not text.strip():
 					return self._reply(400, {"error": "empty message"})
 				return self._reply(200, box_say(name, text))
+			# Same, but as a bracketed paste — for MULTI-LINE feedback (a tuicr review), which
+			# send-keys would split into one prompt per line.
+			if path.startswith("/box/") and path.endswith("/paste"):
+				name = path[len("/box/"):-len("/paste")]
+				if not NAME_RE.match(name):
+					return self._reply(400, {"error": "bad box name"})
+				text = self._body()
+				if not text.strip():
+					return self._reply(400, {"error": "empty message"})
+				return self._reply(200, box_paste(name, text))
 			# Default: spawn a fresh box.
 			if not path.startswith("/box/"):
 				return self._reply(404, {"error": "not found"})

@@ -5,7 +5,8 @@ set -e
 # (hub/Dockerfile.base): common base utils, Node + npm via fnm, and the pinchtab binary. Both
 # Dockerfiles COPY this and RUN it, so the install logic + version handling live in ONE place
 # instead of being duplicated. Version pins arrive as environment variables (passed from build
-# args): NODE_VERSION, NPM_VERSION, PINCHTAB_VERSION. FNM_DIR is set by each Dockerfile's ENV.
+# args): NODE_VERSION, NPM_VERSION, PINCHTAB_VERSION, TUICR_VERSION. FNM_DIR is set by each
+# Dockerfile's ENV.
 #
 # It installs ONLY what BOTH images need. Image-specific packages stay in their own Dockerfile:
 #   claude-box: xclip/xsel/sudo (clipboard proxy) + the claude binary + the clip user & shims
@@ -13,6 +14,7 @@ set -e
 : "${NODE_VERSION:?common-setup: NODE_VERSION not set (pass --build-arg NODE_VERSION=...)}"
 : "${NPM_VERSION:?common-setup: NPM_VERSION not set (pass --build-arg NPM_VERSION=...)}"
 : "${PINCHTAB_VERSION:=0.13.2}"
+: "${TUICR_VERSION:=0.19.1}"
 : "${FNM_DIR:=/opt/fnm}"
 export FNM_DIR
 
@@ -68,3 +70,17 @@ chmod 0755 /usr/local/bin/pinchtab
 npm rm -g pinchtab
 rm -rf /tmp/pt
 pinchtab --version
+
+# tuicr (https://tuicr.dev): the code-review TUI `cbx review` opens on an agent's branch — scroll the
+# diff, leave line/range comments, quit, and cbx turns the persisted comments into review feedback for
+# the box. Installed from the project's own install.sh (its documented method) rather than cargo, so
+# no Rust toolchain is needed: it fetches the matching static release binary for this OS/arch.
+#   INSTALL_DIR=/usr/local/bin  — system-wide, so it survives the home bind-mount (same reason as
+#                                 pinchtab above); the installer's default ~/.local/bin would not.
+#   INSTALL_YES=1               — the installer prompts on a readable /dev/tty; a build has none, but
+#                                 say so explicitly instead of relying on that.
+# It lands in BOTH images: the hub runs the TUI, and in a box `tuicr review add` lets an agent attach
+# its own comments to a session. Bump TUICR_VERSION (build arg) to upgrade.
+curl -fsSL https://tuicr.dev/install.sh \
+	| TUICR_VERSION="${TUICR_VERSION}" TUICR_INSTALL_DIR=/usr/local/bin TUICR_INSTALL_YES=1 sh
+tuicr --version

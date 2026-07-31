@@ -50,9 +50,11 @@ RUN printf '%s\n' 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="
 ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
 ARG PINCHTAB_VERSION=0.13.2
+ARG TUICR_VERSION=0.19.1
 ENV FNM_DIR=/opt/fnm
 COPY common-setup.sh terminfo-ghostty tmux.conf /tmp/
 RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION="${PINCHTAB_VERSION}" \
+		TUICR_VERSION="${TUICR_VERSION}" \
 		sh /tmp/common-setup.sh \
 	&& rm /tmp/common-setup.sh
 

@@ -40,7 +40,7 @@
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
-unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql cbxfe cbxsync cbxexport cbximport 2>/dev/null || true
+unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql cbxfe cbxsync cbxexport cbximport cbxcp cbxexec 2>/dev/null || true
 unset -f cbxui 2>/dev/null || true          # cbxui was renamed to cbxtun; drop the stale function
 
 # Every entry point below reaches the server as plain "$CBX_SERVER" / "$CBX_PROJECT". Empty, and ssh
@@ -344,6 +344,90 @@ cbximport() {
 		| ssh -T "$CBX_SERVER" "$(_cbx_hub_pipe) cbx import $box"
 }
 
+# cbxcp <src> <dst> — copy a file or a WHOLE DIRECTORY between a box / the hub and your laptop, in
+# either direction. The general-purpose transfer; cbxexport/cbximport above move repo *changes* as a
+# git patch, which is the right tool for code but useless for a log, a screenshot or a built artifact.
+#
+#   cbxcp work1:/home/dev/repo/build/out.log .     # box   -> laptop (into the current dir)
+#   cbxcp work1:/home/dev/repo/build/libs .        # …a whole directory, same syntax
+#   cbxcp hub:/work/boxes/work1/state ./state      # hub   -> laptop, renaming on the way
+#   cbxcp ./fix.patch work1:/home/dev              # laptop -> box
+#
+# Exactly ONE side carries a `<target>:` prefix — a box name, or `hub`; the other side is local. A
+# leading '/' or './' means local, so /tmp/a:b is never mistaken for a target.
+#
+# Everything moves as a tar stream over `docker exec -i`, which is what makes files and directories
+# one code path (modes and symlinks survive) and what avoids a temp copy on the server: there is no
+# `docker cp` to the host and then an scp, just one pipe end to end. NO `ssh -t` and no `docker exec
+# -t` anywhere — a PTY rewrites newlines and would corrupt any binary payload, the same trap
+# _cbx_hub_pipe documents for the patch pipes.
+#
+# The destination is resolved on the RECEIVING side by $_CBX_CP_RX: extract into it if it is an
+# existing directory, otherwise treat it as the new name. Identical semantics whichever way you copy,
+# and it needs no extra round-trip to probe the far end first.
+_CBX_CP_RX='d=$1; t=$(mktemp -d); tar -C "$t" -xf -; if [ -d "$d" ]; then mv "$t"/* "$d"/; else mkdir -p "$(dirname "$d")"; mv "$t"/* "$d"; fi; rmdir "$t"'
+cbxcp() {
+	_cbx_need_server || return 1
+	local usage="usage: cbxcp <src> <dst>   ONE side is <box>:<path> or hub:<path>, e.g. cbxcp work1:/home/dev/repo/x.log ."
+	local re='^([A-Za-z0-9][A-Za-z0-9_.-]*):(.+)$'
+	local src="${1:-}" dst="${2:-}" s_t="" s_p="" d_t="" d_p="" ex
+	[ -n "$src" ] || { echo "$usage" >&2; return 2; }
+	[[ $src =~ $re ]] && { s_t="${BASH_REMATCH[1]}"; s_p="${BASH_REMATCH[2]}"; }
+	# A remote source may omit the destination — like `cp x .`, the common "just grab it" case.
+	[ -n "$dst" ] || { [ -n "$s_t" ] && dst=.; }
+	[ -n "$dst" ] || { echo "$usage" >&2; return 2; }
+	[[ $dst =~ $re ]] && { d_t="${BASH_REMATCH[1]}"; d_p="${BASH_REMATCH[2]}"; }
+	[ -n "$s_t$d_t" ] || { echo "cbxcp: neither side names a box or the hub — nothing to copy to/from" >&2; echo "$usage" >&2; return 2; }
+	[ -z "$s_t" ] || [ -z "$d_t" ] || { echo "cbxcp: both sides are remote ('$s_t' and '$d_t') — copy via your laptop in two steps" >&2; return 2; }
+	# The `docker exec -i <container>` prefix, evaluated on the SERVER. The hub is found by its compose
+	# labels (it survives renames and compose's -1 suffix); a box is named by convention, as in cbxtun.
+	if [ "${s_t:-$d_t}" = hub ]; then ex="$(_cbx_hub_pipe)"; else ex="docker exec -i box-${CBX_PROJECT}-${s_t:-$d_t}"; fi
+	if [ -n "$s_t" ]; then
+		echo "cbxcp: $s_t:$s_p -> $dst" >&2
+		# dirname/basename are pure string work, so they are computed here and the far side just tars.
+		ssh -T "$CBX_SERVER" "$ex tar -C '$(dirname "$s_p")' -cf - '$(basename "$s_p")'" \
+			| sh -c "$_CBX_CP_RX" sh "$dst"
+	else
+		[ -e "$src" ] || { echo "cbxcp: no such file or directory: $src" >&2; return 1; }
+		echo "cbxcp: $src -> $d_t:$d_p" >&2
+		tar -C "$(dirname "$src")" -cf - "$(basename "$src")" \
+			| ssh -T "$CBX_SERVER" "$ex sh -c '$_CBX_CP_RX' sh '$d_p'"
+	fi
+}
+
+# cbxexec <box|hub> <command…> — run ANY command in a box or the hub and get its output here, clean
+# enough to pipe into your local tools:
+#
+#   cbxexec work1 gradle -q :infostarsEJB:test | tee test.log
+#   cbxexec work1 cat /home/dev/repo/build/reports/x.json | jq .failures
+#   cbxexec hub 'cbx q --text' | grep -i blocked
+#   cbxexec work1 'grep -rn TODO /home/dev/repo | wc -l'     # …the pipe runs IN the box
+#   tar -cf - ./seed | cbxexec work1 'tar -C /tmp -xf -'     # …and stdin flows the other way
+#
+# The arguments are joined with spaces and handed to `sh -c` INSIDE the container, so where you put
+# the quotes decides where a pipe runs: unquoted, your local shell takes it and the box's stdout flows
+# into your local tool (the usual case); quoted, the box's own shell does. Because it is `sh -c`, `cd
+# x && …`, redirection and globbing all work as you would type them there.
+#
+# NO PTY on either hop (`ssh -T`, `docker exec -i`, never -t): stdout stays byte-exact and stdin is
+# forwarded, so this pipes in both directions and survives binary payloads. That is the whole
+# difference from `cbxbox`, which is the interactive tmux attach and deliberately allocates one.
+# stderr stays on stderr, so a local pipe sees only real output — diagnostics still reach your
+# terminal. The exit status is the command's own, so `cbxexec work1 test -e /x && …` works.
+#
+# The command travels base64-encoded. It is decoded on the SERVER and passed to `sh -c` as a single
+# argument, which sidesteps the two layers of shell re-parsing (ssh's, then the server's) that would
+# otherwise mangle every quote, $ and backtick you send.
+cbxexec() {
+	_cbx_need_server || return 1
+	local tgt="${1:-}" ex b64
+	[ -n "$tgt" ] && [ "$#" -ge 2 ] || { echo "usage: cbxexec <box|hub> <command…>   e.g. cbxexec work1 cat /home/dev/repo/build/out.log | less" >&2; return 2; }
+	shift
+	if [ "$tgt" = hub ]; then ex="$(_cbx_hub_pipe)"; else ex="docker exec -i box-${CBX_PROJECT}-${tgt}"; fi
+	b64=$(printf '%s' "$*" | base64 | tr -d '\n')
+	ssh -T "$CBX_SERVER" "$ex sh -c \"\$(printf %s $b64 | base64 -d)\""
+}
+
 # ---------------------------------------------------------------------------------------------
 # BASH COMPLETION for cbx / cbxbox / cbxfe / cbxtun.
 #
@@ -447,7 +531,7 @@ _cbx_complete() {
 	if [[ $cur == -* ]]; then
 		local flags=""
 		case "$cmd" in
-			review)    flags="--full --net" ;;
+			review)    flags="--full --net --tui --plain" ;;
 			merge)     flags="--squash --edit" ;;
 			fix)       flags="-m --force" ;;
 			prereview) flags="--force" ;;
@@ -511,10 +595,34 @@ _cbx_complete_tun() {
 	return 0
 }
 
+# cbxcp takes a local path on one side and <target>:<path> on the other, so both are offered at once:
+# local files from compgen -f, plus `hub:`/`<box>:` prefixes with the space suppressed so the remote
+# path can be typed straight on. Remote paths themselves are not completed — that would need an ssh
+# round-trip per Tab, which is exactly what the name cache exists to avoid.
+_cbx_complete_cp() {
+	local cur="${COMP_WORDS[COMP_CWORD]}"
+	case "$cur" in
+		*:*) COMPREPLY=() ;;                        # past the target; the far side's paths are unknown here
+		*)   COMPREPLY=($(compgen -S : -W "hub $(_cbx_names box)" -- "$cur"))
+		     [ "${#COMPREPLY[@]}" -gt 0 ] && compopt -o nospace
+		     COMPREPLY+=($(compgen -f -- "$cur")) ;;
+	esac
+	return 0
+}
+
+# cbxexec's first word is the target (a box, or the hub); everything after it is the command, which
+# only the container could complete — so we complete word 1 and then get out of the way.
+_cbx_complete_exec() {
+	[ "$COMP_CWORD" -eq 1 ] && COMPREPLY=($(compgen -W "hub $(_cbx_names box)" -- "${COMP_WORDS[1]}"))
+	return 0
+}
+
 if [ -n "${BASH_VERSION:-}" ]; then
 	complete -F _cbx_complete cbx
 	complete -F _cbx_complete_boxonly cbxbox cbxfe cbxexport
 	complete -F _cbx_complete_import cbximport
 	complete -F _cbx_complete_tun cbxtun
+	complete -F _cbx_complete_cp cbxcp
+	complete -F _cbx_complete_exec cbxexec
 	complete -W '--rebase' cbxsync
 fi

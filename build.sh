@@ -42,6 +42,11 @@ BUILD_ARGS=(
 )
 [ -n "$PINCHTAB_VERSION" ] && BUILD_ARGS+=(--build-arg PINCHTAB_VERSION="$PINCHTAB_VERSION")
 
+# tuicr (the review TUI) is pinned by the Dockerfile ARG, not by the host: unlike node/npm/pinchtab
+# there is nothing on the build host it has to match — the hub runs it standalone. Export
+# TUICR_VERSION to override.
+if [ -n "${TUICR_VERSION:-}" ]; then BUILD_ARGS+=(--build-arg TUICR_VERSION="$TUICR_VERSION"); fi
+
 # Refresh Claude to the latest release WITHOUT rebuilding the expensive install layer: bump the
 # CLAUDE_REFRESH value (e.g. `CLAUDE_REFRESH=$(date +%s) ./build.sh`) and only the lightweight
 # `claude update` layer in the Dockerfile re-runs. Unset -> cache hit, no refresh.

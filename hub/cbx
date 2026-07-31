@@ -26,8 +26,15 @@ set -euo pipefail
 #   cbx q  --text                           # the queue table once, as plain text (for pipes/scripts)
 #                                           #   colour: CBX_COLOR=always|never|auto (auto = 'cbx status'
 #                                           #   colours a terminal only; the live dashboard always does)
-#   cbx review <box> [--full] [--net]       # per-commit patches since your last review
-#                                           #   --full = whole branch, --net = one combined diff
+#   cbx review <box> [--full] [--net]       # open the review TUI (tuicr) on the agent's branch: leave
+#                                           #   line comments, quit, CONFIRM, and they are sent to the
+#                                           #   box — no retyping them into `cbx fix`. Nothing is sent
+#                                           #   until you answer 's' at the prompt.
+#              [--tui] [--plain]            #   --plain = the old delta/less pager (also used when no
+#                                           #   TUI is installed, for --net, and for a RE-review, whose
+#                                           #   range-diff a TUI cannot show); --tui forces the TUI.
+#                                           #   --full = whole branch, --net = one combined diff.
+#                                           #   CBX_REVIEW_TUI picks a different TUI (empty = never one)
 #   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
 #   cbx prereview <box>                     # ask the agent to self-review its diff before you look
 #   cbx merge  <box> [--squash] [--edit]    # merge the agent branch into dev
@@ -67,6 +74,32 @@ STATE="$REPO/.git/cbx"
 TMUX_SESSION="${TMUX_SESSION:-services}"
 BROKER_URL="${BROKER_URL:-http://box-broker:8099}"
 BROKER_TOKEN="${BROKER_TOKEN:-}"
+
+# The interactive review TUI `cbx review` opens on an agent's branch. Default: tuicr (tuicr.dev),
+# installed into this image by common-setup.sh — scroll the diff, leave line/range comments, quit, and
+# cbx offers to send them to the box (see review_tui / review_send).
+#
+#   CBX_REVIEW_TUI unset      -> tuicr if it is on PATH, else the plain delta/less pager
+#   CBX_REVIEW_TUI=           -> never a TUI; always the pager (same as passing --plain every time)
+#   CBX_REVIEW_TUI='cmd …'    -> that command instead. The commit range is substituted for a {range}
+#                                placeholder, or appended when there is none:
+#                                  CBX_REVIEW_TUI='hunk'                -> hunk dev..refs/agents/work1
+#                                  CBX_REVIEW_TUI='delta --paging=always {range}'
+#                                Only tuicr's comments can be harvested and sent to the box — any other
+#                                command is a viewer, and cbx just falls back to `cbx fix -m` after it.
+# `-` is accepted as a synonym for empty, since an empty value is easy to lose through a wrapper.
+# The placeholder is held in its own variable and NEVER written inline in a ${…}: the '}' of
+# '{range}' would close the parameter expansion early, so `${CBX_REVIEW_TUI-tuicr -r {range}}` silently
+# means "…-tuicr -r {range" followed by a literal '}' — which appends a stray brace to whatever the
+# user set (and only looks right when the variable is unset).
+REVIEW_TUI_PLACEHOLDER='{range}'
+# --no-update-check: tuicr phones GitHub for a newer release at startup. Here the version is pinned by
+# the image (common-setup.sh), so an update notice would only be a slower start and advice you cannot act on.
+REVIEW_TUI_DEFAULT="tuicr --no-update-check -r $REVIEW_TUI_PLACEHOLDER"
+REVIEW_TUI="${CBX_REVIEW_TUI-$REVIEW_TUI_DEFAULT}"
+# `if`, not `[ … ] && …`: under `set -e` a bare test that FAILS becomes the script's exit status, so
+# the common case (a value that isn't '-') would kill cbx right here. Same reason for the guards below.
+if [ "$REVIEW_TUI" = "-" ]; then REVIEW_TUI=""; fi
 
 # Your project's "make this tree ready to build" command. `cbx golden snapshot --prep` runs it IN THE
 # REPO (not in a copy), so it's an optional convenience around the setup you'd otherwise do by hand —
@@ -398,6 +431,20 @@ say_to_box() {
 	# box as a note, not a failure — and a `die` here would abort them AFTER they'd done their work.
 	local box="$1" msg="$2" resp
 	resp="$(broker POST "/box/$box/say" --data-raw "$msg" 2>&1)" || {
+		echo "cbx: could not reach box '$box': $resp" >&2
+		return 1
+	}
+}
+
+paste_to_box() {
+	# Same, for a MULTI-LINE prompt (a tuicr review: one numbered point per line). say_to_box cannot
+	# carry one — its send-keys types the text, and claude submits on every newline, so an N-line
+	# review would arrive as N half-prompts, each acted on before the next lands. /paste puts the text
+	# in through tmux's BRACKETED paste instead, exactly like a real paste into the composer, and the
+	# Enter that follows is the only thing that submits. --data-binary, not --data-raw: curl's
+	# --data-raw is still text and @-free but we want the bytes and newlines untouched.
+	local box="$1" msg="$2" resp
+	resp="$(broker POST "/box/$box/paste" --data-binary @- <<<"$msg" 2>&1)" || {
 		echo "cbx: could not reach box '$box': $resp" >&2
 		return 1
 	}
@@ -791,17 +838,146 @@ watch_queue() {
 	done
 }
 
+# ---- the review TUI (tuicr) ------------------------------------------------------------------
+#
+# `cbx review` opens $REVIEW_TUI on the agent's branch instead of paging a diff at you. With tuicr
+# (the default) the loop closes: you leave line/range comments in the TUI, quit, and cbx reads the
+# comments back out and offers to send them to the box — no retyping them into `cbx fix -m`.
+#
+# The handover is tuicr's PERSISTED SESSION, not its `y`/--stdout clipboard export: the export is a
+# key you have to remember to press, and --stdout writes into the same stream the TUI paints on
+# (tuicr renders to stdout, alt-screen; only its "tuicr-session: <slug>" announcement goes to
+# stderr). The session file is written as soon as a review target becomes active, survives the TUI
+# if it holds comments, and is removed by tuicr when it does not — which is exactly the "did you
+# write anything?" signal we need. So: capture the slug from stderr, read the comments as JSON
+# afterwards, and delete the session once it has been sent.
+
+have_tui() { [ -n "$REVIEW_TUI" ] && command -v "${REVIEW_TUI%% *}" >/dev/null 2>&1; }
+# Only tuicr's comments can be harvested; any other CBX_REVIEW_TUI is treated as a viewer.
+tui_is_tuicr() { [ "$(basename "${REVIEW_TUI%% *}")" = tuicr ]; }
+
+# Run the TUI on <range>, leaving TUI_SESSION set to tuicr's session slug (empty for anything else).
+# stdout is left alone — that is where the TUI draws; only stderr is captured, so a real failure can
+# be shown instead of scrolling past behind the alternate screen.
+TUI_SESSION=""
+run_review_tui() {
+	local range="$1" cmd errf rc=0
+	if [[ "$REVIEW_TUI" == *"$REVIEW_TUI_PLACEHOLDER"* ]]; then
+		cmd="${REVIEW_TUI//"$REVIEW_TUI_PLACEHOLDER"/$range}"
+	else cmd="$REVIEW_TUI $range"; fi
+	errf="$(mktemp)"
+	TUI_SESSION=""
+	( cd "$REPO" && eval "$cmd" ) 2>"$errf" || rc=$?
+	TUI_SESSION="$(sed -n 's/^tuicr-session: //p' "$errf" | tail -1)"
+	if [ "$rc" -ne 0 ]; then
+		echo "cbx: the review TUI ('$cmd') failed:" >&2
+		sed 's/^/  /' "$errf" >&2
+	fi
+	rm -f "$errf"
+	return "$rc"
+}
+
+# Read a session's not-yet-sent comments: REVIEW_MD is the numbered markdown that goes to the agent
+# (anchored with tuicr's own `path:line` / `path:start-end` locations, so it can jump to each one),
+# REVIEW_IDS the comment ids behind it.
+#
+# ALREADY-SENT comments are filtered out through cbx's own state ($STATE/<box>.sent), not by deleting
+# the session: tuicr keeps an index.json beside the session files, so removing a file under it leaves
+# an entry pointing at nothing. This matters because a session is keyed by the COMMIT RANGE — review
+# the same unchanged branch twice and tuicr hands back the same comments, which would otherwise be
+# sent to the agent a second time. (After a fix round the sha moves, so that session is new anyway.)
+REVIEW_MD=""; REVIEW_IDS=""
+review_harvest() {
+	local slug="$1" box="$2" json seen
+	REVIEW_MD=""; REVIEW_IDS=""
+	json="$(tuicr review comments --session "$slug" --repo "$REPO" 2>/dev/null || true)"
+	[ -n "$json" ] || return 0
+	seen="$(cat "$STATE/$box.sent" 2>/dev/null || true)"
+	# `.id as $i` BEFORE the pipe: inside `$s | index(.id)` the `.` is already $s (the id list), so
+	# `.id` would be looked up on an array and the whole filter would error out into "no comments".
+	json="$(printf '%s' "$json" | jq -c --arg seen "$seen" \
+		'($seen | split("\n")) as $s | [ .[] | select(.id as $i | ($s | index($i)) == null) ]' 2>/dev/null || true)"
+	[ -n "$json" ] || return 0
+	REVIEW_IDS="$(printf '%s' "$json" | jq -r '.[].id' 2>/dev/null || true)"
+	REVIEW_MD="$(printf '%s' "$json" | jq -r '
+		to_entries[]
+		| ((.key + 1) | tostring) as $n
+		| (if (.value.path == null) then "(overall)" else "`" + .value.location + "`" end) as $where
+		| (if ((.value.comment_type // "none") == "none") then "" else " [" + .value.comment_type + "]" end) as $kind
+		| $n + ". " + $where + $kind + " — " + (.value.content | gsub("\n"; "\n   "))
+	' 2>/dev/null || true)"
+}
+
+# Newest local session that actually holds comments — the fallback when the announcement line was
+# missed (an older tuicr, or a TUI that died before printing it).
+review_session_guess() {
+	tuicr review list --repo "$REPO" 2>/dev/null | jq -r '
+		[ .[] | select(.kind == "local" and .comment_count > 0) ]
+		| sort_by(.updated_at) | last | .slug // empty' 2>/dev/null || true
+}
+
+# THE CONFIRM STEP: show what you wrote, and only then let it reach the agent. Nothing is sent by
+# quitting the TUI — send is an explicit 's' here, so a review you abandoned halfway stays yours.
+review_confirm_send() {
+	local box="$1" slug="$2" md ids tmp ans
+	review_harvest "$slug" "$box"
+	md="$REVIEW_MD"; ids="$REVIEW_IDS"
+	[ -n "$md" ] || { echo "cbx: no new comments in the review — nothing to send."; return 0; }
+	while :; do
+		echo
+		printf '%s── feedback for %s ───────────────────────────────%s\n' "$C_B$C_CYA" "$box" "$C_RESET"
+		printf '%s\n' "$md"
+		printf '%s──────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
+		printf '[s]end to %s  [e]dit  [d]iscard ? ' "$box"
+		read -r ans </dev/tty || ans=d
+		case "$ans" in
+			s|S|"")
+				guard_busy "$box" || { echo "cbx: not sent — the review is still saved, re-run 'cbx review $box'."; return 1; }
+				paste_to_box "$box" "Review feedback on your handoff:
+
+$md
+
+Please address each point on your branch, then run: handoff" \
+					|| { echo "cbx: feedback NOT delivered — is the box running? (cbx ls)" >&2
+					     echo "cbx: the review is still saved; re-run 'cbx review $box' to retry." >&2; return 1; }
+				# Sent = consumed, recorded HERE rather than by touching tuicr's store (see review_harvest).
+				if [ -n "$ids" ]; then printf '%s\n' "$ids" >> "$STATE/$box.sent"; fi
+				echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
+				return 0
+				;;
+			e|E)
+				tmp="$(mktemp --suffix=.md)"
+				printf '%s\n' "$md" > "$tmp"
+				# </dev/tty: stdin here is the terminal already, but be explicit — an editor started
+				# with anything else on stdin renders to a dead terminal and hangs.
+				"${EDITOR:-vim}" "$tmp" </dev/tty >/dev/tty 2>&1 || true
+				md="$(cat "$tmp")"; rm -f "$tmp"
+				[ -n "${md//[[:space:]]/}" ] || { echo "cbx: emptied — nothing to send."; return 0; }
+				;;
+			d|D)
+				echo "cbx: not sent. The comments stay in tuicr — 're-run cbx review $box' to pick them up,"
+				echo "     or drop them with: tuicr review list --repo $REPO"
+				return 0
+				;;
+			*) echo "cbx: answer s (send), e (edit) or d (discard)." ;;
+		esac
+	done
+}
+
 review() {
 	[ $# -ge 1 ] || die "review needs a box name"
-	local box="$1" full="" net="" arg ref sha prev
+	local box="$1" full="" net="" plain="" tui="" arg ref sha prev
 	shift
 	for arg in "$@"; do
 		case "$arg" in
-			--full) full=1 ;;
-			--net)  net=1 ;;
-			*) die "review: unknown option '$arg' (--full | --net)" ;;
+			--full)  full=1 ;;
+			--net)   net=1 ;;
+			--plain) plain=1 ;;
+			--tui)   tui=1 ;;
+			*) die "review: unknown option '$arg' (--full | --net | --tui | --plain)" ;;
 		esac
 	done
+	if [ -n "$plain" ] && [ -n "$tui" ]; then die "review: --tui and --plain are opposites, pick one"; fi
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box' (has it run handoff?)"
 	sha="$(git_ rev-parse "$ref")"
@@ -814,6 +990,48 @@ review() {
 		echo "cbx: $box was only REBASED onto a newer $DEV since your last review — same patches, new shas."
 		echo "cbx: nothing new to read; 'cbx merge $box' when ready (--full to see the branch anyway)."
 		echo
+	fi
+
+	# --- viewer: the TUI, or the plain pager -----------------------------------------------------
+	# Incremental = you have reviewed this box before and it has moved since. That case is the pager's,
+	# because it is a `git range-diff` — only what changed since you last looked, correct across the
+	# amends and rebases a fix round produces. A TUI can only be pointed at a commit RANGE, and after
+	# an amend `prev..ref` is no longer "the new work" (the old commits are not ancestors any more), so
+	# it would silently degrade to the whole branch. --tui asks for that anyway.
+	local incremental="" use_tui=""
+	if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ -z "$full" ] \
+	   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then incremental=1; fi
+	if [ -n "$plain" ]; then use_tui=""
+	elif ! have_tui; then
+		if [ -n "$tui" ]; then die "review: no review TUI on PATH (CBX_REVIEW_TUI='$REVIEW_TUI')"; fi
+		use_tui=""
+	elif [ -n "$tui" ]; then use_tui=1
+	elif [ -n "$net" ]; then use_tui=""      # --net names a pager rendering (one combined diff)
+	elif [ -n "$incremental" ]; then
+		use_tui=""
+		echo "cbx: $box changed since your last review — showing the range-diff (pager)."
+		echo "cbx: '--tui' opens ${REVIEW_TUI%% *} on the whole branch instead."
+		echo
+	else use_tui=1
+	fi
+
+	if [ -n "$use_tui" ]; then
+		if run_review_tui "$DEV..$ref"; then
+			printf '%s %s' "$sha" "$(git_ rev-parse "$DEV")" > "$STATE/$box.reviewed"
+			if tui_is_tuicr; then
+				local slug="$TUI_SESSION"
+				[ -n "$slug" ] || slug="$(review_session_guess)"
+				if [ -n "$slug" ]; then
+					review_confirm_send "$box" "$slug" || true
+				else
+					echo "cbx: no comments in the review — nothing to send."
+				fi
+			fi
+			echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
+			return 0
+		fi
+		echo "cbx: falling back to the plain pager." >&2
+		echo >&2
 	fi
 
 	# Everything goes through ONE pager. Printing the log first and then piping a diff to delta would
@@ -966,7 +1184,8 @@ merge() {
 	git_ --no-pager log --oneline -1 | sed 's/^/  /'
 	git_ --no-pager diff --shortstat "$before" "$after" | sed 's/^/  /'
 	git_ update-ref -d "$ref"
-	rm -f "$STATE/$box.reviewed"
+	# .sent goes with it: the branch this box will push next is a new review from scratch.
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
 	echo "cbx: dropped refs/agents/$box (merged)"
 	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
 	# of work starts from what you just landed.
@@ -982,7 +1201,8 @@ drop() {
 	[ $# -ge 1 ] || die "drop needs a box name"
 	local box="$1"
 	git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
-	rm -f "$STATE/$box.reviewed"
+	# .sent goes with it: the branch this box will push next is a new review from scratch.
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
 	say_to_box "$box" "I dropped your handoff — that approach is not going in. Do not re-push it; wait for new instructions." 2>/dev/null || true
 	echo "cbx: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
 }

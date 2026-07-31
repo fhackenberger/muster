@@ -43,7 +43,7 @@ toolchain install.
 
 Both the box and the hub are a lean **base** on `debian:trixie-slim` + a project **add-on**:
 `claude-box-hub-base` (`hub/Dockerfile.base`) carries the project-agnostic hub tooling (git/ssh, tmux,
-node, pinchtab + Google Chrome, cbx, entrypoint, and the uid-1000 `dev` user), and `claude-box-hub`
+node, pinchtab + Google Chrome, the tuicr review TUI, cbx, entrypoint, and the uid-1000 `dev` user), and `claude-box-hub`
 layers the infostars build toolchain (JDK + gradle + ant) via the **shared `Dockerfile.addon`**
 (`--build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000`). The box mirrors this:
 `claude-box` (base) + `claude-box-infostars` (same `Dockerfile.addon`, `BASE_IMAGE=claude-box`) — the
@@ -197,7 +197,8 @@ changed" comes from doing one and not the other:
 | What you changed | Travels via | Carried by |
 |---|---|---|
 | `hub/cbx`, `hub/entrypoint.sh`, `hub/git-ssh`, `hub/Dockerfile.base` | Jenkins build | `claude-box-hub-base` → `claude-box-hub` |
-| `Dockerfile`, `common-setup.sh`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
+| `Dockerfile`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
+| `common-setup.sh` (shared toolchain: node, pinchtab, **tuicr**) | Jenkins build | **both** bases — box *and* hub |
 | `box-broker/broker.py`, **`claude-box.sh`** | Jenkins build | `claude-box-broker` |
 | `compose.yml`, `.env`, `service-env`, `mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
 
@@ -279,6 +280,38 @@ That gives you:
 - **`cbximport <box> [base]`** — the reverse: **replace** an agent's branch with *your* net change and
   tell the box to just note it, not act (`git format-patch` → `cbx import`). See *Editing an agent's
   work by hand* below.
+- **`cbxcp <src> <dst>`** — copy a file or a whole directory between a box / the hub and your laptop,
+  either direction. Exactly one side is `<box>:<path>` or `hub:<path>`; the other is local, and a
+  remote source may drop the destination (defaults to `.`):
+
+  ```sh
+  cbxcp work1:/home/dev/repo/build/out.log .      # box    -> laptop
+  cbxcp work1:/home/dev/repo/build/libs .         # …a whole directory, same syntax
+  cbxcp hub:/work/boxes/work1/state ./state       # hub    -> laptop, renamed on the way
+  cbxcp ./fix.patch work1:/home/dev               # laptop -> box
+  ```
+
+  Use this for logs, screenshots and build artifacts; use `cbxexport`/`cbximport` for **code**, since
+  those move a reviewable git patch rather than loose files. The destination is extracted into if it
+  is an existing directory and treated as the new name otherwise — same rule whichever way you copy.
+  Everything travels as a tar stream over `docker exec -i`, so modes and symlinks survive, directories
+  need no special flag, and nothing is staged on the server in between.
+- **`cbxexec <box|hub> <command…>`** — run an arbitrary command in a box or the hub with its output
+  clean enough to pipe into your local tools:
+
+  ```sh
+  cbxexec work1 gradle -q :infostarsEJB:test | tee test.log
+  cbxexec work1 cat /home/dev/repo/build/reports/x.json | jq .failures
+  cbxexec hub 'cbx q --text' | grep -i blocked
+  cbxexec work1 'grep -rn TODO /home/dev/repo | wc -l'     # …the pipe runs IN the box
+  tar -cf - ./seed | cbxexec work1 'tar -C /tmp -xf -'     # …and stdin flows the other way
+  ```
+
+  The arguments are joined and handed to `sh -c` inside the container, so **where you put the quotes
+  decides where a pipe runs**: unquoted, your local shell takes it and the box's stdout flows into
+  your local tool; quoted, the box's own shell does. No PTY on either hop, so stdout is byte-exact,
+  stdin is forwarded, and stderr stays on stderr — a local pipe sees only real output. The exit status
+  is the command's own. Use `cbxbox` instead when you want the *interactive* tmux attach.
 
 **Export the two variables as their own commands.** Prefixing them to the `source` — `CBX_SERVER=…
 CBX_PROJECT=… . cbx.bash_aliases` — does *not* work: assignments prefixed to a command are temporary
@@ -444,7 +477,8 @@ summary as a git note. Nothing else in the stack can write `dev`.
 ```sh
 cbx q                       # LIVE dashboard: queue + status, and a BELL when something needs you
 cbx q --text                # just the queue table, once, as plain text (pipes, scripts)
-cbx review work1            # diff vs dev — on a SECOND look, only what changed since the last one
+cbx review work1            # the review TUI: comment on lines, quit, confirm -> sent to the box
+cbx review work1 --plain    # …the old pager instead (a diff vs dev, no commenting)
 cbx fix    work1 -m "extract the dup mapper, add a test for the null branch"
 cbx merge  work1            # merge into dev (--squash for a single commit) + tell the box to rebase
 cbx push                    # dev -> origin
@@ -484,11 +518,21 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   (`CBX_WATCH_FETCH`, 60s). `q` or Ctrl-C quits, Enter refreshes now, `-n SECS` sets the interval
   (`CBX_WATCH_INTERVAL`), `--no-bell` mutes it. Piped or redirected output is never watched — it
   prints the table once, exactly like `--text`.
+- **`cbx review` opens a review TUI** — [tuicr](https://tuicr.dev), installed into the hub image by
+  `common-setup.sh` — on `dev..refs/agents/<box>`. Scroll the diff (`j`/`k`, `]` next hunk, `{`/`}`
+  next file), press `c` on a line or `v`…`c` over a range to leave a comment, `C` for a file-level one,
+  `?` for the full keymap. Quit with `q` and cbx reads the comments back out. See *The confirm step*
+  below — nothing reaches the agent until you say so.
 - **`cbx review` is incremental.** It records what you last saw, so after a `cbx fix` round it shows
   a `git range-diff` — only the new work, correct across the amends and rebases a fix round produces.
-  `--full` gives the whole branch.
+  `--full` gives the whole branch. That case stays on the **pager**: a range-diff is not a commit
+  range, so no TUI can render it, and pointing one at `<last>..<new>` would silently show the whole
+  branch again the moment the agent amended rather than appended. cbx says so and prints the
+  `--tui` escape hatch. The pager also handles `--net` (one combined diff) and any non-terminal
+  output, exactly as before.
 - **`cbx fix` types into the agent's claude session** (via the broker, `tmux send-keys`). You never
   attach; the agent fixes and re-runs `handoff`, and the box shows up as `re-review` in `cbx q`.
+  It is still there for a one-liner you didn't need the TUI for.
 - **Conflicts surface at push time, not merge time.** Every push is test-merged against `dev` *and*
   against every other live agent branch (`git merge-tree`, no worktree touched), so you learn that
   two agents hit the same lines while you can still tell one of them to rebase.
@@ -497,6 +541,59 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   reviewer box is the obvious next step, not built yet.
 - `cbx drop work1` discards a branch and tells the box; `cbx rebase all` moves every agent onto the
   current `dev` without a recreate (cheap, use it after merging).
+
+### The confirm step
+
+Quitting the TUI does **not** send anything. cbx reads the comments you left out of tuicr's persisted
+session, prints them as the markdown the agent would receive, and asks:
+
+```
+── feedback for work1 ───────────────────────────────
+1. (overall) — Needs a test for the null branch.
+2. `src/pdf/Renderer.java:42` [issue] — 42 is a magic number, name it.
+3. `src/pdf/Renderer.java:50-55` — This block could be extracted.
+──────────────────────────────────────────────────
+[s]end to work1  [e]dit  [d]iscard ?
+```
+
+- **`s`** delivers it into the box's claude session (the same one-way channel `cbx fix` uses) with
+  "Please address each point on your branch, then run: handoff" appended. Refused while the agent is
+  `busy`, like every other command that types at an agent.
+- **`e`** opens the text in `$EDITOR` first — reword, delete a point, add one the TUI had no anchor
+  for. What you save is what is sent.
+- **`d`** sends nothing. The comments stay in tuicr, so re-running `cbx review <box>` picks the same
+  review back up where you left it.
+
+Two details worth knowing:
+
+- **Multi-line feedback arrives as ONE prompt.** `cbx fix` uses the broker's `/say`, which types the
+  text with `tmux send-keys` — and claude submits its prompt on every newline, so an N-point review
+  would land as N half-prompts, each acted on before the next arrived. A review therefore goes
+  through `/paste` instead: `tmux load-buffer` + `paste-buffer -p`, i.e. a real **bracketed paste**,
+  which claude takes into the composer whole; the Enter after it is the only thing that submits.
+- **Sent comments are remembered, in `.git/cbx/<box>.sent`.** A tuicr session is keyed by the commit
+  range, so reviewing the *same unchanged* branch twice hands back the comments you already sent —
+  cbx filters those out and says "no new comments" instead of sending them again. It records the ids
+  on its own side rather than deleting tuicr's session file, because tuicr keeps an `index.json`
+  beside those files that would then point at nothing. (After a fix round the sha moves, so the next
+  review is a fresh session anyway.) `cbx merge` / `cbx drop` clear the record with the branch.
+
+**Choosing a different TUI, or none.** `CBX_REVIEW_TUI` overrides the command:
+
+| Value | Effect |
+|---|---|
+| *unset* | `tuicr --no-update-check -r {range}` — the default, comments harvested and confirmed |
+| empty or `-` | never a TUI; `cbx review` is the plain delta/less pager, as it was before |
+| a command line | that command instead. `{range}` is substituted (appended if the placeholder is absent) |
+
+Only **tuicr**'s comments can be harvested — anything else is treated as a viewer, and you follow it
+with `cbx fix -m` as usual. The pager is also the automatic fallback when no TUI is installed, so a
+hub built from an older image keeps working; `--tui` on such a hub is an error rather than a silent
+downgrade.
+
+To classify comments as issue / suggestion / note / praise (the `[issue]` tag above), give tuicr a
+`~/.config/tuicr/config.toml` in the hub with `[[comment_types]]` entries — see
+[tuicr's docs](https://tuicr.dev). Untyped comments work fine without it.
 
 Inside a box the agent has three commands: `mydiff` (exactly what it will hand over, its branch
 only), `handoff "summary"`, and ordinary git. It has no credentials for the real origin and the
@@ -679,8 +776,8 @@ environment.
 - **Broker policy:** the hub passes a box NAME — nothing else. Image, uid, network, privileges, the
   socket and the mount list are the broker's; the mounts come from the root-owned `mounts` table,
   which no container can write, and golden-relative sources in it are confined to the golden. It is
-  the only socket holder. Its two box-facing operations (`/say`, `/dirty`) run **fixed** commands —
-  there is no arbitrary-exec endpoint.
+  the only socket holder. Its three box-facing operations (`/say`, `/paste`, `/dirty`) run **fixed**
+  commands — there is no arbitrary-exec endpoint.
 - **git daemon has no auth.** Boxes push over `git://` on the cbx network; the `update` hook in
   `data/repo` (installed by the hub entrypoint) is what bounds that: `refs/agents/*` and
   `refs/notes/cbx` only, so a box can never write `dev` or delete a branch.
