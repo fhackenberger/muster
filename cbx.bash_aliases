@@ -575,7 +575,7 @@ _cbx_complete() {
 		local flags=""
 		case "$cmd" in
 			review)    flags="--full --net --tui --plain" ;;
-			merge)     flags="--squash --edit" ;;
+			merge)     flags="--squash --edit --landed" ;;
 			fix)       flags="-m --force" ;;
 			prereview) flags="--force" ;;
 			rebase)    flags="--force" ;;

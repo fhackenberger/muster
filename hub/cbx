@@ -40,6 +40,11 @@ set -euo pipefail
 #   cbx merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
 #                                           #   (--edit on a 1-commit branch: no merge commit)
+#             [--landed]                    #   the merge CONFLICTED and you finished it by hand: retire
+#                                           #   the branch + tell the box, without merging again. Only
+#                                           #   needed when your fix was a squash/hand-written commit —
+#                                           #   if the agent's commits ended up in dev, plain `cbx merge`
+#                                           #   detects it and closes out by itself.
 #   cbx drop   <box>                        # discard an agent branch (tells the box)
 #   cbx rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
 #
@@ -1153,19 +1158,96 @@ prereview() {
 	echo "cbx: asked $1 to self-review and re-hand off."
 }
 
+# Everything that has to happen once an agent's work is IN $DEV: retire the ref, clear the review
+# state, tell the box, and say whether origin still needs it.
+#
+# This is a separate function because the CONFLICT path leaves merge() through `die`. You then resolve
+# in the hub's repo and commit — the work has landed, but the ref and the '.reviewed' state are still
+# sitting there, so `cbx q` goes on offering `cbx merge <box>` forever and the merge itself now says
+# "nothing was merged" every time. That dead end is what this closes.
+merge_finish() {
+	local box="$1" ref="refs/agents/$box" mstate mage after_rebase resume_note fbehind fahead
+	git_ update-ref -d "$ref" 2>/dev/null || true
+	# .sent goes with it: the branch this box will push next is a new review from scratch.
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
+	echo "cbx: dropped refs/agents/$box (merged)"
+	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
+	# of work starts from what you just landed.
+	#
+	# What it should do AFTER the rebase is decided HERE, from the box's activity — not left to the
+	# agent to infer. The old wording ("then continue with the next task") told an agent that had
+	# already finished and gone idle to find itself something to do, and one duly picked an unrelated
+	# piece of work out of the repo and started on it. An agent cannot reliably tell whether it was
+	# mid-task when a line was typed into its prompt; cbx can, from .cbx-state.
+	read -r mstate mage <<< "$(box_activity "$box")"
+	if [ "$mstate" = busy ]; then
+		after_rebase="Then go straight back to the task you were already working on and finish that. Do NOT start, plan, or pick up any other work."
+		resume_note="and resume the task it was on"
+	else
+		after_rebase="Then STOP and wait for my next instruction. There is no next task queued for you: do NOT start, plan, or pick up any other work, and do not look for something to do."
+		resume_note="and then wait for instructions"
+	fi
+	if say_to_box "$box" "Your work was merged into ${DEV}. Run exactly: git fetch hub && git rebase hub/${DEV} — that only replays the commits you have already made onto the merged ${DEV}. It is NOT a request for new changes, and nothing in the merge needs fixing. ${after_rebase}"; then
+		echo "cbx: asked $box to rebase onto $DEV $resume_note"
+	else
+		echo "cbx: (box $box not reachable — rebase it later with 'cbx rebase $box')"
+	fi
+	# Not a blanket "NOT pushed yet": when you finished the merge by hand you may well have pushed
+	# already, and being told to push again is how you end up wondering which of the two is true.
+	read -r fbehind fahead <<< "$(divergence)"
+	if [ "$fahead" != 0 ]; then
+		echo "cbx: $fahead commit(s) on $DEV are not on origin yet. Run: cbx push"
+	else
+		echo "cbx: origin already has $DEV — nothing left to push."
+	fi
+}
+
 merge() {
 	[ $# -ge 1 ] || die "merge needs a box name"
-	local box="$1" squash="" edit="" single="" a ref msg
+	local box="$1" squash="" edit="" single="" landed="" a ref msg
 	shift
 	for a in "$@"; do
 		case "$a" in
 			--squash) squash=1 ;;
 			--edit|-e) edit=1 ;;
-			*) die "merge: unknown option '$a' (--squash | --edit)" ;;
+			--landed) landed=1 ;;
+			*) die "merge: unknown option '$a' (--squash | --edit | --landed)" ;;
 		esac
 	done
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
+
+	# A conflict from an earlier attempt that is still unresolved. Merging again just re-conflicts on
+	# top of it, and closing the box out would strand the mess in the hub's worktree — so stop here
+	# and name both ways out. Unmerged index entries are the reliable signal: `--squash` leaves the
+	# index conflicted without ever writing MERGE_HEAD, so checking for that file alone misses half
+	# the cases.
+	if [ -n "$(git_ ls-files -u | head -1)" ]; then
+		echo "cbx: $REPO still has UNRESOLVED conflicts from an earlier merge:" >&2
+		git_ diff --name-only --diff-filter=U | sed 's/^/    /' >&2
+		echo "cbx: finish it   — resolve them, 'git add' + 'git commit', then: cbx merge $box${squash:+ --landed}" >&2
+		echo "cbx: or drop it  — git -C $REPO merge --abort   (then 'cbx merge $box' from scratch)" >&2
+		die "refusing to merge on top of an unfinished merge"
+	fi
+
+	# Already in $DEV? Then the merge happened — most likely you resolved a conflicted one by hand.
+	# Close the books instead of running a merge that can only say "nothing was merged". Checked
+	# BEFORE the stale-origin refusal below, so a moved origin can't trap you in this state.
+	if git_ merge-base --is-ancestor "$ref" "$DEV" 2>/dev/null; then
+		echo "cbx: refs/agents/$box is already contained in $DEV — nothing to merge."
+		echo "cbx: closing it out (this is the state a conflicted merge leaves behind once you commit the fix)."
+		merge_finish "$box"
+		return 0
+	fi
+	# The same situation, but where git CANNOT see it: you resolved the conflict with a squash or a
+	# hand-written commit, so the content landed while the agent's commits are not ancestors of $DEV.
+	# Nothing can prove that from the graph, so it is an explicit assertion by you.
+	if [ -n "$landed" ]; then
+		echo "cbx: --landed: taking your word that $box's work is already in $DEV, and closing it out."
+		echo "cbx: (its commits are NOT ancestors of $DEV — expected after a squash or a hand-written fix.)"
+		merge_finish "$box"
+		return 0
+	fi
 	# The hub tree is EXPECTED to carry local setup work (it's what goldens are snapshotted from), so a
 	# dirty tree is not an error here. Just show it and let git decide: it refuses precisely when the
 	# merge would overwrite a file you've modified, which is the only case that actually matters.
@@ -1198,20 +1280,25 @@ merge() {
 	# `--edit` on a single commit means "let me fix up that commit's message" — a merge commit wrapping
 	# one commit is pure noise there, and having to remember `--squash` for it is a papercut. So take
 	# the squash path and seed the editor with the agent's own message (see below).
-	if [ -n "$edit" ] && [ -z "$squash" ] && [ "$ncommits" = 1 ]; then
+	# ONE commit is one commit, whether or not you also typed --squash: there is nothing to summarise,
+	# so you edit that commit's own message. (Without --squash this also drops the merge commit, which
+	# would be pure noise around a single change.) The --squash case used to fall through to git's
+	# SQUASH_MSG and hand you your own message wrapped in "Squashed commit of the following:" and
+	# indented four spaces — something to clean up before you could start editing.
+	if [ -n "$edit" ] && [ "$ncommits" = 1 ]; then
+		[ -z "$squash" ] && echo "cbx: one commit — landing it directly (no merge commit); its message is what you'll edit"
 		squash=1 single=1
-		echo "cbx: one commit — landing it directly (no merge commit); its message is what you'll edit"
 	fi
 	git_ checkout -q "$DEV"
 	before="$(git_ rev-parse HEAD)"
-	# --edit opens an editor on the message. For a squash that message is git's SQUASH_MSG, which
-	# lists EVERY squashed commit — so you rewrite the agent's history into one message starting from
-	# what it actually wrote, rather than from a blank buffer. git falls back to `vi` when nothing is
-	# configured; common-setup.sh puts vim in both images, so name it explicitly.
+	# --edit opens an editor seeded with what the agent actually wrote, never a blank buffer — one
+	# commit gives you its own message, several give you all of them (see the two branches below).
+	# git falls back to `vi` when nothing is configured; common-setup.sh puts vim in both images, so
+	# name it explicitly.
 	local -a ed=()
 	[ -n "$edit" ] && ed=(env GIT_EDITOR="${EDITOR:-${VISUAL:-vim}}")
 	if [ -n "$squash" ]; then
-		git_ merge --squash "$ref" || die "merge conflicts — resolve in $REPO, then commit"
+		git_ merge --squash "$ref" || die "merge conflicts — resolve them in $REPO and commit, then run: cbx merge '$box' --landed   (to retire the branch and tell the box)"
 		if [ -n "$edit" ]; then
 			if [ -n "$single" ]; then
 				# One commit: SQUASH_MSG's "Squashed commit of the following:" preamble is noise, so
@@ -1221,10 +1308,29 @@ merge() {
 					-m "$(git_ log -1 --format=%B "$ref")" -m "Cbx-Box: $box" \
 					|| die "commit aborted (empty message?) — the change is staged, finish it in $REPO"
 			else
-				# Append the trailer to SQUASH_MSG so it's in the buffer you edit (and can be removed).
-				printf '\n%s\n' "Cbx-Box: $box" >> "$REPO/.git/SQUASH_MSG"
-				"${ed[@]}" git -C "$REPO" commit \
-					|| die "commit aborted (empty message?) — the squash is staged, finish it in $REPO"
+				# SEVERAL commits: compose the buffer ourselves rather than using git's SQUASH_MSG.
+				# SQUASH_MSG opens with "Squashed commit of the following:" and indents every message
+				# by four spaces under a full `commit <sha> / Author: / Date:` header — a log to read,
+				# not a message to edit: you reflow all of it before you can write anything. Here each
+				# message appears VERBATIM and unindented, separated by a '#' banner giving position
+				# and sha. git strips '#' lines on save (--cleanup=strip), so leaving the buffer as-is
+				# yields the messages one blank line apart, and the banners never reach the commit.
+				local msgf="$REPO/.git/CBX_SQUASH_MSG" c i=0
+				: > "$msgf"
+				while read -r c; do
+					i=$((i + 1))
+					if [ "$i" = 1 ]; then
+						printf '# ── %s/%s · %s ── these ── lines are dropped; write the squashed message below\n' \
+							"$i" "$ncommits" "$(git_ log -1 --format=%h "$c")" >> "$msgf"
+					else
+						printf '\n# ── %s/%s · %s ──\n' "$i" "$ncommits" "$(git_ log -1 --format=%h "$c")" >> "$msgf"
+					fi
+					git_ log -1 --format=%B "$c" >> "$msgf"
+				done < <(git_ rev-list --reverse "$DEV..$ref")
+				printf '\nCbx-Box: %s\n' "$box" >> "$msgf"
+				"${ed[@]}" git -C "$REPO" commit --cleanup=strip -e -F "$msgf" \
+					|| { rm -f "$msgf"; die "commit aborted (empty message?) — the squash is staged, finish it in $REPO"; }
+				rm -f "$msgf"
 			fi
 		else
 			git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
@@ -1232,7 +1338,7 @@ merge() {
 	else
 		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$ref" \
 			-m "$msg" -m "Cbx-Box: $box" \
-			|| die "merge conflicts — resolve in $REPO, then 'git commit'"
+			|| die "merge conflicts — resolve them in $REPO and 'git commit', then run: cbx merge '$box'   (to retire the branch and tell the box)"
 	fi
 	after="$(git_ rev-parse HEAD)"
 	[ "$before" != "$after" ] || die "nothing was merged — $DEV is unchanged (already up to date?)"
@@ -1240,33 +1346,7 @@ merge() {
 	echo "cbx: $DEV is now $(git_ rev-parse --short HEAD)"
 	git_ --no-pager log --oneline -1 | sed 's/^/  /'
 	git_ --no-pager diff --shortstat "$before" "$after" | sed 's/^/  /'
-	git_ update-ref -d "$ref"
-	# .sent goes with it: the branch this box will push next is a new review from scratch.
-	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
-	echo "cbx: dropped refs/agents/$box (merged)"
-	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
-	# of work starts from what you just landed.
-	#
-	# What it should do AFTER the rebase is decided HERE, from the box's activity — not left to the
-	# agent to infer. The old wording ("then continue with the next task") told an agent that had
-	# already finished and gone idle to find itself something to do, and one duly picked an unrelated
-	# piece of work out of the repo and started on it. An agent cannot reliably tell whether it was
-	# mid-task when a line was typed into its prompt; cbx can, from .cbx-state.
-	local mstate mage after_rebase resume_note
-	read -r mstate mage <<< "$(box_activity "$box")"
-	if [ "$mstate" = busy ]; then
-		after_rebase="Then go straight back to the task you were already working on and finish that. Do NOT start, plan, or pick up any other work."
-		resume_note="and resume the task it was on"
-	else
-		after_rebase="Then STOP and wait for my next instruction. There is no next task queued for you: do NOT start, plan, or pick up any other work, and do not look for something to do."
-		resume_note="and then wait for instructions"
-	fi
-	if say_to_box "$box" "Your work was merged into ${DEV}. Run exactly: git fetch hub && git rebase hub/${DEV} — that only replays the commits you have already made onto the merged ${DEV}. It is NOT a request for new changes, and nothing in the merge needs fixing. ${after_rebase}"; then
-		echo "cbx: asked $box to rebase onto $DEV $resume_note"
-	else
-		echo "cbx: (box $box not reachable — rebase it later with 'cbx rebase $box')"
-	fi
-	echo "cbx: NOT pushed yet — the merge is local to the hub. Run: cbx push"
+	merge_finish "$box"
 }
 
 drop() {

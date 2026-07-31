@@ -542,6 +542,22 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
 - **`cbx fix` types into the agent's claude session** (via the broker, `tmux send-keys`). You never
   attach; the agent fixes and re-runs `handoff`, and the box shows up as `re-review` in `cbx q`.
   It is still there for a one-liner you didn't need the TUI for.
+- **`cbx merge <box> --edit` seeds the editor with what the agent wrote**, never a blank buffer, and
+  never git's `SQUASH_MSG` (which wraps every message in `Squashed commit of the following:` and
+  indents it four spaces under a `commit`/`Author:`/`Date:` header — a log to read, not a message to
+  edit). A **one-commit** branch opens that commit's own message, so you start typing straight away;
+  this holds with or without `--squash`, and the agent stays the author. **Several commits** open all
+  of them verbatim and unindented, separated by a `# ── 2/3 · <sha> ──` banner; git drops `#` lines on
+  save, so leaving the buffer untouched gives you the messages one blank line apart and no banners.
+- **A conflicted `cbx merge` is finished by re-running it.** When the merge hits conflicts, cbx stops
+  and leaves them in the hub's repo for you — which means it also never got to retire
+  `refs/agents/<box>` or clear the review state. So after you resolve and commit, run **`cbx merge
+  <box>` again**: it sees the branch is already contained in `dev`, skips straight to the bookkeeping
+  (drop the ref, clear the state, tell the box to rebase, say whether origin still needs a push) and
+  the queue finally lets go. Without that, `cbx q` keeps offering a merge that answers "nothing was
+  merged" every time. If you resolved it as a **squash or a hand-written commit** the agent's commits
+  are not ancestors of `dev` and nothing can prove it landed — say so with **`cbx merge <box>
+  --landed`**. Re-running while conflicts are still unresolved is refused, with both ways out named.
 - **Conflicts surface at push time, not merge time.** Every push is test-merged against `dev` *and*
   against every other live agent branch (`git merge-tree`, no worktree touched), so you learn that
   two agents hit the same lines while you can still tell one of them to rebase.
