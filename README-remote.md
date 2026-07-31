@@ -541,6 +541,11 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   reviewer box is the obvious next step, not built yet.
 - `cbx drop work1` discards a branch and tells the box; `cbx rebase all` moves every agent onto the
   current `dev` without a recreate (cheap, use it after merging).
+- **What an agent is told to do after a merge or rebase depends on its state**, and cbx decides it
+  from `.cbx-state` rather than leaving the agent to infer it. A `busy` box is told to finish the task
+  it was already on; anything else is told to rebase and then **stop and wait** — explicitly not to
+  start, plan or look for other work. The earlier wording ("then continue with the next task") read to
+  an idle agent as permission to find itself something to do, and one went off and did exactly that.
 
 ### The confirm step
 

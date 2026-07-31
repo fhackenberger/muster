@@ -1189,8 +1189,23 @@ merge() {
 	echo "cbx: dropped refs/agents/$box (merged)"
 	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
 	# of work starts from what you just landed.
-	if say_to_box "$box" "Your work was merged into ${DEV}. Please run: git fetch hub && git rebase hub/${DEV} — then continue with the next task."; then
-		echo "cbx: asked $box to rebase onto $DEV"
+	#
+	# What it should do AFTER the rebase is decided HERE, from the box's activity — not left to the
+	# agent to infer. The old wording ("then continue with the next task") told an agent that had
+	# already finished and gone idle to find itself something to do, and one duly picked an unrelated
+	# piece of work out of the repo and started on it. An agent cannot reliably tell whether it was
+	# mid-task when a line was typed into its prompt; cbx can, from .cbx-state.
+	local mstate mage after_rebase resume_note
+	read -r mstate mage <<< "$(box_activity "$box")"
+	if [ "$mstate" = busy ]; then
+		after_rebase="Then go straight back to the task you were already working on and finish that. Do NOT start, plan, or pick up any other work."
+		resume_note="and resume the task it was on"
+	else
+		after_rebase="Then STOP and wait for my next instruction. There is no next task queued for you: do NOT start, plan, or pick up any other work, and do not look for something to do."
+		resume_note="and then wait for instructions"
+	fi
+	if say_to_box "$box" "Your work was merged into ${DEV}. Run exactly: git fetch hub && git rebase hub/${DEV} — that only replays the commits you have already made onto the merged ${DEV}. It is NOT a request for new changes, and nothing in the merge needs fixing. ${after_rebase}"; then
+		echo "cbx: asked $box to rebase onto $DEV $resume_note"
 	else
 		echo "cbx: (box $box not reachable — rebase it later with 'cbx rebase $box')"
 	fi
@@ -1209,7 +1224,7 @@ drop() {
 
 rebase() {
 	[ $# -ge 1 ] || die "rebase needs a box name (or 'all')"
-	local box list behind n=0 ok=0 force=""
+	local box list behind n=0 ok=0 force="" rstate rage after_rebase
 	[ "${2:-}" = --force ] && force=--force
 	if [ "$1" = all ]; then
 		list="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
@@ -1234,7 +1249,16 @@ rebase() {
 		else
 			behind="nothing pushed yet"
 		fi
-		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved. Resolve any conflicts, then carry on."; then
+		# Same reasoning as in merge(): what to do after the rebase is decided from the box's state, so
+		# an agent that is between tasks is not invited to go and find itself one. Normally every
+		# recipient here is non-busy (guard_busy skipped the rest); --force is the exception.
+		read -r rstate rage <<< "$(box_activity "$box")"
+		if [ "$rstate" = busy ]; then
+			after_rebase="Then go straight back to the task you were already working on. Do NOT start, plan, or pick up any other work."
+		else
+			after_rebase="Then STOP and wait for my next instruction — do NOT start, plan, or pick up any other work."
+		fi
+		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved, so this only replays your own commits on top of it. Resolve any conflicts it reports. It is NOT a request for new changes. ${after_rebase}"; then
 			ok=$((ok + 1))
 			echo "  $box: asked to rebase ($behind)"
 		else
