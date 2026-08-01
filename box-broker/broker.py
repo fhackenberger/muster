@@ -19,7 +19,9 @@ shared read-only by every box as an overlayfs lowerdir; each box writes into its
 N agents cost N x (their own diff) instead of N full checkouts. The mount is performed by DOCKER
 (a local-driver volume with type=overlay), so neither this broker nor the box needs CAP_SYS_ADMIN.
 Each box therefore gets a REAL .git and works on its own branch (agent/<box>), pushing to the hub;
-the hub reviews and merges. See hub/cbx and README-remote.md.
+the hub reviews and merges. See hub/cbx and README-remote.md. A spawn may name a different base
+branch and a branch to merge into it (POST /box/<name>?base=…&merge=…), which is how `cbx minto`
+hands an agent a conflicted merge that is already set up when claude starts.
 
 Goldens are immutable while any box is overlaid on one (changing a lowerdir under a live overlay
 is undefined behaviour), so they are versioned: data/golden/g-<id>, with `current` pointing at the
@@ -60,6 +62,7 @@ import re
 import shutil
 import subprocess
 import threading
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -99,6 +102,15 @@ CLAUDEBOX_SCRIPT = os.environ.get("CLAUDEBOX_SCRIPT", "/usr/local/bin/claude-box
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 GOLDEN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+# A git branch name, for the ?base=/?merge= spawn parameters (`cbx minto`). These end up in the box's
+# environment and are handed to `git checkout`/`git merge` there, so the set is deliberately narrow:
+# the leading character rules out a name that would parse as an option, and valid_branch() rejects the
+# revision syntax ('..', '@{') that the character class alone still admits.
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$")
+
+
+def valid_branch(name):
+	return bool(name) and bool(BRANCH_RE.match(name)) and ".." not in name and not name.endswith(".lock")
 HOME_IN = "/home/dev"
 
 # Serializes the background `docker pull` of BOX_IMAGE so concurrent spawns don't each start one.
@@ -577,7 +589,28 @@ def session_args(box_dir, resume):
 	return f"--session-id {sid}"
 
 
-def create_box(name, resume=False, fresh_upper=False):
+def box_job(box_dir, base, merge):
+	"""The box's branch job, persisted so a RECREATE reproduces it.
+
+	`cbx minto` spawns a box whose branch is based on some other branch (base) with $DEV merged into it
+	(merge) — see cbx-box-init. Both are normally a no-op on recreate, because the box's upper layer
+	still holds the branch and init resumes it; but a recreate --fresh discards the upper layer, and
+	without these the box would silently come back based on DEV_BRANCH with no merge in progress —
+	i.e. quietly the wrong thing, which is worse than failing."""
+	out = {}
+	for key, val in (("base", base), ("merge", merge)):
+		path = os.path.join(box_dir, key + "-branch")
+		if val:
+			with open(path, "w") as fh:
+				fh.write(val)
+			out[key] = val
+		elif os.path.exists(path):
+			with open(path) as fh:
+				out[key] = fh.read().strip()
+	return out
+
+
+def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	with _golden_lock:
 		golden = current_golden()
 	container = box_container(name)
@@ -598,6 +631,7 @@ def create_box(name, resume=False, fresh_upper=False):
 	svc_env = parse_service_env()
 	rows, checkout_dst, checkout_ro = parse_mounts(golden)
 	claude_args = session_args(box_dir, resume)
+	job = box_job(box_dir, base, merge)
 	mounts, vols = [], []
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
 	if checkout_ro:
@@ -649,6 +683,12 @@ def create_box(name, resume=False, fresh_upper=False):
 		CBX_BOX="" if checkout_ro else name,
 		CBX_HUB_GIT_URL=HUB_GIT_URL,
 		CBX_DEV_BRANCH=DEV_BRANCH,
+		# `cbx minto`: base the branch on something other than DEV_BRANCH, and (merge) leave that branch
+		# merged-and-conflicted before claude starts. Doing it in the INIT command rather than as a
+		# prompt is the point — a prompt is advisory and asynchronous, so "the agent never actually ran
+		# the setup" would be a failure you could only find by attaching to the tmux session.
+		CBX_BASE_BRANCH=job.get("base", ""),
+		CBX_MERGE_BRANCH=job.get("merge", ""),
 		HOME="/tmp",
 	)
 	forward_ports = {}
@@ -679,6 +719,7 @@ def create_box(name, resume=False, fresh_upper=False):
 	start_forwarders(name, slot, forwards)  # after the box exists
 	return {"box": name, "container": container, "workdir": checkout_dst, "session": claude_args,
 	        "golden": os.path.basename(golden), "branch": f"agent/{name}",
+	        "base": job.get("base", DEV_BRANCH), "merge": job.get("merge", ""),
 	        "slot": slot, "forwards": forward_ports, "mounts": mounts}
 
 
@@ -841,6 +882,12 @@ class Handler(BaseHTTPRequestHandler):
 	def _flag(self, name):
 		return name in (self.path.split("?", 1)[1] if "?" in self.path else "")
 
+	def _param(self, name):
+		"""A query parameter's value, or None. (_flag only answers "is this word present".)"""
+		q = self.path.split("?", 1)[1] if "?" in self.path else ""
+		vals = urllib.parse.parse_qs(q).get(name) or []
+		return vals[0] if vals else None
+
 	def _path(self):
 		return self.path.split("?", 1)[0].rstrip("/")
 
@@ -915,7 +962,13 @@ class Handler(BaseHTTPRequestHandler):
 			name = path[len("/box/"):]
 			if not NAME_RE.match(name):
 				return self._reply(400, {"error": "bad box name"})
-			result = create_box(name)
+			# ?base=<branch>&merge=<branch> — `cbx minto`: start this box on <base> with <merge>
+			# merged in and conflicted, instead of a fresh branch off DEV_BRANCH.
+			base, merge = self._param("base"), self._param("merge")
+			for b in (base, merge):
+				if b is not None and not valid_branch(b):
+					return self._reply(400, {"error": f"bad branch name: {b!r}"})
+			result = create_box(name, base=base, merge=merge)
 		except Exception as e:  # noqa: BLE001
 			return self._reply(500, {"error": str(e)})
 		self._reply(201, result)

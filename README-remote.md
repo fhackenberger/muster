@@ -486,6 +486,7 @@ cbx review work1 --plain    # …the old pager instead (a diff vs dev, no commen
 cbx fix    work1 -m "extract the dup mapper, add a test for the null branch"
 cbx merge  work1            # merge into dev (--squash for a single commit) + tell the box to rebase
 cbx push                    # dev -> origin
+cbx minto  staging          # the other direction: dev -> a long-lived branch (see below)
 ```
 
 ```
@@ -683,6 +684,71 @@ cbx merge work1                    # …then land it on the hub's dev as usual (
 
 Both use `docker exec -i` over ssh with **no PTY** — a pseudo-terminal would translate newlines and
 corrupt the patch bytes — which is why they're separate aliases and not the PTY-based `cbx` wrapper.
+
+### Merging dev *into* another branch (`cbx minto`)
+
+Everything above moves work **into** `dev`. `cbx minto <branch>` is the other direction — getting `dev`
+out into a long-lived branch (a staging integration branch, a release line):
+
+```sh
+cbx minto staging          # fast-forward, or a merge; asks only if it conflicts
+cbx push staging           # same preview + confirm as `cbx push`, for any branch
+```
+
+Two rules shape it, and they're worth knowing because they're what make it safe to run casually:
+
+- **The hub's checkout never moves.** It stays on `dev`, dirty with your local setup work — that tree
+  is what goldens are snapshotted from, so a `git checkout staging` here would change what every new
+  box starts from. A clean merge is therefore computed **in the object store** (`git merge-tree` →
+  `commit-tree` → `update-ref`); no index, no worktree, nothing to clean up if it fails.
+- **`refs/heads/<target>` doesn't move until the merge is finished.** Every path either lands a
+  finished commit or leaves the branch exactly as it was, so `--abort` is always free.
+
+The target has to exist as a **local** branch (minto creates it from `origin/<branch>` if needed) and
+must not be behind origin — `--pull` fast-forwards it first. A branch that's ahead of origin is fine.
+
+**On conflict** it asks what the branch is *for* — remembered per branch, and used to decide the
+resolution — then offers two ways out:
+
+```
+cbx: 3 conflicted file(s):
+    src/a.kt src/b.kt build.gradle
+cbx: what is staging FOR? (guides how conflicts get resolved)
+  [integration branch for the staging server] > 
+cbx: [b]ox — an agent resolves it  [h]ere — a worktree, you resolve it  [a]bort ?
+```
+
+**`[b]ox`** spawns an agent that opens **onto the conflicted tree**: the broker takes
+`?base=<target>&merge=<dev>` and `cbx-box-init` does the checkout and the merge in the box's tmux
+window *before claude starts* — setup is never left to a prompt, which is advisory and asynchronous.
+The agent gets both branches (`hub/<target>`, `hub/dev`), `merge.conflictstyle=zdiff3` so every hunk
+shows the common **base** and not just the two sides, and a briefing built around `git log --merge`,
+which lists the commits *from both sides* behind each conflicted file. It is told to flag a conflict
+it can't resolve rather than guess, and that its golden came from `dev` so the tree may not compile
+if `<target>` differs in build config.
+
+```sh
+cbx q                              # BOX  ... STATUS  SUMMARY: [minto -> staging] resolved 3 conflicts…
+cbx review minto-staging           # the RESOLUTION alone — `git show --cc`, hunks matching neither side
+cbx fix minto-staging -m '…'       # not convinced? send it back, same as any box
+cbx minto staging --land minto-staging
+cbx push staging
+```
+
+`--land` verifies before it moves anything: the target is still where it was, and the agent's commit
+contains **both** `<target>` and `dev` (i.e. it really is that merge, not a rebase or a squash). Then
+it fast-forwards the branch, keeps the handoff summary as a `cbx` note on the merge commit, drops the
+agent ref and retires the box. **`cbx merge` refuses a minto box outright** — merging it into `dev`
+would drag the whole target branch's history in, which is the one destructive mistake available here.
+
+**`[h]ere`** gives you a **linked worktree** under `.git/cbx/wt/<branch>` instead. It lives inside
+`.git` deliberately: that survives a hub container replacement (it's in the bind-mounted repo), and
+`cbx golden snapshot` already strips `.git/cbx`, so a half-finished merge can never leak into a
+golden. Committing there moves the branch (a linked worktree owns the branch it holds), so
+`cbx minto staging --landed` only verifies and tears the worktree down. An unfinished one shows up in
+`cbx status` — it has no box and no agent ref, so nothing else would remind you.
+
+`cbx minto <branch> --abort` drops whichever of the two is open. The branch was never moved.
 
 ## Goldens: the shared prepared checkout
 

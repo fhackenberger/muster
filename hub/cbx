@@ -48,6 +48,20 @@ set -euo pipefail
 #   cbx drop   <box>                        # discard an agent branch (tells the box)
 #   cbx rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
 #
+#   cbx minto <branch>                      # merge dev INTO another branch (staging, a release branch).
+#                                           #   A fast-forward, or a merge computed in the OBJECT STORE:
+#                                           #   the hub's own checkout never moves either way. On a
+#                                           #   CONFLICT it asks what the branch is for, then offers:
+#             [--box] [--here]              #   --box  = spawn an agent that opens on the conflicted
+#                                           #            tree with BOTH branches and both histories
+#                                           #   --here = a linked worktree under .git/cbx/wt you resolve
+#             [--intent "..."]              #   what the branch is FOR ("integration for staging") —
+#                                           #   remembered per branch, and handed to the agent
+#             --land <box>                  #   take the agent's resolved merge, move the branch onto it
+#             --landed                      #   you finished the --here worktree: verify + tear it down
+#             --abort                       #   drop whatever minto has open for that branch
+#             --pull                        #   fast-forward the branch to origin first
+#
 #   cbx export <box>                        # the agent's work, SQUASHED, as one mbox patch on STDOUT
 #                                           #   (laptop: `cbxexport <box>` pipes it into a local git am)
 #   cbx import <box>                        # read a patch on STDIN, REPLACE the agent's branch with it,
@@ -495,26 +509,33 @@ patch_ids() {
 # True when the branch changed only because it was rebased: same patches, different shas. Needs a
 # recorded dev sha, so state written before this existed just falls through to "re-review".
 rebase_only() {
-	local box="$1" pdev pref old new
+	local box="$1" pdev pref old new base
+	base="$(base_of "$box")"
 	pdev="$(reviewed_dev "$box")"; pref="$(reviewed_ref "$box")"
 	[ -n "$pdev" ] && [ -n "$pref" ] || return 1
 	git_ rev-parse --verify -q "${pdev}^{commit}" >/dev/null || return 1
 	old="$(patch_ids "$pdev" "$pref")"
-	new="$(patch_ids "$DEV" "refs/agents/$box")"
+	new="$(patch_ids "$base" "refs/agents/$box")"
 	# Two empty sets are not evidence of a rebase — they mean we failed to read patches at all.
 	[ -n "$old" ] && [ "$old" = "$new" ]
 }
 
 # merged | new | reviewed | rebased | re-review
+# Measured against the box's BASE, which is $DEV for an ordinary box and the target branch for one
+# spawned by `cbx minto` — a merge box's branch sits on top of the target and would otherwise read as
+# "hundreds of commits ahead of dev, conflicts with everything".
 box_status() {
-	local box="$1" sha prev
+	# `base`, NOT a local shadowing $DEV: bash locals are dynamically scoped, so a `local DEV` here
+	# would still be unset while base_of (which reads $DEV) runs, and `set -u` would kill cbx.
+	local box="$1" sha prev base
+	base="$(base_of "$box")"
 	sha="$(git_ rev-parse "refs/agents/$box")"
 	prev="$(reviewed_ref "$box")"
-	# Nothing on top of $DEV = this branch is already contained in it: it was merged, and only the ref
-	# and the review state were left behind (a conflicted `cbx merge` that you finished by hand does
-	# exactly that). Say so FIRST — otherwise the box sits in the queue as 'new' or 're-review'
+	# Nothing on top of the base = this branch is already contained in it: it was merged, and only the
+	# ref and the review state were left behind (a conflicted `cbx merge` that you finished by hand
+	# does exactly that). Say so FIRST — otherwise the box sits in the queue as 'new' or 're-review'
 	# forever, `cbx review` has an empty range to show, and there is no obvious way out.
-	if [ "$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo 1)" = 0 ]; then
+	if [ "$(git_ rev-list --count "$base..refs/agents/$box" 2>/dev/null || echo 1)" = 0 ]; then
 		echo merged
 	elif [ -z "$prev" ]; then echo new
 	elif [ "$prev" = "$sha" ]; then echo reviewed
@@ -524,16 +545,28 @@ box_status() {
 }
 
 queue() {
-	local any=0 box sha ahead age note prev status conf other
+	local any=0 box sha ahead age note prev status conf other base mt
 	printf '%-12s %6s %-14s %-11s %s\n' BOX AHEAD LAST STATUS SUMMARY
 	for box in $(agent_refs); do
 		any=1
+		base="$(base_of "$box")"; mt="$(minto_target "$box")"
 		sha="$(git_ rev-parse "refs/agents/$box")"
-		ahead="$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')"
+		# AHEAD for a minto box counts what the BOX added (the merge commit), not what the merge brings
+		# in with it — see minto_own_count. The target it is merging into goes in the summary rather
+		# than the STATUS column, which stays new/re-review/reviewed and keeps the table aligned.
+		if [ -n "$mt" ]; then
+			ahead="$(minto_own_count "$box" "$base")"
+		else
+			ahead="$(git_ rev-list --count "$base..refs/agents/$box" 2>/dev/null || echo '?')"
+		fi
 		age="$(git_ log -1 --format=%cr "refs/agents/$box")"
 		note="$(note_of "$box")"
 		status="$(box_status "$box")"
+		[ -n "$mt" ] && note="[minto -> $mt] ${note:-—}"
 		printf '%-12s %6s %-14s %-11s %s\n' "$box" "$ahead" "$age" "$status" "${note:-—}"
+		# A minto box conflicts with $DEV and with every other box BY CONSTRUCTION — its branch is the
+		# target branch plus a merge. Reporting that would be noise on every single line.
+		[ -n "$mt" ] && continue
 		# Conflicts are the shared-checkout collision awareness, moved earlier: you learn that two
 		# agents touched the same lines when they push, not when you merge the second one.
 		conf="$(conflicts_between "$DEV" "refs/agents/$box")"
@@ -541,6 +574,7 @@ queue() {
 		for other in $(agent_refs); do
 			[ "$other" = "$box" ] && continue
 			[[ "$other" > "$box" ]] || continue          # report each pair once
+			[ -n "$(minto_target "$other")" ] && continue
 			conf="$(conflicts_between "refs/agents/$box" "refs/agents/$other")"
 			[ -n "$conf" ] && printf '  %-10s ⚠ conflicts with %s: %s\n' "" "$other" "$conf"
 		done
@@ -592,6 +626,17 @@ status_overview() {
 		"$([ "$ahead" = 0 ] && printf '%s' "$C_DIM" || printf '%s' "$C_GRN")" "$ahead" "$C_RESET"
 	[ "$behind" != 0 ] && todo+=("cbx pull                # take $behind commit(s) from origin first")
 
+	# Open `cbx minto` worktrees. These have no box and no agent ref, so nothing else on this screen
+	# would show them — and an unfinished merge sitting in .git/cbx/wt is exactly the thing you forget.
+	local wtd wtb
+	for wtd in "$MINTO_WT"/*; do
+		[ -d "$wtd" ] || continue
+		wtb="$(git -C "$wtd" symbolic-ref --short -q HEAD 2>/dev/null || basename "$wtd")"
+		printf '  %s%s%s — %sunfinished merge of %s%s, in %s\n' \
+			"$C_B" "$wtb" "$C_RESET" "$C_YEL" "$DEV" "$C_RESET" "$wtd"
+		todo+=("cbx minto $wtb --landed   # finish the merge you started (or --abort)")
+	done
+
 	# The queue lives INSIDE the overview (rather than beside it) so one screen answers both "who is
 	# waiting on me" and "what do I do about it" — `cbx q --text` still prints the bare table.
 	hdr queue
@@ -604,12 +649,34 @@ status_overview() {
 			"$C_DIM" "$nw" BOX STATUS AHEAD BEHIND LAST SUMMARY "$C_RESET"
 	fi
 	for box in $list; do
+		# A minto box is measured against the branch it is merging INTO, not $DEV: its branch is that
+		# branch plus one merge commit, so dev-relative counts would read as hundreds of commits ahead.
+		local mbase mtgt
+		mtgt="$(minto_target "$box")"; mbase="${mtgt:-$DEV}"
 		sha="$(git_ rev-parse --short "refs/agents/$box")"
 		st="$(box_status "$box")"
-		ahd="$(git_ rev-list --count "$DEV..refs/agents/$box" 2>/dev/null || echo '?')"
-		bhd="$(git_ rev-list --count "refs/agents/$box..$DEV" 2>/dev/null || echo '?')"
+		ahd="$(git_ rev-list --count "$mbase..refs/agents/$box" 2>/dev/null || echo '?')"
+		bhd="$(git_ rev-list --count "refs/agents/$box..$mbase" 2>/dev/null || echo '?')"
 		age="$(git_ log -1 --format=%cr "refs/agents/$box")"; age="${age% ago}"
 		note="$(note_of "$box")"
+		if [ -n "$mtgt" ]; then
+			# The target goes in the SUMMARY, not the STATUS column: status still means new / reviewed /
+			# re-review (it is what decides the suggestion below), and a branch name would blow the
+			# column's width apart. AHEAD is what the box itself added — the merge commit — not the
+			# commits the merge brings along with it.
+			ahd="$(minto_own_count "$box" "$mtgt")"
+			printf '  %s %s %s%5s%s %s%6s%s %s%-13s%s %s%s%s\n' \
+				"$(cell "$C_B" "$nw" "$(trunc "$nw" "$box")")" "$(cell "$(q_color "$st")" 9 "$st")" \
+				"$C_GRN" "$ahd" "$C_RESET" "$C_DIM" 0 "$C_RESET" \
+				"$C_DIM" "$(trunc 13 "$age")" "$C_RESET" \
+				"$C_MAG" "$(trunc "$sumw" "[minto -> $mtgt] ${note:-—}")" "$C_RESET"
+			# No conflict scan: a merge box collides with $DEV and with every other box by construction.
+			case "$st" in
+				new|re-review) todo+=("cbx review $box            # the conflict resolution for $mtgt") ;;
+				*)             todo+=("cbx minto $mtgt --land $box   # land the resolved merge") ;;
+			esac
+			continue
+		fi
 		printf '  %s %s %s%5s%s %s%6s%s %s%-13s%s %s\n' \
 			"$(cell "$C_B" "$nw" "$(trunc "$nw" "$box")")" "$(cell "$(q_color "$st")" 9 "$st")" \
 			"$C_GRN" "$ahd" "$C_RESET" \
@@ -952,7 +1019,19 @@ review_session_guess() {
 
 # "You have looked at this branch, up to <sha>, while $DEV was at <sha>." Drives the queue status
 # (new / re-review / reviewed) and the incremental range-diff.
-mark_reviewed() { printf '%s %s' "$2" "$(git_ rev-parse "$DEV")" > "$STATE/$1.reviewed"; }
+mark_reviewed() { printf '%s %s' "$2" "$(git_ rev-parse "$(base_of "$1")")" > "$STATE/$1.reviewed"; }
+
+# The review TUI leaves things in the terminal's input queue: keys you typed while it was repainting,
+# plus the tail of its own query/response sequences. Whatever is pending gets echoed into — and can
+# outright answer — the next prompt, which is where the garbled "[m]ark / [l]eave" line comes from.
+# Drop it before asking anything.
+tty_flush() {
+	[ -e /dev/tty ] || return 0
+	# -n with a big count and -d '' (NUL): nothing short of the timeout stops it, so a partial line
+	# with no trailing newline is consumed too. Timing out is the normal exit, hence `|| true`.
+	read -rs -t 0.05 -n 10000 -d '' _ </dev/tty 2>/dev/null || true
+	return 0
+}
 
 # THE CONFIRM STEP, and the ONLY place a TUI review becomes real. Quitting the TUI decides nothing:
 # not whether the comments are sent, and not whether the review is recorded at all. That matters
@@ -965,6 +1044,7 @@ review_finish() {
 	md="$REVIEW_MD"; ids="$REVIEW_IDS"
 	if [ -z "$md" ]; then
 		# Nothing written. Still a decision: reviewed-and-happy, or "I did not really look".
+		tty_flush
 		printf 'cbx: no comments. [m]ark %s reviewed  [l]eave it unreviewed ? ' "$box"
 		read -r ans </dev/tty || ans=l
 		case "$ans" in
@@ -975,6 +1055,7 @@ review_finish() {
 		return 0
 	fi
 	while :; do
+		tty_flush
 		echo
 		printf '%s── feedback for %s ───────────────────────────────%s\n' "$C_B$C_CYA" "$box" "$C_RESET"
 		printf '%s\n' "$md"
@@ -1040,6 +1121,44 @@ review() {
 	sha="$(git_ rev-parse "$ref")"
 	prev="$(reviewed_ref "$box")"
 	mkdir -p "$STATE"
+
+	# --- a minto box: review the RESOLUTION, not the branch ---------------------------------------
+	# The useful view is the COMBINED diff (`git show --cc`): it shows only the hunks that differ from
+	# BOTH parents — i.e. exactly what the agent decided, with everything it merely carried across from
+	# one side or the other left out. `$DEV..$ref` (what a normal review shows) would be the entire
+	# target branch, and a TUI cannot render a combined diff at all, so this path is always the pager.
+	local mtgt; mtgt="$(minto_target "$box")"
+	if [ -n "$mtgt" ]; then
+		if [ -n "$prev" ] && [ "$prev" != "$sha" ]; then
+			echo "cbx: $box re-resolved since your last look ($(git_ rev-parse --short "$prev") -> $(git_ rev-parse --short "$sha"))."
+			echo
+		fi
+		{
+			echo "== $box: merge of $DEV into $mtgt =="
+			echo "== what $mtgt is for: $(minto_field "$box" 4) =="
+			echo
+			if [ -n "$full" ]; then
+				git_ --no-pager log --color=always --notes=cbx -1 "$ref"
+				echo
+				echo "-- everything $DEV brings to $mtgt --"
+				echo
+				git_ diff "$mtgt...$ref"
+			else
+				echo "-- THE RESOLUTION: hunks that match neither side ('--full' for the whole merge) --"
+				echo
+				# --cc, not -m: -m prints one full diff per parent (the whole target branch, then the
+				# whole of $DEV). --cc keeps only what the resolution itself changed.
+				git_ show --cc --notes=cbx --color=always "$ref"
+			fi
+		} | review_pager
+		mark_reviewed "$box" "$sha"
+		echo
+		echo "cbx: reviewed $(git_ rev-parse --short "$sha")."
+		echo "cbx: land it     — cbx minto $mtgt --land $box"
+		echo "cbx: or fix it   — cbx fix $box -m 'take the ... side in <file>, because ...'"
+		echo "cbx: or drop it  — cbx minto $mtgt --abort"
+		return 0
+	fi
 	# Nothing on top of $DEV: the work is already in, so there is no diff to show. Without this you get
 	# an empty range-diff ("1: abc123 < -: ---------") and no hint that the way out is a merge that
 	# only does bookkeeping.
@@ -1236,6 +1355,19 @@ merge() {
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
 
+	# A minto box's branch is <target> plus a merge commit. Merging that into $DEV would not land a fix
+	# — it would drag the entire target branch's history into $DEV, which is the one genuinely
+	# destructive mistake available in this workflow. Refuse, and name the command that is meant.
+	local mtgt; mtgt="$(minto_target "$box")"
+	if [ -n "$mtgt" ]; then
+		echo "cbx: '$box' is resolving a merge of $DEV INTO $mtgt — it does not belong in $DEV." >&2
+		echo "cbx: merging it here would pull all of $mtgt's history into $DEV." >&2
+		echo "cbx: review it — cbx review $box" >&2
+		echo "cbx: land it   — cbx minto $mtgt --land $box" >&2
+		echo "cbx: drop it   — cbx minto $mtgt --abort" >&2
+		die "refusing to merge a minto box into $DEV"
+	fi
+
 	# A conflict from an earlier attempt that is still unresolved. Merging again just re-conflicts on
 	# top of it, and closing the box out would strand the mess in the hub's worktree — so stop here
 	# and name both ways out. Unmerged index entries are the reliable signal: `--squash` leaves the
@@ -1373,9 +1505,413 @@ drop() {
 	local box="$1"
 	git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
 	# .sent goes with it: the branch this box will push next is a new review from scratch.
-	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
+	# .mergeinto too — without it a dropped minto box would keep being measured against a target it is
+	# no longer resolving, and `cbx merge` would go on refusing it.
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.mergeinto"
 	say_to_box "$box" "I dropped your handoff — that approach is not going in. Do not re-push it; wait for new instructions." 2>/dev/null || true
 	echo "cbx: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
+}
+
+# ------------------------------------------------------------------ minto (merge $DEV INTO a branch)
+#
+# The other direction from `cbx merge`: agent work flows INTO $DEV, and $DEV flows OUT into the
+# long-lived branches (staging, a release branch). Two rules shape the whole thing:
+#
+#   * THE HUB'S CHECKOUT NEVER MOVES. It stays on $DEV, dirty with your local setup work — that tree is
+#     what goldens are snapshotted from, so a `git checkout <target>` here would change what every new
+#     box starts from. A clean merge is therefore computed in the OBJECT STORE (merge-tree +
+#     commit-tree + update-ref) and a hand-resolved one gets its own linked worktree.
+#   * NOTHING MOVES refs/heads/<target> UNTIL THE MERGE IS FINISHED. Every path either lands a finished
+#     commit or leaves the branch exactly as it was, so `--abort` is always free.
+MINTO_WT="$STATE/wt"
+INTENT_DIR="$STATE/branch-intent"
+
+# Branch names may contain '/', which cannot appear in a state FILE name. One encoding, used for both
+# the intent cache and the worktree directory.
+branch_slug() { printf '%s' "${1//\//__}"; }
+
+# The job record for a box spawned by `cbx minto`: four lines — target, the target sha when it was
+# spawned, the $DEV sha when it was spawned, the intent. Its EXISTENCE is what tells the rest of cbx
+# that this box's branch is not meant for $DEV: the queue, the review and `mark_reviewed` measure it
+# against the target instead, and `cbx merge` refuses it outright.
+minto_field() { sed -n "${2}p" "$STATE/$1.mergeinto" 2>/dev/null || true; }
+minto_target() { minto_field "$1" 1; }
+# The branch an agent branch is measured against: its minto target, or $DEV for an ordinary box. Used
+# everywhere a diff, a count or a status is computed for a box.
+base_of() { local t; t="$(minto_target "$1")"; printf '%s' "${t:-$DEV}"; }
+
+# How many commits a minto box ADDED — everything on its branch that is on neither the target nor
+# $DEV. A clean resolution is exactly 1: the merge commit. A plain `<target>..<ref>` count would also
+# include every commit the merge brings in from $DEV, so a one-commit resolution of a busy week reads
+# as "37 commits to review".
+minto_own_count() {
+	git_ rev-list --count "refs/agents/$1" --not "$2" "$DEV" 2>/dev/null || echo '?'
+}
+
+# The box currently resolving a merge into <target>, if any (empty otherwise).
+minto_box_for() {
+	local f b
+	for f in "$STATE"/*.mergeinto; do
+		[ -e "$f" ] || continue
+		b="$(basename "$f" .mergeinto)"
+		if [ "$(minto_target "$b")" = "$1" ]; then printf '%s' "$b"; return 0; fi
+	done
+	return 0
+}
+
+# What the branch is FOR, in one line. Asked only on the conflict path — a fast-forward or a clean
+# merge decides nothing, so there is nothing for an intent to inform. Remembered per branch, because
+# the answer for 'staging' is the same every month and retyping it is how it ends up empty.
+minto_intent() {
+	local target="$1" given="$2" cached="" ans f
+	f="$INTENT_DIR/$(branch_slug "$target")"
+	if [ -n "$given" ]; then
+		mkdir -p "$INTENT_DIR"; printf '%s\n' "$given" > "$f"
+		printf '%s' "$given"; return 0
+	fi
+	cached="$(head -1 "$f" 2>/dev/null || true)"
+	if [ ! -t 0 ]; then printf '%s' "$cached"; return 0; fi
+	tty_flush
+	printf 'cbx: what is %s FOR? (guides how conflicts get resolved)\n' "$target" >&2
+	printf '  %s> ' "${cached:+[$cached] }" >&2
+	read -r ans </dev/tty || ans=""
+	[ -n "$ans" ] || ans="$cached"
+	if [ -n "$ans" ]; then mkdir -p "$INTENT_DIR"; printf '%s\n' "$ans" > "$f"; fi
+	printf '%s' "$ans"
+}
+
+# Everything that must be true before a merge into <target> can start. Runs before anything is
+# touched, so every refusal here leaves the repo exactly as it was.
+minto_prepare() {
+	local target="$1" dopull="$2" behind ahead wt head
+	echo "cbx: fetching origin"
+	git_ fetch -q origin 2>/dev/null || echo "cbx: (could not reach origin — working from the local refs)" >&2
+	# The target must exist as a LOCAL branch: the merge needs it here, and a resolving box can only
+	# fetch what the hub's git daemon exports, which is refs/heads/*.
+	if ! git_ rev-parse --verify -q "refs/heads/$target" >/dev/null; then
+		git_ rev-parse --verify -q "refs/remotes/origin/$target" >/dev/null \
+			|| die "no branch '$target' — not here, and not on origin"
+		git_ branch --track "$target" "origin/$target" >/dev/null
+		echo "cbx: created local $target tracking origin/$target"
+	fi
+	head="$(git_ symbolic-ref -q HEAD || true)"
+	[ "$head" != "refs/heads/$target" ] \
+		|| die "$target is the hub's checked-out branch — minto merges INTO a branch you are not sitting on"
+	wt="$MINTO_WT/$(branch_slug "$target")"
+	if [ -e "$wt" ]; then
+		echo "cbx: an unfinished minto worktree is already open on $target:" >&2
+		echo "    $wt" >&2
+		echo "cbx: finish it — resolve there, 'git add' + 'git commit', then: cbx minto $target --landed" >&2
+		echo "cbx: or drop it — cbx minto $target --abort" >&2
+		die "refusing to start a second merge into $target"
+	fi
+	local other; other="$(minto_box_for "$target")"
+	if [ -n "$other" ]; then
+		echo "cbx: box '$other' is already resolving a merge into $target." >&2
+		echo "cbx: land it    — cbx review $other   then   cbx minto $target --land $other" >&2
+		echo "cbx: or drop it — cbx minto $target --abort" >&2
+		die "refusing to start a second merge into $target"
+	fi
+	# Don't build on a stale base: a merge onto an old tip is rejected by `cbx push <target>` afterwards,
+	# leaving you to untangle it once the work is already done.
+	read -r behind ahead <<< "$(divergence "$target")"
+	if [ "$behind" != 0 ]; then
+		if [ -z "$dopull" ]; then
+			echo "cbx: origin/$target has $behind commit(s) $target doesn't." >&2
+			echo "cbx: merging now would put this on a stale base and 'cbx push $target' would be rejected." >&2
+			die "run: cbx minto $target --pull   (fast-forwards $target to origin first)"
+		fi
+		# A plain fetch into the branch: fast-forward only, so a genuinely diverged target fails here
+		# rather than being silently rewritten.
+		git_ fetch -q origin "$target:$target" \
+			|| die "$target has diverged from origin/$target — reconcile it by hand first"
+		echo "cbx: fast-forwarded $target to origin/$target"
+	fi
+}
+
+# The prompt for a resolving agent. Everything the box needs to understand the conflict SEMANTICALLY:
+# what the branch is for, and the commands that show both sides' history behind each conflicted file.
+minto_prompt() {
+	local target="$1" intent="$2" conflicts="$3" box="$4"
+	cat <<EOF
+You are resolving a merge conflict, not writing a feature.
+
+Your checkout is already on agent/${box} — it was branched from ${target} and \`git merge hub/${DEV}\`
+has been started for you, so the conflicts are sitting in your working tree right now. Both branches
+are fully available as hub/${target} and hub/${DEV}.
+
+WHAT ${target} IS FOR: ${intent:-（not stated）}
+Resolve every conflict so that ${target} keeps serving that purpose.
+
+Conflicted: ${conflicts}
+
+Before you change a single hunk, understand BOTH sides. These show you the two histories that
+collided, not just the two texts:
+
+  git log --oneline --left-right --boundary hub/${target}...hub/${DEV}
+      '<' = only on ${target}, '>' = only on ${DEV} — the two divergent histories side by side
+  git log --merge --stat
+      ONLY the commits, from BOTH sides, that touch a conflicted file. Start here.
+  git log --merge -p -- <conflicted-file>
+      per file: every commit from either side behind this conflict, with its diff and message
+  git log --notes=cbx hub/${DEV}
+      the handoff summaries — why ${DEV}'s side of the conflict looks the way it does
+  git diff --diff-filter=U
+      the conflict hunks. merge.conflictstyle is zdiff3, so each one shows the common BASE too:
+      that is what tells you which side CHANGED a line and which side merely kept it.
+
+Rules:
+  * Keep BOTH sides' intent wherever they are merely adjacent edits. A conflict is textual far more
+    often than it is semantic.
+  * Where the two sides genuinely disagree about behaviour, decide in favour of what ${target} is for,
+    and SAY SO in your handoff summary — that is the part I will read most carefully.
+  * If a conflict cannot be resolved without knowing something you don't, resolve the rest, leave that
+    one, and tell me. A flagged unknown is worth far more to me than a confident guess.
+  * Do NOT do any other work: no refactoring, no cleanups, no "while I'm here". Only the resolution.
+  * This box's golden was snapshotted from ${DEV}, so if ${target} differs in build config the tree may
+    not compile. Verify what you can; say plainly what you could not verify.
+
+When done: git add the resolved files, \`git commit\` (keep the merge commit — do NOT squash or rebase),
+then run: handoff "resolved <n> conflicts merging ${DEV} into ${target}: <what you decided and why>"
+EOF
+}
+
+# Spawn the resolver and record the job. Ordering matters: the state file is written BEFORE the box
+# exists, so a spawn that fails halfway still leaves something `--abort` can clean up.
+minto_spawn() {
+	local target="$1" tsha="$2" dsha="$3" intent="$4" conflicts="$5"
+	local box resp container
+	box="minto-$(branch_slug "$target")"
+	box="$(printf '%s' "$box" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | cut -c1-31)"
+	mkdir -p "$STATE"
+	printf '%s\n%s\n%s\n%s\n' "$target" "$tsha" "$dsha" "$intent" > "$STATE/$box.mergeinto"
+	echo "cbx: spawning box '$box' on $target, with $DEV merged in and conflicted"
+	# base + merge: the broker hands them to cbx-box-init, which does the checkout AND the merge in the
+	# box's tmux window BEFORE claude starts. That part must not be a prompt — a prompt is advisory and
+	# asynchronous, and "the agent did not actually run the setup commands" is not a failure you want to
+	# debug through a tmux session.
+	if ! resp="$(broker POST "/box/$box?base=$target&merge=$DEV")"; then
+		rm -f "$STATE/$box.mergeinto"
+		die "spawning box '$box' failed: $resp"
+	fi
+	container="$(printf '%s' "$resp" | jqr '.container // empty')"
+	if paste_to_box "$box" "$(minto_prompt "$target" "$intent" "$conflicts" "$box")"; then
+		echo "cbx: briefed $box (both branches, both histories, and what $target is for)"
+	else
+		echo "cbx: box is up but the briefing did NOT land — attach and paste it yourself:" >&2
+		echo "    docker exec -it -u dev $container tmux attach -t main" >&2
+	fi
+	echo "cbx: next — cbx q            # watch for the handoff"
+	echo "cbx:        cbx review $box  # the resolution alone (combined diff)"
+	echo "cbx:        cbx minto $target --land $box"
+}
+
+# The by-hand path: a LINKED WORKTREE, so the hub's own checkout stays on $DEV. It lives under
+# .git/cbx/ for two reasons — that directory is inside the bind-mounted repo, so it survives a hub
+# container replacement, and `golden_snapshot` already strips it, so a half-finished merge can never
+# leak into a golden and turn up in every new box.
+minto_worktree() {
+	local target="$1" wt
+	wt="$MINTO_WT/$(branch_slug "$target")"
+	mkdir -p "$MINTO_WT"
+	git_ worktree add --quiet "$wt" "$target" || die "could not create a worktree for $target"
+	git -C "$wt" config merge.conflictstyle zdiff3
+	# Expected to fail — that is the point. `|| true`: this is where the conflicts are supposed to land.
+	git -C "$wt" merge "$DEV" >/dev/null 2>&1 || true
+	echo
+	echo "cbx: resolve it in    $wt"
+	echo "cbx: (your $DEV checkout at $REPO is untouched)"
+	echo
+	echo "    cd $wt"
+	echo "    git status                       # the unmerged paths"
+	echo "    git log --merge -p -- <file>     # commits from BOTH sides behind each conflict"
+	echo "    \$EDITOR <file>                   # zdiff3: each hunk shows the common base too"
+	echo "    git add <file> && git commit     # $target moves HERE — a linked worktree owns its branch"
+	echo "    cbx minto $target --landed       # verify, tear the worktree down, tell you what's next"
+	echo
+	echo "cbx: changed your mind? cbx minto $target --abort"
+}
+
+# Take a resolving box's merge commit and move <target> onto it. Three ancestry checks make it
+# impossible to land anything that is not the merge that was asked for, and the guarded update-ref
+# makes it impossible to land it onto a target that moved in the meantime.
+minto_land() {
+	# NB `ref` gets its own statement: within ONE `local`, bash expands every word before assigning any
+	# of them, so "refs/agents/$box" there would read an unset $box and `set -u` would kill cbx.
+	local target="$1" box="$2" tsha dsha now n
+	local ref="refs/agents/$box"
+	[ -e "$STATE/$box.mergeinto" ] || die "box '$box' is not resolving a merge (no minto job recorded)"
+	[ "$(minto_target "$box")" = "$target" ] \
+		|| die "box '$box' is resolving a merge into '$(minto_target "$box")', not '$target'"
+	git_ rev-parse --verify -q "$ref" >/dev/null || die "$box has not pushed anything yet (no handoff)"
+	tsha="$(minto_field "$box" 2)"; dsha="$(minto_field "$box" 3)"
+	now="$(git_ rev-parse "refs/heads/$target")"
+	[ "$now" = "$tsha" ] \
+		|| die "$target moved since the merge started ($(git_ rev-parse --short "$tsha") -> $(git_ rev-parse --short "$now")) — re-run 'cbx minto $target' against the new tip"
+	git_ merge-base --is-ancestor "$tsha" "$ref" \
+		|| die "$box's branch does not contain $target — it did not resolve the merge that was asked for"
+	git_ merge-base --is-ancestor "$dsha" "$ref" \
+		|| die "$box's branch does not contain $DEV — it committed a resolution but dropped the merge (rebased or squashed it?)"
+	n="$(minto_own_count "$box" "$target")"
+	[ "$n" = 1 ] || echo "cbx: note — the box added $n commit(s), not just the merge ('cbx review $box --full' shows them)"
+	git_ update-ref -m "cbx minto --land $box" "refs/heads/$target" "$(git_ rev-parse "$ref")" "$tsha"
+	# No note copying needed: refs/heads/<target> and refs/agents/<box> now name the SAME commit, and a
+	# cbx note is attached to the commit, not to the ref — deleting the ref leaves the summary in place
+	# (`git log --notes=cbx $target`).
+	git_ update-ref -d "$ref" 2>/dev/null || true
+	rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent"
+	echo "cbx: $target is now $(git_ rev-parse --short "$target")"
+	git_ --no-pager diff --shortstat "$tsha" "refs/heads/$target" | sed 's/^/  /'
+	# A minto box has exactly one job and it is done. Unlike an agent box there is no ongoing task to
+	# resume, so leaving it running would just be a box you have to remember to kill.
+	if broker DELETE "/box/$box" >/dev/null 2>&1; then
+		echo "cbx: retired box $box"
+	else
+		echo "cbx: (box $box could not be removed — 'cbx kill $box' when convenient)"
+	fi
+	echo "cbx: next — cbx push $target"
+}
+
+# The --here counterpart: the branch already moved (a commit in a linked worktree moves the branch it
+# holds), so this only verifies what landed and cleans up.
+minto_landed() {
+	local target="$1" wt
+	wt="$MINTO_WT/$(branch_slug "$target")"
+	[ -e "$wt" ] || die "no minto worktree open for $target (nothing to finish)"
+	if [ -n "$(git -C "$wt" ls-files -u | head -1)" ]; then
+		echo "cbx: $wt still has UNRESOLVED conflicts:" >&2
+		git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/    /' >&2
+		die "resolve them, 'git add' + 'git commit', then re-run"
+	fi
+	git -C "$wt" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+		&& die "the merge in $wt is resolved but NOT committed — 'git -C $wt commit' first"
+	git_ merge-base --is-ancestor "$DEV" "refs/heads/$target" \
+		|| die "$target does not contain $DEV — was the merge committed? ('git -C $wt log --oneline -3')"
+	echo "cbx: $target is now $(git_ rev-parse --short "$target")"
+	git_ --no-pager log --oneline -1 "$target" | sed 's/^/  /'
+	git_ worktree remove --force "$wt" || die "could not remove $wt (remove it by hand, then 'git -C $REPO worktree prune')"
+	git_ worktree prune
+	echo "cbx: worktree removed. Next — cbx push $target"
+}
+
+# Undo whatever minto has open for a branch. Safe at any point BEFORE the merge lands, which is the
+# whole reason nothing touches refs/heads/<target> until then: there is never anything to revert.
+minto_abort() {
+	local target="$1" box wt n=0
+	wt="$MINTO_WT/$(branch_slug "$target")"
+	if [ -e "$wt" ]; then
+		git -C "$wt" merge --abort 2>/dev/null || true
+		git_ worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
+		git_ worktree prune
+		echo "cbx: removed the minto worktree for $target ($target was never moved)"
+		n=$((n + 1))
+	fi
+	box="$(minto_box_for "$target")"
+	if [ -n "$box" ]; then
+		git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
+		rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent"
+		broker DELETE "/box/$box" >/dev/null 2>&1 || true
+		echo "cbx: dropped box $box and its resolution ($target was never moved)"
+		n=$((n + 1))
+	fi
+	[ "$n" -gt 0 ] || echo "cbx: nothing open for $target — nothing to abort"
+}
+
+minto() {
+	[ $# -ge 1 ] || die "minto needs a target branch: cbx minto <branch>"
+	local target="$1" intent="" land="" abort="" landed="" dopull="" mode="" a
+	shift
+	while [ $# -gt 0 ]; do
+		a="$1"
+		case "$a" in
+			--intent)   shift; intent="${1:-}"; [ -n "$intent" ] || die "minto: --intent needs text" ;;
+			--intent=*) intent="${a#--intent=}" ;;
+			--land)     shift; land="${1:-}"; [ -n "$land" ] || die "minto: --land needs a box name" ;;
+			--land=*)   land="${a#--land=}" ;;
+			--abort)    abort=1 ;;
+			--landed)   landed=1 ;;
+			--pull)     dopull=1 ;;
+			--box)      mode=box ;;
+			--here)     mode=here ;;
+			*) die "minto: unknown option '$a' (--intent '…' | --box | --here | --land <box> | --landed | --abort | --pull)" ;;
+		esac
+		shift
+	done
+	[ "$target" != "$DEV" ] || die "minto: '$target' IS the source branch — cbx minto merges $DEV into something else"
+	mkdir -p "$STATE"
+
+	if [ -n "$abort" ];  then minto_abort  "$target";        return 0; fi
+	if [ -n "$land" ];   then minto_land   "$target" "$land"; return 0; fi
+	if [ -n "$landed" ]; then minto_landed "$target";        return 0; fi
+
+	minto_prepare "$target" "$dopull"
+
+	local tsha dsha tree out rc=0 new conflicts n ans
+	tsha="$(git_ rev-parse "refs/heads/$target")"
+	dsha="$(git_ rev-parse "refs/heads/$DEV")"
+
+	if git_ merge-base --is-ancestor "$dsha" "$tsha"; then
+		echo "cbx: $target already contains every commit on $DEV — nothing to merge."
+		return 0
+	fi
+	# Fast-forward: no merge commit is written, so there is nothing to decide — and therefore no reason
+	# to ask what the branch is for.
+	if git_ merge-base --is-ancestor "$tsha" "$dsha"; then
+		echo "cbx: $target is an ancestor of $DEV — fast-forwarding $(git_ rev-list --count "$target..$DEV") commit(s):"
+		git_ --no-pager log --oneline "$target..$DEV" | sed 's/^/  /'
+		git_ update-ref -m "cbx minto: fast-forward to $DEV" "refs/heads/$target" "$dsha" "$tsha"
+		echo "cbx: $target is now $(git_ rev-parse --short "$target"). Next — cbx push $target"
+		return 0
+	fi
+
+	echo "cbx: merging $DEV into $target — $(git_ rev-list --count "$target..$DEV") commit(s) to bring in, $(git_ rev-list --count "$DEV..$target") only on $target"
+	# THE MERGE, ATTEMPTED IN THE OBJECT STORE. No index, no worktree, nothing to clean up when it
+	# fails — and the hub's own tree is never a participant, so its local setup changes can neither be
+	# clobbered nor swept into the merge. merge-tree prints the resulting tree oid on line 1, and on
+	# conflict (exit 1, distinct from a real error) the conflicted paths from line 2 on.
+	out="$(git_ merge-tree --write-tree --name-only --no-messages "$target" "$DEV" 2>&1)" || rc=$?
+	if [ "$rc" = 0 ]; then
+		tree="$(printf '%s' "$out" | head -1)"
+		new="$(git_ commit-tree "$tree" -p "$tsha" -p "$dsha" \
+			-m "Merge $DEV into $target" -m "Cbx-Minto: $DEV")"
+		git_ update-ref -m "cbx minto: merge $DEV" "refs/heads/$target" "$new" "$tsha"
+		echo "cbx: merged cleanly — $target is now $(git_ rev-parse --short "$new")"
+		git_ --no-pager diff --shortstat "$tsha" "$new" | sed 's/^/  /'
+		echo "cbx: next — cbx push $target"
+		return 0
+	fi
+	[ "$rc" = 1 ] || die "git merge-tree failed ($rc): $out"
+
+	conflicts="$(printf '%s' "$out" | tail -n +2 | tr '\n' ' ')"
+	conflicts="${conflicts% }"
+	n="$(printf '%s' "$out" | tail -n +2 | grep -c . || true)"
+	echo
+	printf '%scbx: %s conflicted file(s):%s\n' "$C_B$C_RED" "$n" "$C_RESET"
+	printf '%s' "$out" | tail -n +2 | sed 's/^/    /'
+	echo
+	intent="$(minto_intent "$target" "$intent")"
+
+	if [ -z "$mode" ]; then
+		if [ -t 0 ]; then
+			tty_flush
+			printf 'cbx: [b]ox — an agent resolves it  [h]ere — a worktree, you resolve it  [a]bort ? '
+			read -r ans </dev/tty || ans=a
+			case "$ans" in
+				b|B|"") mode=box ;;
+				h|H)    mode=here ;;
+				*)      echo "cbx: aborted — $target is unchanged, nothing was written."; return 0 ;;
+			esac
+		else
+			# Non-interactive: report and change nothing. Guessing either way would be a surprise.
+			echo "cbx: not a terminal — nothing done. Re-run with --box or --here." >&2
+			return 1
+		fi
+	fi
+	if [ "$mode" = box ]; then
+		minto_spawn "$target" "$tsha" "$dsha" "$intent" "$conflicts"
+	else
+		minto_worktree "$target"
+	fi
 }
 
 rebase() {
@@ -1431,8 +1967,10 @@ rebase() {
 }
 
 divergence() {
-	# "<behind> <ahead>" of $DEV relative to origin/$DEV. Needs a fetch first to mean anything.
-	git_ rev-list --left-right --count "origin/$DEV...$DEV" 2>/dev/null || echo "0 0"
+	# "<behind> <ahead>" of a branch relative to its origin/ counterpart ($DEV unless told otherwise —
+	# `cbx minto` asks about the branch it is merging into). Needs a fetch first to mean anything.
+	local b="${1:-$DEV}"
+	git_ rev-list --left-right --count "origin/$b...$b" 2>/dev/null || echo "0 0"
 }
 
 pull() {
@@ -1462,15 +2000,30 @@ pull() {
 }
 
 push() {
-	local ahead behind yes="" a reply
+	# Takes an optional BRANCH (default $DEV) so `cbx minto <target>` has something to hand you at the
+	# end. Everything else — the --stat preview, the confirm, the failure diagnostics — is per-branch by
+	# substitution only; nothing about the push itself is dev-specific.
+	local ahead behind yes="" a reply branch=""
 	for a in "$@"; do
 		case "$a" in
 			-y|--yes) yes=1 ;;
-			*) die "push: unknown option '$a' (-y | --yes)" ;;
+			-*) die "push: unknown option '$a' (-y | --yes)" ;;
+			*)  [ -z "$branch" ] || die "push: one branch at a time (got '$branch' and '$a')"
+			    branch="$a" ;;
 		esac
 	done
-	read -r behind ahead <<< "$(divergence)"
-	[ "$behind" = 0 ] || die "origin has $behind commit(s) $DEV doesn't — run 'cbx pull' (or 'cbx pull --rebase') first"
+	local DEV="${branch:-$DEV}"          # local: every $DEV below now means "the branch being pushed"
+	git_ rev-parse --verify -q "refs/heads/$DEV" >/dev/null || die "push: no local branch '$DEV'"
+	# The counts are only true against a fresh origin. `cbx merge` fetches before it merges, but a
+	# `cbx push <other-branch>` can arrive with no fetch in between.
+	git_ fetch -q origin "$DEV" 2>/dev/null || echo "cbx: (could not reach origin — counts may be stale)" >&2
+	read -r behind ahead <<< "$(divergence "$DEV")"
+	if [ "$behind" != 0 ]; then
+		if [ -n "$branch" ]; then
+			die "origin has $behind commit(s) $DEV doesn't — run 'cbx minto $DEV --pull' first"
+		fi
+		die "origin has $behind commit(s) $DEV doesn't — run 'cbx pull' (or 'cbx pull --rebase') first"
+	fi
 	# Don't report "pushed" when there was nothing to push — that reads as "my merge went out" when
 	# in fact nothing was ever merged (a silent `cbx merge` failure looks exactly like this).
 	if [ "$ahead" = 0 ]; then
@@ -1605,6 +2158,11 @@ golden_snapshot() {
 	# file in every agent's `git status`.
 	rm -f  "$st/.git/hooks/update"
 	rm -rf "$st/.git/cbx"
+	# Linked-worktree registrations (a `cbx minto --here` in progress). The worktrees themselves live
+	# under .git/cbx and are gone with the line above, but their admin dirs are separate: left behind,
+	# every box would inherit a `git worktree list` entry pointing at a path that does not exist there,
+	# and git refuses to check out a branch it believes is checked out in one of them.
+	rm -rf "$st/.git/worktrees"
 	printf '%s from %s (%s) at %s\n' "$id" "$(git_ rev-parse --short HEAD)" "$DEV" "$(date -Is)" \
 		> "$st/.git/cbx-golden"
 
@@ -1713,6 +2271,7 @@ case "$cmd" in
 	fix)      fix "$@" ;;
 	prereview) prereview "$@" ;;
 	merge)    merge "$@" ;;
+	minto)    colors_init; minto "$@" ;;
 	drop)     drop "$@" ;;
 	rebase)   rebase "$@" ;;
 	export)   export_patch "$@" ;;
@@ -1728,5 +2287,7 @@ case "$cmd" in
 			reap)     golden_reap ;;
 			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap" ;;
 		esac ;;
-	*) sed -n '4,52p' "$0" | sed 's/^# \?//'; exit 1 ;;
+	# The header block IS the help. Printed by pattern rather than by line number (it used to be a
+	# hard-coded '4,52p', which silently started cutting the usage list in half as commands were added).
+	*) awk 'NR < 4 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 1 ;;
 esac
