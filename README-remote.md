@@ -484,7 +484,7 @@ cbx q --text                # just the queue table, once, as plain text (pipes, 
 cbx review work1            # the review TUI: comment on lines, quit, confirm -> sent to the box
 cbx review work1 --plain    # …the old pager instead (a diff vs dev, no commenting)
 cbx fix    work1 -m "extract the dup mapper, add a test for the null branch"
-cbx merge  work1            # merge into dev (--squash for a single commit) + tell the box to rebase
+cbx merge  work1            # merge into dev (--squash for one commit, --reword to fix the messages)
 cbx push                    # dev -> origin
 cbx minto  staging          # the other direction: dev -> a long-lived branch (see below)
 ```
@@ -550,6 +550,29 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   this holds with or without `--squash`, and the agent stays the author. **Several commits** open all
   of them verbatim and unindented, separated by a `# ── 2/3 · <sha> ──` banner; git drops `#` lines on
   save, so leaving the buffer untouched gives you the messages one blank line apart and no banners.
+- **`cbx merge <box> --reword` keeps every commit and rewrites only the messages.** `--squash --edit`
+  gives you one commit you can word yourself, but a branch that is genuinely three changes should land
+  as three. `--reword` opens a small loop over the commits instead:
+
+  ```
+  ── work1: 3 commit(s) to land on dev ─────────────────
+     1. 51aeab2 wip
+     2. dff7652 REWORDED: cache the widget lookup per request
+     3. acb3eb6 fix thing
+  ────────────────────────────────────────────────────
+  (green = your wording)  [1-3] edit  [a]ll  [d]<n> diff  [r]<n> revert  [m]erge  [q]uit ?
+  ```
+
+  Edit them in any order, as many times as you like; `d<n>` pages that commit's diff when you need to
+  remember what it did, `r<n>` puts the agent's wording back. **Nothing is rewritten until you press
+  `m`** — and quitting doesn't lose your work: the messages are kept per commit sha under
+  `.git/cbx/reword/<box>/`, so re-running `--reword` picks them up (they're keyed by sha, so if the
+  agent pushes again in the meantime the stale ones are simply ignored). The rewrite is object-store
+  only: every commit keeps its **tree** — what lands is byte-for-byte what you reviewed — and its
+  original **author** and author date. Only the message and the parent chain change, so the patches
+  are identical and the box's follow-up `git rebase hub/dev` skips them cleanly by patch-id.
+  Refused on a branch containing a merge commit (replaying that as a linear chain would silently drop
+  one side) — use `--squash --edit` there.
 - **A branch whose work is already in `dev` shows up as `merged`.** `cbx q` lists it with `0` ahead and
   the one action that applies (`cbx merge <box>` — which does only bookkeeping), and `cbx review <box>`
   says so instead of paging an empty range-diff at you. Without that, a box left over from a
@@ -858,6 +881,19 @@ The stack's own plumbing (`data/repo`, the goldens, `data/boxes`, `hub-services`
 pinchtab, `git-identity`) stays in `compose.yml` — that's the stack's definition, not this project's
 environment.
 
+
+## Tests
+
+```sh
+./tests/run-tests.sh              # everything (~40s), no docker and no network needed
+./tests/run-tests.sh minto        # only tests whose name matches
+```
+
+`hub/cbx`, `box-bin/cbx-box-init` and the broker's pure helpers are covered by an offline suite: the
+broker is replaced by a stub with the same HTTP contract (which records what cbx asked it to do), and
+every git operation runs against a scratch repo with a bare "origin" beside it. It runs in the
+Jenkins pipeline **before** any image is built — a broken `cbx` should never reach an image. See
+[`tests/README.md`](tests/README.md) for how to add one.
 
 ## Notes
 

@@ -8,7 +8,7 @@ set -euo pipefail
 #     prepared "golden" checkout and pushes to refs/agents/<box> here; you review and merge into dev.
 #
 # Usage:
-#   cbx svcs                                # list dev services (declared in hub-services/) + state
+#   cbx svcs | services                     # list dev services (declared in hub-services/) + state
 #   cbx up   <service>                      # start a service in its tmux window
 #   cbx down <service>                      # stop it
 #   cbx logs <service>|gitd                 # attach that service window (Ctrl-b d to detach)
@@ -19,8 +19,8 @@ set -euo pipefail
 #   cbx ls                                  # list services + boxes (broker)
 #   cbx forwards [box]                      # re-establish the hub-loopback socat forwards
 #
-#   cbx status                              # what can be merged / rebased / pushed, with commands
-#   cbx q  [-n SECS] [--no-bell]            # LIVE dashboard: queue + status in one repainted screen,
+#   cbx status | st                         # what can be merged / rebased / pushed, with commands
+#   cbx q | queue [-n SECS] [--no-bell]     # LIVE dashboard: queue + status in one repainted screen,
 #                                           #   and your terminal BELLS when an agent stops working
 #                                           #   or a new handoff lands. 'q'/Ctrl-C quits, Enter refreshes
 #   cbx q  --text                           # the queue table once, as plain text (for pipes/scripts)
@@ -40,6 +40,12 @@ set -euo pipefail
 #   cbx merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
 #                                           #   (--edit on a 1-commit branch: no merge commit)
+#             [--reword|-r]                 #   KEEP every commit and rewrite each MESSAGE, in a little
+#                                           #   editor loop: lists the commits, [n] edits one, [a] all,
+#                                           #   [d<n>] shows its diff, [r<n>] reverts to the agent's
+#                                           #   wording, [m] merges. Nothing is rewritten until you
+#                                           #   confirm, and your edits survive quitting. Trees and
+#                                           #   authors are untouched — only the messages change.
 #             [--landed]                    #   the merge CONFLICTED and you finished it by hand: retire
 #                                           #   the branch + tell the box, without merging again. Only
 #                                           #   needed when your fix was a squash/hand-written commit —
@@ -478,6 +484,11 @@ agent_refs() { git_ for-each-ref --format='%(refname:strip=2)' refs/agents/; }
 # a box handed off WITHOUT a summary (bare `handoff`), pipefail propagates that through head, and
 # under `set -e` the enclosing `msg="$(note_of …)"` then kills the whole command silently.
 note_of() { git_ notes --ref=cbx show "refs/agents/$1" 2>/dev/null | head -1 || true; }
+
+# `--notes=cbx`, but only when that ref exists. Otherwise git prefixes EVERY log with "warning: notes
+# ref refs/notes/cbx is invalid" — which is the first thing you see in a stack where no agent has yet
+# handed off with a summary, and it reads like something is broken.
+notes_arg() { git_ rev-parse --verify -q refs/notes/cbx >/dev/null && printf '%s' --notes=cbx || true; }
 
 # Conflicted paths between two committishes, without touching the worktree or the index.
 # --no-messages drops git's "Auto-merging / CONFLICT (content)" prose, leaving the tree oid on line 1
@@ -1138,7 +1149,7 @@ review() {
 			echo "== what $mtgt is for: $(minto_field "$box" 4) =="
 			echo
 			if [ -n "$full" ]; then
-				git_ --no-pager log --color=always --notes=cbx -1 "$ref"
+				git_ --no-pager log --color=always $(notes_arg) -1 "$ref"
 				echo
 				echo "-- everything $DEV brings to $mtgt --"
 				echo
@@ -1148,7 +1159,7 @@ review() {
 				echo
 				# --cc, not -m: -m prints one full diff per parent (the whole target branch, then the
 				# whole of $DEV). --cc keeps only what the resolution itself changed.
-				git_ show --cc --notes=cbx --color=always "$ref"
+				git_ show --cc $(notes_arg) --color=always "$ref"
 			fi
 		} | review_pager
 		mark_reviewed "$box" "$sha"
@@ -1177,14 +1188,25 @@ review() {
 	fi
 
 	# --- viewer: the TUI, or the plain pager -----------------------------------------------------
-	# Incremental = you have reviewed this box before and it has moved since. That case is the pager's,
-	# because it is a `git range-diff` — only what changed since you last looked, correct across the
-	# amends and rebases a fix round produces. A TUI can only be pointed at a commit RANGE, and after
-	# an amend `prev..ref` is no longer "the new work" (the old commits are not ancestors any more), so
-	# it would silently degrade to the whole branch. --tui asks for that anyway.
-	local incremental="" use_tui=""
+	# "It moved since I last looked" is TWO different situations, and conflating them was a bug: a
+	# re-review showed the new commits' subjects and no diffs at all.
+	#
+	#   ADDED    — the agent pushed MORE commits on top; your $prev is still an ancestor. The new work
+	#              is exactly `$prev..$ref`, a normal commit range: the TUI handles it, and the pager
+	#              shows it as an ordinary patch series.
+	#   REWRITTEN — a fix round amended or rebased what you already read, so `$prev..$ref` is NOT the
+	#              new work (the old commits are no longer ancestors). Only `git range-diff` can line
+	#              the two versions up, and a TUI cannot render one — hence the pager.
+	#
+	# The old code called both "incremental" and sent both to range-diff. range-diff only prints a
+	# patch for commits it can PAIR; a brand-new commit has no counterpart, so it comes out as a bare
+	# "-: ------- > 3: 0bcd6e6 subject" line. For the ADDED case that is every single commit, which is
+	# why the whole review rendered as a list of subjects with no file diffs anywhere.
+	local incremental="" added="" use_tui=""
 	if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ -z "$full" ] \
-	   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then incremental=1; fi
+	   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then
+		if git_ merge-base --is-ancestor "$prev" "$ref" 2>/dev/null; then added=1; else incremental=1; fi
+	fi
 	if [ -n "$plain" ]; then use_tui=""
 	elif ! have_tui; then
 		if [ -n "$tui" ]; then die "review: no review TUI on PATH (CBX_REVIEW_TUI='$REVIEW_TUI')"; fi
@@ -1193,7 +1215,7 @@ review() {
 	elif [ -n "$net" ]; then use_tui=""      # --net names a pager rendering (one combined diff)
 	elif [ -n "$incremental" ]; then
 		use_tui=""
-		echo "cbx: $box changed since your last review — showing the range-diff (pager)."
+		echo "cbx: $box AMENDED what you already reviewed — showing the range-diff (pager)."
 		echo "cbx: '--tui' opens ${REVIEW_TUI%% *} on the whole branch instead."
 		echo
 	else use_tui=1
@@ -1209,6 +1231,13 @@ review() {
 		local base rc=0 slug
 		base="$(git_ merge-base "$DEV" "$ref" 2>/dev/null || true)"
 		[ -n "$base" ] || base="$DEV"      # unrelated histories: nothing better to offer
+		# Only the commits added since your last review, when that is what this is — the TUI's own
+		# range, so its comments anchor to the new work instead of the whole branch again.
+		if [ -n "$added" ]; then
+			base="$prev"
+			echo "cbx: $box added $(git_ rev-list --count "$prev..$ref") commit(s) since your last review — showing just those ('--full' for the branch)."
+			echo
+		fi
 		run_review_tui "$base..$ref" || rc=$?
 		# Interrupted (Ctrl-C, SIGHUP, the terminal going away) is NOT a broken TUI: you bailed out.
 		# Fall through to neither the pager nor the confirm step, and leave the queue untouched.
@@ -1237,14 +1266,23 @@ review() {
 	{
 		echo "== $box: $(git_ rev-list --count "$DEV..$ref") commit(s) on top of $DEV =="
 		echo
-		if [ -n "$prev" ] && [ "$prev" != "$sha" ] && [ -z "$full" ] \
-		   && git_ rev-parse --verify -q "$prev^{commit}" >/dev/null; then
-			# Re-review after a fix round: show ONLY what changed since you last looked. range-diff copes
-			# with the amends and rebases a fix round produces, which a plain diff cannot. Keep the plain
-			# commit list above it, since range-diff shows subjects but not messages or notes.
-			git_ log --color=always --notes=cbx "$DEV..$ref"
+		if [ -n "$added" ]; then
+			# The agent pushed MORE commits on top of what you read. `$prev..$ref` IS the new work, so
+			# show it the way the default view shows a branch: every new commit with its own message,
+			# notes and full patch. (A range-diff here would print one subject line per commit and no
+			# diff at all — see the ADDED/REWRITTEN split above.)
+			git_ log --color=always $(notes_arg) "$DEV..$ref"
 			echo
-			echo "-- changes since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
+			echo "-- the $(git_ rev-list --count "$prev..$ref") commit(s) added since your last review ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
+			echo
+			git_ log --color=always $(notes_arg) --reverse --patch --stat "$prev..$ref"
+		elif [ -n "$incremental" ]; then
+			# Re-review after a fix round REWROTE what you read (amend/rebase): only range-diff can line
+			# the old and new versions up. Keep the plain commit list above it, since range-diff shows
+			# subjects but not messages or notes.
+			git_ log --color=always $(notes_arg) "$DEV..$ref"
+			echo
+			echo "-- what changed in the commits you already reviewed ($(git_ rev-parse --short "$prev")); --full for the whole branch --"
 			echo
 			# --color=always because delta does NOT understand range-diff (its inner diff is indented by
 			# four spaces and carries a second +/- column, so delta passes every line through verbatim).
@@ -1253,14 +1291,14 @@ review() {
 			git_ range-diff --color=always "$DEV..$prev" "$DEV..$ref"
 		elif [ -n "$net" ]; then
 			# The branch's NET effect, as it will land: one combined diff, no per-commit split.
-			git_ log --color=always --notes=cbx "$DEV..$ref"
+			git_ log --color=always $(notes_arg) "$DEV..$ref"
 			echo
 			git_ diff "$DEV...$ref"
 		else
 			# Default: each commit with ITS OWN message, notes and diff, oldest first — so a branch with
 			# several commits reads as a sequence of changes instead of one merged blob you can't
 			# attribute. `--net` gives the combined diff when you want the end state instead.
-			git_ log --color=always --notes=cbx --reverse --patch --stat "$DEV..$ref"
+			git_ log --color=always $(notes_arg) --reverse --patch --stat "$DEV..$ref"
 		fi
 	} | review_pager
 
@@ -1306,8 +1344,10 @@ prereview() {
 merge_finish() {
 	local box="$1" ref="refs/agents/$box" mstate mage after_rebase resume_note fbehind fahead
 	git_ update-ref -d "$ref" 2>/dev/null || true
-	# .sent goes with it: the branch this box will push next is a new review from scratch.
+	# .sent goes with it: the branch this box will push next is a new review from scratch. Same for any
+	# --reword messages: they are keyed to commits that have now landed.
 	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
+	rm -rf "$(reword_dir "$box")"
 	echo "cbx: dropped refs/agents/$box (merged)"
 	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
 	# of work starts from what you just landed.
@@ -1340,18 +1380,182 @@ merge_finish() {
 	fi
 }
 
+# ------------------------------------------------------------------ reword (`cbx merge --reword`)
+#
+# Agents write serviceable commit messages, not the ones you want in the history of $DEV. `--squash
+# --edit` collapses the branch into one commit you can word yourself, but that throws the structure
+# away: a branch that is genuinely three changes should land as three commits. --reword keeps every
+# commit and lets you rewrite each message, then lands them with the normal merge.
+#
+# Edits are kept per commit sha under $STATE/reword/<box>/, so an interrupted session (or a `q` you
+# regret) is not lost — re-run and they are still there. They are keyed by the ORIGINAL sha, so if the
+# agent pushes again in the meantime the stale ones simply stop matching and are ignored.
+reword_dir() { printf '%s/reword/%s' "$STATE" "$1"; }
+
+# The message you will land for a commit: your edited version if there is one, else the agent's.
+reword_msg() {
+	local box="$1" c="$2" f
+	f="$(reword_dir "$box")/$c"
+	if [ -s "$f" ]; then cat "$f"; else git_ log -1 --format=%B "$c"; fi
+}
+
+# The little editor loop. Lists the commits, lets you edit any of them (repeatedly, in any order),
+# shows a diff on demand, and only rewrites anything once you confirm. Returns 0 with REWORD_TIP set
+# to the new branch tip, or 1 if you backed out (in which case NOTHING has been written: the rewrite
+# happens after the confirm, never as you go).
+REWORD_TIP=""
+reword_tui() {
+	local box="$1" ref="$2" base dir c i n ans arg tmp
+	local -a commits=()
+	REWORD_TIP=""
+	base="$(git_ merge-base "$DEV" "$ref")"
+	# A MERGE inside the agent's branch cannot be reworded this way: the rewrite below replays a linear
+	# chain with commit-tree, which would silently flatten it and drop one side's history. Rare (agents
+	# work on their own branch), but it would be data loss disguised as a reword.
+	if [ -n "$(git_ rev-list --merges "$base..$ref")" ]; then
+		echo "cbx: $box's branch contains a merge commit — --reword can only rewrite a linear chain." >&2
+		die "use 'cbx merge $box --squash --edit' instead, or reword it by hand in a worktree"
+	fi
+	while read -r c; do commits+=("$c"); done < <(git_ rev-list --reverse "$base..$ref")
+	n="${#commits[@]}"
+	[ "$n" -gt 0 ] || die "nothing to reword — $box has no commits on top of $DEV"
+	dir="$(reword_dir "$box")"; mkdir -p "$dir"
+
+	while :; do
+		tty_flush
+		echo
+		printf '%s── %s: %s commit(s) to land on %s ─────────────────%s\n' "$C_B$C_CYA" "$box" "$n" "$DEV" "$C_RESET"
+		i=0
+		for c in "${commits[@]}"; do
+			i=$((i + 1))
+			# The SUBJECT of what will actually land — your edit if you made one, marked so you can see
+			# at a glance what is still the agent's wording.
+			if [ -s "$dir/$c" ]; then
+				printf '  %s%2d.%s %s%s%s %s%s%s\n' "$C_B" "$i" "$C_RESET" \
+					"$C_DIM" "$(git_ rev-parse --short "$c")" "$C_RESET" \
+					"$C_GRN" "$(head -1 "$dir/$c")" "$C_RESET"
+			else
+				printf '  %s%2d.%s %s%s%s %s\n' "$C_B" "$i" "$C_RESET" \
+					"$C_DIM" "$(git_ rev-parse --short "$c")" "$C_RESET" \
+					"$(git_ log -1 --format=%s "$c")"
+			fi
+		done
+		printf '%s────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_RESET"
+		printf '%s(green = your wording)%s  [1-%s] edit  [a]ll  [d]<n> diff  [r]<n> revert  [m]erge  [q]uit ? ' \
+			"$C_DIM" "$C_RESET" "$n"
+		read -r ans </dev/tty || ans=q
+		arg="${ans#[a-zA-Z]}"; arg="${arg# }"
+		case "$ans" in
+			[0-9]*) reword_one "$box" "$ans" "${commits[@]}" ;;
+			a|A)
+				for c in "${commits[@]}"; do reword_open "$box" "$c"; done ;;
+			d*|D*)
+				if [ -z "$arg" ]; then echo "cbx: which one? e.g. 'd2'"; continue; fi
+				reword_show "$box" "$arg" "${commits[@]}" ;;
+			r*|R*)
+				if [ -z "$arg" ]; then echo "cbx: which one? e.g. 'r2'"; continue; fi
+				reword_revert "$box" "$arg" "${commits[@]}" ;;
+			m|M|"")
+				REWORD_TIP="$(reword_apply "$box" "$base" "${commits[@]}")"
+				return 0 ;;
+			q|Q)
+				echo "cbx: not merged. Your edited messages are kept — 'cbx merge $box --reword' picks them up."
+				return 1 ;;
+			*) echo "cbx: answer a number (edit that one), a (all), d<n>, r<n>, m (merge) or q (quit)." ;;
+		esac
+	done
+}
+
+# Open $EDITOR on one commit's message. Seeded with what will currently land, so re-editing continues
+# from your own wording rather than starting from the agent's again.
+reword_open() {
+	local box="$1" c="$2" dir tmp
+	dir="$(reword_dir "$box")"; mkdir -p "$dir"
+	tmp="$(mktemp --suffix=.COMMIT_EDITMSG)"
+	{
+		reword_msg "$box" "$c"
+		echo
+		echo "# Rewording $(git_ rev-parse --short "$c") by $(git_ log -1 --format='%an' "$c")."
+		echo "# Lines starting with '#' are dropped. An empty message keeps the agent's original."
+		echo "#"
+		git_ log -1 --format='#   %s' "$c"
+		git_ show --stat --format= "$c" | sed 's/^/# /'
+	} > "$tmp"
+	"${EDITOR:-vim}" "$tmp" </dev/tty >/dev/tty 2>&1 || true
+	# --cleanup=strip semantics, done here because nothing is committed yet: drop comment lines and
+	# leading/trailing blank lines.
+	local body
+	body="$(grep -v '^#' "$tmp" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac)"
+	rm -f "$tmp"
+	if [ -z "${body//[[:space:]]/}" ]; then
+		rm -f "$dir/$c"
+		echo "cbx: left $(git_ rev-parse --short "$c") with the agent's original message."
+	else
+		printf '%s\n' "$body" > "$dir/$c"
+	fi
+}
+
+# Resolve "3" (or "d3"/"r3") to a commit and act on it. Kept separate so the index check — the one
+# thing a typo hits — is written once.
+reword_pick() {
+	local sel="$1"; shift
+	local -a commits=("$@")
+	sel="${sel#[a-zA-Z]}"; sel="${sel# }"
+	case "$sel" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$sel" -ge 1 ] && [ "$sel" -le "${#commits[@]}" ] || return 1
+	printf '%s' "${commits[$((sel - 1))]}"
+}
+
+reword_one() {
+	local box="$1" sel="$2"; shift 2
+	local c; c="$(reword_pick "$sel" "$@")" || { echo "cbx: no commit $sel (1-$#)."; return 0; }
+	reword_open "$box" "$c"
+}
+
+reword_show() {
+	local box="$1" sel="$2"; shift 2
+	local c; c="$(reword_pick "$sel" "$@")" || { echo "cbx: no commit $sel (1-$#)."; return 0; }
+	git_ show --color=always "$c" | review_pager
+}
+
+reword_revert() {
+	local box="$1" sel="$2"; shift 2
+	local c; c="$(reword_pick "$sel" "$@")" || { echo "cbx: no commit $sel (1-$#)."; return 0; }
+	rm -f "$(reword_dir "$box")/$c"
+	echo "cbx: $(git_ rev-parse --short "$c") is back to the agent's own message."
+}
+
+# Replay the chain with the new messages. Object-store only (commit-tree), like `cbx minto`: each new
+# commit keeps its original TREE — so the code that lands is byte-for-byte what you reviewed — and its
+# original AUTHOR and author date. Only the message and the parent change. Prints the new tip.
+reword_apply() {
+	local box="$1" parent="$2"; shift 2
+	local c new
+	for c in "$@"; do
+		new="$(GIT_AUTHOR_NAME="$(git_ log -1 --format=%an "$c")" \
+		       GIT_AUTHOR_EMAIL="$(git_ log -1 --format=%ae "$c")" \
+		       GIT_AUTHOR_DATE="$(git_ log -1 --format=%aD "$c")" \
+		       git -C "$REPO" commit-tree "$c^{tree}" -p "$parent" -F <(reword_msg "$box" "$c"))"
+		parent="$new"
+	done
+	printf '%s' "$parent"
+}
+
 merge() {
 	[ $# -ge 1 ] || die "merge needs a box name"
-	local box="$1" squash="" edit="" single="" landed="" a ref msg
+	local box="$1" squash="" edit="" single="" landed="" reword="" a ref msg mref
 	shift
 	for a in "$@"; do
 		case "$a" in
 			--squash) squash=1 ;;
 			--edit|-e) edit=1 ;;
+			--reword|-r) reword=1 ;;
 			--landed) landed=1 ;;
-			*) die "merge: unknown option '$a' (--squash | --edit | --landed)" ;;
+			*) die "merge: unknown option '$a' (--squash | --edit | --reword | --landed)" ;;
 		esac
 	done
+	[ -z "$reword" ] || [ -z "$squash" ] \
+		|| die "merge: --reword and --squash are opposites — --squash makes ONE commit, --reword keeps them all"
 	ref="refs/agents/$box"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
 
@@ -1428,6 +1632,19 @@ merge() {
 	local ncommits
 	ncommits="$(git_ rev-list --count "$DEV..$ref")"
 	echo "cbx: merging refs/agents/$box ($ncommits commit(s)) into $DEV"
+
+	# --reword: rewrite the messages FIRST, then merge the rewritten chain. `mref` is what gets merged;
+	# `$ref` stays the agent's ref for the bookkeeping in merge_finish. The rewrite is object-store only
+	# and keeps every tree, so what lands is exactly what you reviewed.
+	mref="$ref"
+	if [ -n "$reword" ]; then
+		if [ ! -t 0 ]; then die "merge --reword needs a terminal (it opens an editor per commit)"; fi
+		colors_init
+		reword_tui "$box" "$ref" || return 1
+		mref="$REWORD_TIP"
+		[ -n "$mref" ] || die "reword produced nothing — $DEV is unchanged"
+		echo "cbx: reworded $ncommits commit(s) -> $(git_ rev-parse --short "$mref") (same trees, same authors)"
+	fi
 	# `--edit` on a single commit means "let me fix up that commit's message" — a merge commit wrapping
 	# one commit is pure noise there, and having to remember `--squash` for it is a papercut. So take
 	# the squash path and seed the editor with the agent's own message (see below).
@@ -1487,7 +1704,8 @@ merge() {
 			git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
 		fi
 	else
-		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$ref" \
+		# $mref, not $ref: with --reword this is the rewritten chain (same trees, new messages).
+		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$mref" \
 			-m "$msg" -m "Cbx-Box: $box" \
 			|| die "merge conflicts — resolve them in $REPO and 'git commit', then run: cbx merge '$box'   (to retire the branch and tell the box)"
 	fi
@@ -1508,6 +1726,7 @@ drop() {
 	# .mergeinto too — without it a dropped minto box would keep being measured against a target it is
 	# no longer resolving, and `cbx merge` would go on refusing it.
 	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.mergeinto"
+	rm -rf "$(reword_dir "$box")"
 	say_to_box "$box" "I dropped your handoff — that approach is not going in. Do not re-push it; wait for new instructions." 2>/dev/null || true
 	echo "cbx: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
 }
