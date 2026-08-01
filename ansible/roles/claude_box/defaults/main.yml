@@ -1,0 +1,52 @@
+---
+# Defaults for the claude_box role — the PROJECT-AGNOSTIC half of deploying a claude-box stack.
+# Everything here is overridable by the caller; the role hard-codes nothing project-specific, so
+# it can be lifted into the standalone claude-box repository unchanged (see
+# docker-compose/claude-box/tools/split-out.sh).
+
+# Where the stack lives on the remote. `.env`, `mounts`, `service-env`, `data/*` and `git-identity/`
+# are all relative to this.
+claude_box_dir: /virtual_machines/claude-box-docker
+
+# The claude-box source tree that is rsynced to claude_box_dir. ABSOLUTE on purpose: `synchronize`
+# resolves a relative src against the ROLE's files/ directory first, which would silently pick the
+# wrong tree (or nothing) once this role lives in another repository.
+claude_box_source: "{{ playbook_dir }}/docker-compose/claude-box/"
+
+# The uid the hub and every box run as. Not a name: there is no matching account on the host, the
+# containers simply run with this numeric id, so the bind-mounted data dirs must be owned by it.
+claude_box_uid: 1000
+
+# The compose env file. It is templated by the caller (it carries the vault-backed tokens) and `.env`
+# is symlinked to it so `docker compose` picks it up from the project dir automatically. Named after
+# the project rather than `.env` so it is greppable and can be templated with a sane mode.
+claude_box_env_file: claude-box.conf
+
+# Data subdirectories created under <dir>/data/ and chowned to claude_box_uid. The stack's own
+# plumbing; project caches that appear in the `mounts` table are added here by the caller.
+#   repo            the hub's authoritative git repo (dev + every refs/agents/*, and the only clone
+#                   with the deploy key). Was data/checkout before the agent-branch workflow.
+#   golden          prepared checkouts the agent boxes overlay (data/golden/current) …
+#   golden-staging  … plus the staging dir the hub prepares a new one in before the broker seals it.
+#   claude          the ONE claude config dir shared by the hub and every box (CLAUDE_CONFIG_DIR).
+#   boxes           per-box state: session id, port-forward slot, and the box's overlay upper layer.
+#   pinchtab        the pinchtab server's config/state for the hub.
+claude_box_data_dirs:
+  - repo
+  - golden
+  - golden-staging
+  - claude
+  - boxes
+  - pinchtab
+
+# Project config files templated into the stack dir. One entry per file:
+#   { src: <ABSOLUTE path to a Jinja template>, dest: <path relative to claude_box_dir>,
+#     owner: …, group: …, mode: … }
+# src MUST be absolute. A role resolves `template: src=foo` against its OWN templates/ directory
+# first, so a bare relative path pointing at the calling repository's templates/ tree breaks the
+# moment this role is used from somewhere else. Callers pass
+# `{{ playbook_dir }}/templates/docker-compose/<stack>/…`, which sidesteps the search path entirely.
+claude_box_config_files: []
+
+# Comment baked into the generated GitHub deploy key, so it is identifiable on the repo's key list.
+claude_box_deploy_key_comment: "claude-box-deploy-key@{{ inventory_hostname }}"

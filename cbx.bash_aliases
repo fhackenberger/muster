@@ -1,8 +1,9 @@
 # cbx laptop aliases — source this from your ~/.bashrc:
 #
-#     export CBX_SERVER=root@hetzner1.acoveo.com   # optional: override before sourcing
-#     export CBX_PROJECT=infostars
+#     export CBX_SERVER=root@your.server            # optional: override before sourcing
+#     export CBX_PROJECT=myproject
 #     source /path/to/claude-box/cbx.bash_aliases
+#     source /path/to/claude-box/cbx.bash_aliases.project   # optional, AFTER this file
 #
 # The exports must be their OWN commands. `CBX_SERVER=… . cbx.bash_aliases` silently leaves the
 # variable unset — see _cbx_need_server below for why. Sourcing also registers bash completion for
@@ -27,8 +28,8 @@
 # `:=` below only assigns when it's unset. `echo "$CBX_TRANSPORT"` if a transport change seems ignored.
 
 # Set these — either export them in ~/.bashrc before sourcing, or edit the defaults here.
-: "${CBX_SERVER:=root@your-server}"      # the claude-box host, e.g. root@hetzner1.acoveo.com
-: "${CBX_PROJECT:=myproject}"            # PROJECT_NAME of the stack, e.g. infostars
+: "${CBX_SERVER:=root@your-server}"      # the claude-box host, e.g. root@cbx.example.com
+: "${CBX_PROJECT:=myproject}"            # PROJECT_NAME of the stack, e.g. myproject
 : "${CBX_TRANSPORT:=ssh}"                # transport for interactive sessions: mosh | ssh (default)
 # TERM handling. `docker exec -it` does NOT propagate your terminal — it hands the container TERM=dumb,
 # which has no `clear`, so tmux dies with "terminal does not support clear". So we forward YOUR real
@@ -40,7 +41,7 @@
 # Drop any older alias-based definitions (pre-mosh README) so the function definitions below parse —
 # bash expands `cbx` as an alias mid-parse otherwise, failing with "syntax error near `('". Harmless
 # when none exist; also lets you re-source this file cleanly.
-unalias cbx cbxhub cbxbox cbxui cbxtun cbxpsql cbxfe cbxsync cbxexport cbximport cbxcp cbxexec 2>/dev/null || true
+unalias cbx cbxhub cbxbox cbxui cbxtun cbxsync cbxexport cbximport cbxcp cbxexec 2>/dev/null || true
 unset -f cbxui 2>/dev/null || true          # cbxui was renamed to cbxtun; drop the stale function
 
 # Every entry point below reaches the server as plain "$CBX_SERVER" / "$CBX_PROJECT". Empty, and ssh
@@ -61,7 +62,7 @@ _cbx_need_server() {
 		*)
 			case "${CBX_PROJECT:-}" in
 				''|myproject)
-					echo "cbx: CBX_PROJECT is ${CBX_PROJECT:-not set} — it must be the stack's PROJECT_NAME (e.g. infostars)." >&2
+					echo "cbx: CBX_PROJECT is ${CBX_PROJECT:-not set} — it must be the stack's PROJECT_NAME (e.g. myproject)." >&2
 					echo "$hint" >&2
 					return 1 ;;
 			esac
@@ -112,7 +113,7 @@ _cbx_env() {
 # The `docker exec` into the hub, resolved by compose labels at call time. Emitted as a literal
 # string (the $(docker ps …) subshell is left for the server to evaluate); $CBX_PROJECT is inlined.
 _cbx_hub() {
-	printf 'docker exec -it %s$(docker ps -q -f label=com.docker.compose.project=%s -f label=com.docker.compose.service=hub)' "$(_cbx_env)" "$CBX_PROJECT"
+	printf 'docker exec -it %s%s' "$(_cbx_env)" "$(cbx_service_cid hub)"
 }
 
 # run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1 / cbx --help
@@ -151,31 +152,6 @@ cbxhub() {
 # flags come from _cbx_env (TERM + LANG) — see there for why both are needed.
 cbxbox() {
 	_cbx_session "docker exec -it -u dev $(_cbx_env)box-${CBX_PROJECT}-$1 tmux attach -t main"
-}
-
-# open a psql shell on the stack's postgres (the `db` service) against the DB name given as an arg:
-#   cbxpsql infotrack_dev
-# The db container is resolved by its compose labels (survives renames), like the hub. psql runs as the
-# container's `postgres` OS user, so it connects over the local socket with peer auth — no password.
-# Pass CBX_DB_USER to connect as a specific db user instead (psql then prompts; type the password —
-# never baked in here). Override the service with CBX_DB_SERVICE. Anything AFTER the dbname is passed
-# straight to psql. Both interactive and piped SQL work:
-#   cbxpsql infotrack_dev                                      # interactive REPL (clipboard works)
-#   echo 'SELECT 1;' | cbxpsql infotrack_dev                   # pipe SQL in
-#   cbxpsql infotrack_dev --single-transaction < dump.sql      # load a file atomically (all-or-nothing)
-#   cbxpsql infotrack_dev -v ON_ERROR_STOP=1 -tA < q.sql       # stop on first error, tab/unaligned out
-# When stdin is a terminal we allocate a TTY (-it / ssh -t); when it's a pipe we don't (-i / ssh -T)
-# and stream stdin straight through. Extra args are %q-quoted so they survive the server-side shell
-# re-parse; the $(docker ps …) lookup is left for the server to expand.
-cbxpsql() {
-	_cbx_need_server || return 1
-	[ -n "$1" ] || { echo "usage: cbxpsql <dbname> [psql args…]   (e.g. cbxpsql infotrack_dev --single-transaction < f.sql)" >&2; return 2; }
-	local db="$1"; shift
-	local u=''; [ -n "${CBX_DB_USER:-}" ] && u="-U $CBX_DB_USER "
-	local extra=''; [ "$#" -gt 0 ] && printf -v extra ' %q' "$@"
-	local dflags sshflag
-	if [ -t 0 ]; then dflags='-it'; sshflag='-t'; else dflags='-i'; sshflag='-T'; fi
-	ssh "$sshflag" "$CBX_SERVER" "docker exec $dflags -u postgres \$(docker ps -q -f label=com.docker.compose.project=$CBX_PROJECT -f label=com.docker.compose.service=${CBX_DB_SERVICE:-db}) psql ${u}${extra} ${db}"
 }
 
 # cbxtun — one SSH tunnel to reach hub and/or agent-box (cbox) dev services from your laptop, so you
@@ -233,53 +209,6 @@ REMOTE
 	ssh -N "${Largs[@]}" "$CBX_SERVER"
 }
 
-# ---------------------------------------------------------------------------------------------
-# PROJECT-SPECIFIC shorthand (infostars ports): open ONE agent's frontend on your laptop.
-#
-#   cbxfe work1        -> http://localhost:4211 serves box 'work1' ng serve
-#
-# More than one forward is needed. The page comes from the box's dev server, but its JS calls
-# FRONTEND_DEV_BACKEND_URL — and YOUR BROWSER resolves that URL, so whatever host:port it names has to
-# exist on your laptop and lead to the right backend. There are two possibilities and the agent picks
-# freely between them at runtime, so we tunnel BOTH rather than make you guess:
-#   * the HUB's backend            -> http://localhost:8091   (the default)
-#   * the box's OWN backend        -> http://localhost:<8900+slot>, i.e. that box's BACKEND
-#                                     port-forward, which is what $FRONTEND_DEV_BACKEND_URL_OWN is
-# Getting this wrong is not obvious from the browser: the page loads fine and only its API calls fail
-# (ERR_CONNECTION_REFUSED on e.g. http://localhost:8904/infostarsWeb/rest/config), which reads like a
-# broken backend rather than a missing tunnel. Hence: forward both, always.
-#
-# We read the box's own PORT_FORWARD_BACKEND_TO_HUB to learn the 8900+slot number, then tunnel it
-# straight to the BOX (the hub-side socat binds the hub's loopback, which ssh -L cannot reach). The
-# two backend ports never collide, so both can be up at once.
-#
-# --own tunnels ONLY the box's own backend, leaving :8091 free on your laptop — for when you are
-# running a backend of your own there and cannot give the port up.
-#
-# Ports come from service-env: FRONTEND_DEV_PORT / SERVER_PORT. Override per call with
-# CBX_FRONTEND_PORT / CBX_BACKEND_PORT if a stack uses different ones.
-cbxfe() {
-	_cbx_need_server || return 1
-	local box="" own="" a fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
-	for a in "$@"; do case "$a" in --own) own=1 ;; *) box="$a" ;; esac; done
-	[ -n "$box" ] || { echo "usage: cbxfe <box> [--own]   (--own = the box's own backend only, no :$be)" >&2; return 1; }
-	# The box's own BACKEND forward (8900+slot). Set on every running box by claude-box.sh, so an empty
-	# result means the box isn't up rather than that it has no such backend.
-	hubport=$(ssh "$CBX_SERVER" "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' box-${CBX_PROJECT}-${box} 2>/dev/null | sed -n 's/^PORT_FORWARD_BACKEND_TO_HUB=//p'")
-	local -a specs=("${box}:${fe}"); local desc=""
-	[ -n "$own" ] || { specs+=("hub:${be}"); desc=" :${be} (hub)"; }
-	if [ -n "$hubport" ]; then
-		specs+=("${hubport}:${box}:${be}"); desc="${desc} :${hubport} (the box's own)"
-	elif [ -n "$own" ]; then
-		echo "cbxfe: no BACKEND forward for '$box' (is it running?)" >&2; return 1
-	else
-		# Non-fatal: the hub backend is still tunneled, and that is the URL the frontend uses by default.
-		echo "cbxfe: no BACKEND forward for '$box' (is it running?) — tunneling the hub backend only" >&2
-	fi
-	echo "cbxfe: $box -> frontend :$fe, backend${desc}" >&2
-	cbxtun "${specs[@]}"
-}
-
 # take new commits from origin onto the dev branch, then tell every agent to re-base on them:
 #
 #   cbxsync              # merge origin into the dev branch, then have the agents rebase
@@ -301,7 +230,7 @@ cbxsync() {
 # translate newlines and corrupt it. We can't reuse the `cbx()` wrapper for that reason (it uses
 # `ssh -t`). ssh runs WITHOUT -t as well, so the byte stream is clean end to end.
 _cbx_hub_pipe() {
-	printf 'docker exec -i $(docker ps -q -f label=com.docker.compose.project=%s -f label=com.docker.compose.service=hub)' "$CBX_PROJECT"
+	printf 'docker exec -i %s' "$(cbx_service_cid hub)"
 }
 
 # cbxexport <box> [git am args…] — pull an agent's work onto YOUR checkout as ONE squashed commit.
@@ -398,7 +327,7 @@ cbxcp() {
 # cbxexec <box|hub> <command…> — run ANY command in a box or the hub and get its output here, clean
 # enough to pipe into your local tools:
 #
-#   cbxexec work1 gradle -q :infostarsEJB:test | tee test.log
+#   cbxexec work1 gradle -q :app:test | tee test.log
 #   cbxexec work1 cat /home/dev/repo/build/reports/x.json | jq .failures
 #   cbxexec hub 'cbx q --text' | grep -i blocked
 #   cbxexec work1 'grep -rn TODO /home/dev/repo | wc -l'     # …the pipe runs IN the box
@@ -429,7 +358,88 @@ cbxexec() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# BASH COMPLETION for cbx / cbxbox / cbxfe / cbxtun.
+# BUILDING BLOCKS FOR PROJECT HELPERS
+#
+# Everything a project helper needs that is NOT project-specific. Without these, each one re-derives
+# the same three fiddly things — how a container is addressed on the server, when to allocate a PTY,
+# and how to survive the two layers of shell re-parsing between here and there — and gets one of them
+# subtly wrong. Public names (no leading underscore) because your own file calls them.
+#
+# THE RE-PARSING RULE, since it explains the shape of all of this: an ssh command is a STRING that the
+# server's login shell parses again. So anything that must run THERE (`$(docker ps …)`) is emitted as
+# literal text, and anything that comes from HERE is %q-quoted so quotes, spaces and $ survive intact.
+
+# The compose service's container, as a server-side expression. Resolved by compose LABELS rather than
+# by name, so it survives a container rename or a project prefix you did not expect.
+cbx_service_cid() {
+	printf '$(docker ps -q -f label=com.docker.compose.project=%s -f label=com.docker.compose.service=%s)' \
+		"$CBX_PROJECT" "${1:?usage: cbx_service_cid <service>}"
+}
+
+# An agent box's container name. Boxes are named by convention (box-<project>-<name>) rather than
+# labelled, because the broker — not compose — creates them.
+cbx_box_cid() { printf 'box-%s-%s' "$CBX_PROJECT" "${1:?usage: cbx_box_cid <box>}"; }
+
+# Run a command in one of the stack's SERVICE containers (db, redis, …):
+#     cbx_service_exec db psql mydb
+#     cbx_service_exec --user postgres db psql -v ON_ERROR_STOP=1 mydb < dump.sql
+#
+# The PTY decision is the part worth having in one place. A REPL needs one on both hops (docker -it,
+# ssh -t) or you get no prompt and no line editing; a pipe must NOT have one on either (-i, ssh -T) or
+# the PTY translates newlines and mangles whatever you are streaming in. Deciding from `[ -t 0 ]`
+# means the same helper is correct interactively AND in `echo 'SELECT 1;' | …`, which is exactly the
+# distinction a hand-written helper tends to get wrong in one direction or the other.
+cbx_service_exec() {
+	_cbx_need_server || return 1
+	local user='' svc=''
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--user) user="${2:?--user needs a name}"; shift 2 ;;
+			--) shift; break ;;
+			-*) echo "cbx_service_exec: unknown option '$1'" >&2; return 2 ;;
+			*) svc="$1"; shift; break ;;
+		esac
+	done
+	[ -n "$svc" ] && [ "$#" -gt 0 ] \
+		|| { echo "usage: cbx_service_exec [--user U] <service> <command…>" >&2; return 2; }
+	local cmd; printf -v cmd '%q ' "$@"
+	local dflags sshflag
+	if [ -t 0 ]; then dflags='-it'; sshflag='-t'; else dflags='-i'; sshflag='-T'; fi
+	ssh "$sshflag" "$CBX_SERVER" \
+		"docker exec $dflags ${user:+-u $user }$(cbx_service_cid "$svc") $cmd"
+}
+
+# One environment variable of a running box, or empty. Ports a box was given (PORT_FORWARD_*_TO_HUB),
+# the golden it is on, anything service-env put there — the box's own environment is the authoritative
+# answer to "which port did this box get", and guessing from a slot number is how that goes wrong.
+#
+# EMPTY MEANS "NOT RUNNING" AT LEAST AS OFTEN AS IT MEANS "NOT SET": the caller has to decide which,
+# and should say "is it running?" in the error either way.
+cbx_box_env() {
+	_cbx_need_server || return 1
+	local box="${1:?usage: cbx_box_env <box> <VAR>}" var="${2:?usage: cbx_box_env <box> <VAR>}"
+	local inspect="docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}'"
+	ssh "$CBX_SERVER" "$inspect $(cbx_box_cid "$box") 2>/dev/null | sed -n 's/^${var}=//p'"
+}
+
+# Give your helper the same box-name Tab completion the built-ins have, plus its own flags:
+#     cbx_complete_box cbxfe --own
+# Safe to call from a non-bash shell (it does nothing) and safe to call twice.
+cbx_complete_box() {
+	[ -n "${BASH_VERSION:-}" ] || return 0
+	local fn="${1:?usage: cbx_complete_box <function> [flags…]}"; shift
+	_CBX_BOXONLY_FLAGS["$fn"]="$*"
+	complete -F _cbx_complete_boxonly "$fn"
+}
+
+# ---------------------------------------------------------------------------------------------
+# PROJECT-SPECIFIC helpers (a psql shell on your stack's db, a one-command frontend tunnel, …) are
+# NOT here: they depend on your ports, your service names and your dev loop. Copy
+# cbx.bash_aliases.project.example next to this file, edit it, and source it AFTER this one — it
+# reuses the plumbing above (_cbx_need_server, cbxtun, the completion cache, and the building blocks
+# just above).
+# ---------------------------------------------------------------------------------------------
+# BASH COMPLETION for cbx / cbxbox / cbxtun / cbxcp / cbxexec.
 #
 # Box and service names live on the SERVER, so completing them means an ssh round-trip — far too slow
 # to run on every Tab. So the names are fetched once and cached in a file for $CBX_COMPLETE_TTL
@@ -603,11 +613,15 @@ _cbx_complete() {
 	return 0    # a case arm whose last test failed would otherwise make readline see an error
 }
 
+# Flags offered by each box-name-completing command. A project extras file (see
+# cbx.bash_aliases.project.example) adds its own commands with e.g.
+#     cbx_complete_box cbxfe --own          # the helper; sets the entry below and calls `complete`
+declare -A _CBX_BOXONLY_FLAGS=([cbxexport]="--show --3way")
+
 _cbx_complete_boxonly() {
 	local cur="${COMP_WORDS[COMP_CWORD]}"
 	if [[ $cur == -* ]]; then
-		local flags=""
-		case "${COMP_WORDS[0]}" in cbxfe) flags="--own" ;; cbxexport) flags="--show --3way" ;; esac
+		local flags="${_CBX_BOXONLY_FLAGS[${COMP_WORDS[0]}]:-}"
 		COMPREPLY=($(compgen -W "$flags" -- "$cur"))
 		return 0
 	fi
@@ -662,7 +676,7 @@ _cbx_complete_exec() {
 
 if [ -n "${BASH_VERSION:-}" ]; then
 	complete -F _cbx_complete cbx
-	complete -F _cbx_complete_boxonly cbxbox cbxfe cbxexport
+	complete -F _cbx_complete_boxonly cbxbox cbxexport
 	complete -F _cbx_complete_import cbximport
 	complete -F _cbx_complete_tun cbxtun
 	complete -F _cbx_complete_cp cbxcp

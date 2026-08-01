@@ -1,0 +1,28 @@
+# Everything a RUNNING stack creates in its own directory. None of these is tracked today; listing
+# them makes that deliberate rather than lucky — this directory is both the source tree and, once
+# copied to a server, a live stack dir, so a careless `git add -A` in the wrong copy would otherwise
+# commit an agent's overlay or a deploy key.
+#
+# The real files are made from the *.example ones beside them (mounts, port-forwards, service-env,
+# hub-services/, compose.project.yml) or generated on the host (compose.override.yml, by
+# gen-hub-mounts.sh), or templated onto the server by a config-management tool.
+
+# --- live stack state (bind mounts) ---
+data/                 # repo, goldens, per-box upper layers, the shared claude config, pinchtab
+db-init/              # project seed data
+git-identity/         # the hub's GitHub deploy key + gitconfig — NEVER commit
+boxes/
+
+# --- per-stack config made from the .example files (holds credentials) ---
+.env
+service-env
+mounts
+port-forwards
+hub-services/
+compose.project.yml
+# Rendered from `mounts` by gen-hub-mounts.sh, on the host it runs on.
+compose.override.yml
+
+# --- python bytecode from the test suite's stub broker ---
+__pycache__/
+*.pyc

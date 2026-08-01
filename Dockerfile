@@ -1,6 +1,6 @@
 # claude-box — the LEAN, project-agnostic agent base: debian:trixie-slim + common-setup.sh (node,
-# pinchtab, git, socat, …) + Claude + the clipboard proxy. No JDK/gradle — the infostars build
-# toolchain layers on top via Dockerfile.addon (-> claude-box-infostars, what the broker spawns).
+# pinchtab, git, socat, …) + Claude + the clipboard proxy. No JDK/gradle — YOUR project's build
+# toolchain layers on top via Dockerfile.addon (-> claude-box-<project>, what the broker spawns).
 FROM debian:trixie-slim
 
 # Minimal deps needed just to install Claude below (ca-certificates + curl). The rest of the shared

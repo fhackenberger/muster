@@ -1,17 +1,21 @@
 # Per-project remote claude-box stack. Copy this directory once per project (each gets its own
 # .env, mounts, and ./data), then `./gen-hub-mounts.sh && docker compose up -d`.
 #
-# All images are pulled from the acoveo registry (dockerregistry.acoveo.com) by default, so the
-# stack does NOT need to run on the same host as Jenkins. The db (dbtest) and the box / hub /
-# box-broker images are built + pushed by the Jenkinsfile; here they're referenced by the *_IMAGE
-# vars in .env and pulled per COMPOSE_PULL_POLICY (default `missing`). `docker login
-# dockerregistry.acoveo.com` must have run on the host. To build hub + box-broker locally instead
-# (e.g. on the Jenkins host), set COMPOSE_PULL_POLICY=build.
+# THIS FILE IS THE STACK, NOT YOUR PROJECT. It defines only the two containers claude-box itself is
+# made of — the hub and the box-broker. Anything your project needs beside them (a database, a
+# message broker, a cache, seed data) belongs in `compose.project.yml`: copy
+# compose.project.yml.example and merge it via COMPOSE_FILE in .env, e.g.
+#     COMPOSE_FILE=compose.yml:compose.project.yml:compose.override.yml
+# Note the third entry: setting COMPOSE_FILE at all DISABLES compose's automatic loading of
+# compose.override.yml, which is where gen-hub-mounts.sh renders the hub's half of the `mounts`
+# table — omit it and the hub silently loses every project mount.
 #
-# Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
-# pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
-# holder of the docker socket); they mount only what the `mounts` table grants and reach the hub
-# by name.
+# Image defaults here are REGISTRY-NEUTRAL plain tags (claude-box-hub:stable, …), i.e. whatever the
+# local docker daemon has — which is what you want when the images are built on the same host (the
+# Jenkinsfile tags them exactly like this). To run on a different host, point HUB_IMAGE /
+# BOX_BROKER_IMAGE / BOX_IMAGE / HUB_BASE_IMAGE at registry-qualified names in .env and set
+# COMPOSE_PULL_POLICY=always (`docker login <registry>` must have run on that host). To build hub +
+# box-broker from this directory instead, set COMPOSE_PULL_POLICY=build.
 #
 # Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
 # pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
@@ -25,32 +29,14 @@ networks:
     name: cbx-${PROJECT_NAME}
 
 services:
-  db:
-    image: ${DB_IMAGE:-dockerregistry.acoveo.com/infostars/dbtest:latest}
-    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
-    # The anonymised dev data dump, available inside the container for data/reset-db.sh to import.
-    volumes:
-      - ./db-init/infostars_filtered_data_dump.sql.gz:/db-init/infostars_filtered_data_dump.sql.gz:ro
-    restart: unless-stopped
-
-  activemq:
-    image: apache/activemq-artemis:latest
-    environment:
-      ARTEMIS_USER: artemis
-      ARTEMIS_PASSWORD: artemis
-    restart: unless-stopped
-
-  redis:
-    image: redis:7
-    restart: unless-stopped
-
   # The ONLY container with the docker socket. "claude-box.sh as a service": validates the request
   # (the hub passes a box NAME; the mounts come from the root-owned `mounts` table) then runs the
   # modified claude-box.sh.
   box-broker:
-    # Pulled from the acoveo registry if missing (COMPOSE_PULL_POLICY=missing). Set
-    # COMPOSE_PULL_POLICY=build to (re)build locally from this dir instead (e.g. on the Jenkins host).
-    image: ${BOX_BROKER_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-broker:stable}
+    # Whatever the local daemon has by default (COMPOSE_PULL_POLICY=missing). Point
+    # BOX_BROKER_IMAGE at a registry-qualified name to pull it from elsewhere, or set
+    # COMPOSE_PULL_POLICY=build to (re)build locally from this dir.
+    image: ${BOX_BROKER_IMAGE:-claude-box-broker:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       context: .
@@ -58,7 +44,7 @@ services:
     environment:
       BROKER_TOKEN: ${BROKER_TOKEN}
       PROJECT_NAME: ${PROJECT_NAME}
-      BOX_IMAGE: ${BOX_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-infostars:stable}
+      BOX_IMAGE: ${BOX_IMAGE:-claude-box:stable}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       # The prepared "golden" checkouts every box overlays (data/golden/current), and the staging dir
       # the hub prepares a new one in before the broker seals it into place. PROJECT_ROOT confines
@@ -99,23 +85,25 @@ services:
   # The "hosting dev environment": owns the checkout + git identity, runs backend/ng serve/pinchtab
   # on demand, hosts YOUR commit workflow. Does NOT run claude.
   hub:
-    # Same policy as box-broker: pulled from the acoveo registry if missing
-    image: ${HUB_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub:stable}
+    # Same policy as box-broker.
+    image: ${HUB_IMAGE:-claude-box-hub:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
-      # The hub image = the shared Dockerfile.addon (JDK/gradle/ant via build-setup.sh) layered onto
-      # claude-box-hub-base (hub/Dockerfile.base). Same add-on file the box uses; FINAL_USER=1000 keeps
-      # the hub running as its uid-1000 'dev' user. A local build (COMPOSE_PULL_POLICY=build) resolves
-      # the base from the registry by default; point BASE_IMAGE at a locally-built tag to build offline
-      # (build hub/Dockerfile.base first — see README-remote.md).
+      # The hub image = the shared Dockerfile.addon (your project's toolchain, installed by the script
+      # SETUP_SCRIPT names) layered onto claude-box-hub-base (hub/Dockerfile.base). Same add-on file the
+      # box uses; FINAL_USER=1000 keeps the hub running as its uid-1000 'dev' user. Override
+      # HUB_BASE_IMAGE to build against a locally-built or registry-qualified base, and SETUP_SCRIPT (in
+      # compose.project.yml) to install your own toolchain — see Dockerfile.addon.
       context: .
       dockerfile: Dockerfile.addon
       args:
-        BASE_IMAGE: ${HUB_BASE_IMAGE:-dockerregistry.acoveo.com/acoveo/claude-box-hub-base:stable}
+        BASE_IMAGE: ${HUB_BASE_IMAGE:-claude-box-hub-base:stable}
         FINAL_USER: "1000"
     hostname: ${PROJECT_NAME}-hub
     init: true
-    depends_on: [db, redis, box-broker]
+    # Project services (a db, a cache, …) are added to this list by compose.project.yml, which
+    # compose merges into it — this file knows only about the stack's own two containers.
+    depends_on: [box-broker]
     environment:
       # The hub's own repo: the only clone with origin credentials, the only place dev is merged, and
       # what the boxes fetch/push over git:// (see hub/entrypoint.sh). It is ALSO your setup
@@ -129,7 +117,9 @@ services:
       GOLDEN_STAGING: /work/golden-staging
       # Run by `cbx golden snapshot --prep` IN THE HUB'S REPO (not in a copy), so what it installs is
       # frozen at the path the boxes use it from — put your project's install/warm steps here.
-      GOLDEN_PREP_CMD: ${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}
+      # Empty by default — claude-box knows nothing about your build. Set GOLDEN_PREP_CMD in .env
+      # (e.g. `npm ci && gradle classes`) to give `cbx golden snapshot --prep` something to run.
+      GOLDEN_PREP_CMD: ${GOLDEN_PREP_CMD:-}
       BROKER_URL: http://box-broker:8099
       BROKER_TOKEN: ${BROKER_TOKEN}
       # The mounts table, read-only — the hub does not apply it (compose.override.yml does that), it
@@ -163,7 +153,7 @@ services:
       - ./data/boxes:/work/boxes:ro
       - ./mounts:/work/mounts:ro
       # Dev-service manifests (backend/frontend/pinchtab/…), read-only. Copy hub-services.example ->
-      # hub-services once (Ansible templates it on the acoveo host). An empty/absent dir = no services.
+      # hub-services once (a config-management tool may template it on the server). An empty/absent dir = no services.
       - ./hub-services:/work/hub-services:ro
       - ./data/claude:/home/dev/.claude
       - ./data/pinchtab:/home/dev/.pinchtab

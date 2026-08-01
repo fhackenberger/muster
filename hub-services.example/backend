@@ -1,7 +1,7 @@
 # hub-services/<name> — a dev-service manifest. The FILENAME is the service name, so this file
 # defines `cbx up backend`, `cbx down backend`, `cbx logs backend`.
 #
-# Copy this directory to hub-services/ (the compose bind mount) and edit; on the acoveo host Ansible
+# Copy this directory to hub-services/ (the compose bind mount) and edit; a config-management tool
 # templates the real ones from templates/docker-compose/claude-box/hub-services/. cbx reads a manifest
 # with `cbx svcs` / `cbx up` — it is never seen by compose or the broker, so a command may use $REPO,
 # $VAR and $(…) freely (unlike service-env). Format: `key=value`, one per line, '#' and blanks ignored.
@@ -23,4 +23,4 @@ writes_repo=true
 # launch — folding it into one call would expand the path before the jar exists on a cold cache. The
 # middle guard fails fast with a clear message if no jar turned up. Absolute cache paths (no $HOME) so
 # the same value works identically on the hub and in a box.
-command=gradle --project-dir infostars/ -x test -x buildFrontend build && { find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | grep -q . || { echo 'cbx: aspectjweaver jar not found under /home/dev/.gradle/caches or /home/dev/.m2/repository — did the build resolve it?' >&2; exit 1; }; } && gradle --project-dir infostars/ -x test -x buildFrontend :infostarsTapestryWeb:bootRun --args='--spring.profiles.active=default' -PbootRunExtraJvmArgs="-javaagent:$(find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | sort -V | tail -1)"
+command=gradle --project-dir myapp/ -x test -x buildFrontend build && { find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | grep -q . || { echo 'cbx: aspectjweaver jar not found under /home/dev/.gradle/caches or /home/dev/.m2/repository — did the build resolve it?' >&2; exit 1; }; } && gradle --project-dir myapp/ -x test -x buildFrontend :myappWeb:bootRun --args='--spring.profiles.active=default' -PbootRunExtraJvmArgs="-javaagent:$(find /home/dev/.gradle/caches /home/dev/.m2/repository -name 'aspectjweaver-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' 2>/dev/null | sort -V | tail -1)"

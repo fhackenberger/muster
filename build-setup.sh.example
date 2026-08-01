@@ -1,0 +1,82 @@
+#!/bin/sh
+set -e
+
+# build-setup.sh.example — YOUR project's BUILD toolchain. Copy to `build-setup.sh` and edit.
+#
+#     cp build-setup.sh.example build-setup.sh
+#
+# claude-box has no opinion about your toolchain, so it ships this example and expects the real file
+# beside it — the same arrangement as service-env / mounts / port-forwards, and `build-setup.sh` is
+# gitignored for the same reason. It is the BUILD-time counterpart of common-setup.sh, which installs
+# the shared RUNTIME into the base images: keeping your toolchain out of those is what lets them stay
+# lean and reusable across projects.
+#
+# WHO RUNS IT: Dockerfile.addon, which layers your toolchain onto either base image —
+#     claude-box           + this  ->  claude-box-<project>   (what the broker spawns for every box)
+#     claude-box-hub-base  + this  ->  claude-box-hub         (the hub)
+# so whatever you install here is what an agent — and `cbx up <service>` on the hub — actually has.
+# Point it somewhere else with `--build-arg SETUP_SCRIPT=path/in/the/build/context`.
+#
+# THE CONTRACT
+#   * Runs as root, in a Debian-based image, with `sh` (not bash) and `set -e`.
+#   * The build context is the claude-box directory, so any path you COPY must live in here.
+#   * curl and jq are already present (common-setup.sh put them in the base image).
+#   * Install under /opt and put binaries on PATH BOTH ways: a /etc/profile.d drop-in for login
+#     shells (the hub's tmux services and the boxes' `bash -lc` use those) and a symlink into
+#     /usr/local/bin for everything else. Getting only one of the two is the classic failure — it
+#     works when you try it by hand and not from a script, or the other way round.
+#   * Set any HOME-relative cache (GRADLE_USER_HOME, MAVEN_OPTS, npm's prefix) in Dockerfile.addon's
+#     ENV, not here, and prefer the default ~/.<tool> so the shared cache mounts in `mounts` apply.
+#   * Keep it idempotent-ish and quiet on success; the image build is where its output is read.
+#
+# What follows is a WORKING example — a Temurin JDK 21 + gradle — kept deliberately small. Replace
+# it wholesale; nothing outside this file assumes java or gradle.
+
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl unzip
+rm -rf /var/lib/apt/lists/*
+
+# JDK: the latest GA Temurin (Eclipse Adoptium) 21 for this architecture, resolved at build time from
+# the Adoptium API rather than pinned, so a rebuild picks up the newest 21.x security release. Pin a
+# version instead if your project needs reproducible builds more than it needs the security updates.
+arch="$(dpkg --print-architecture)"
+case "$arch" in
+	amd64) ad_arch=x64 ;;
+	arm64) ad_arch=aarch64 ;;
+	*) echo "build-setup: unsupported arch '$arch'" >&2; exit 1 ;;
+esac
+mkdir -p /opt/java
+curl -fsSL "https://api.adoptium.net/v3/binary/latest/21/ga/linux/${ad_arch}/jdk/hotspot/normal/eclipse?project=jdk" \
+	| tar -xz -C /opt/java --strip-components=1
+export JAVA_HOME=/opt/java PATH="/opt/java/bin:$PATH"
+# Both PATH mechanisms, as above: profile.d for login shells, symlinks for everything else.
+printf '%s\n' \
+	'export JAVA_HOME=/opt/java' \
+	'case ":$PATH:" in *:/opt/java/bin:*) ;; *) export PATH="/opt/java/bin:$PATH" ;; esac' \
+	> /etc/profile.d/10-java.sh
+ln -sf /opt/java/bin/java /opt/java/bin/javac /usr/local/bin/
+java -version
+
+# Gradle: the latest final 8.x unless GRADLE_VERSION pins one (Dockerfile.addon passes that build-arg
+# through, and simply ignores it if your script has no use for it). The jq filter drops snapshots,
+# nightlies, rcs and milestones, and sorts numerically so 8.14.3 beats 8.9 — a plain string sort
+# would not.
+if [ -n "${GRADLE_VERSION:-}" ]; then
+	gradle_url="https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+else
+	sel="$(curl -fsSL https://services.gradle.org/versions/all | jq -r '
+		[ .[]
+		  | select(.version | test("^8\\.[0-9]"))
+		  | select(.snapshot==false and .nightly==false and .rcFor=="" and .milestoneFor=="" and .broken==false)
+		] | sort_by(.version | split(".") | map(tonumber)) | last | "\(.version) \(.downloadUrl)"')"
+	[ -n "$sel" ] && [ "$sel" != "null" ] || { echo "build-setup: could not resolve latest gradle 8.x" >&2; exit 1; }
+	GRADLE_VERSION="${sel%% *}"
+	gradle_url="${sel#* }"
+fi
+echo "build-setup: installing gradle ${GRADLE_VERSION}"
+curl -fsSL "$gradle_url" -o /tmp/gradle.zip
+unzip -q /tmp/gradle.zip -d /opt
+ln -s "/opt/gradle-${GRADLE_VERSION}" /opt/gradle
+ln -s /opt/gradle/bin/gradle /usr/local/bin/gradle
+rm /tmp/gradle.zip
+gradle --version

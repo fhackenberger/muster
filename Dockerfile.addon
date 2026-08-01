@@ -1,22 +1,33 @@
-# Dockerfile.addon — the infostars project build toolchain (JDK + gradle + ant, via build-setup.sh)
-# layered onto EITHER base image. Written ONCE for both add-on images; pick the base with BASE_IMAGE:
-#   box add-on:  --build-arg BASE_IMAGE=claude-box                                    -> claude-box-infostars
+# Dockerfile.addon — YOUR project's build toolchain layered onto EITHER base image. Written ONCE for
+# both add-on images; pick the base with BASE_IMAGE:
+#   box add-on:  --build-arg BASE_IMAGE=claude-box                                      -> claude-box-<project>
 #   hub add-on:  --build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000 -> claude-box-hub
-# Context = the claude-box dir (so build-setup.sh at the root is COPYable). build-setup.sh is the ONE
-# place the toolchain versions live; this file just chooses the base + restores the runtime user.
+#
+# The toolchain itself is not in here: SETUP_SCRIPT names a script IN THE BUILD CONTEXT (= the
+# claude-box dir) that installs it, so the ONE add-on Dockerfile serves every project and the
+# versions live in one place. It defaults to `build-setup.sh` — YOUR file, made from the shipped
+# `build-setup.sh.example` (and gitignored, like service-env and mounts). Keep several and choose
+# between them with --build-arg SETUP_SCRIPT=…, or set it under `hub: build: args:` in
+# compose.project.yml. This file just chooses the base, runs that script, and restores the runtime
+# user. A missing build-setup.sh fails the build at the COPY, which is the intended behaviour: there
+# is no sensible default toolchain for it to fall back to.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 USER root
 
-# GRADLE_VERSION empty (the default) -> build-setup.sh installs the latest 8.x; set it to pin a version.
+# GRADLE_VERSION is passed through unconditionally and simply ignored by a setup script that has no
+# use for it (empty -> the shipped example's "latest 8.x"; set it to pin a version).
 ARG GRADLE_VERSION=
-COPY build-setup.sh /tmp/build-setup.sh
+ARG SETUP_SCRIPT=build-setup.sh
+COPY ${SETUP_SCRIPT} /tmp/build-setup.sh
 RUN GRADLE_VERSION="${GRADLE_VERSION}" sh /tmp/build-setup.sh \
 	&& rm /tmp/build-setup.sh
 
-# JAVA_HOME/GRADLE_HOME are fixed under /opt. GRADLE_USER_HOME is deliberately NOT set: gradle defaults
-# to ~/.gradle, which for the uid-1000 'dev' user is /home/dev/.gradle — the shared gradle cache mount.
+# JAVA_HOME/GRADLE_HOME match where the shipped example (and this stack's own script) install them.
+# GRADLE_USER_HOME is deliberately NOT set: gradle defaults to ~/.gradle, which for the uid-1000
+# 'dev' user is /home/dev/.gradle — the shared gradle cache mount. A different toolchain sets its own
+# ENV here.
 ENV JAVA_HOME=/opt/java \
 	GRADLE_HOME=/opt/gradle
 

@@ -1,0 +1,54 @@
+# compose.project.yml — YOUR project's services, merged over the stack's own compose.yml.
+#
+#     cp compose.project.yml.example compose.project.yml
+#     $EDITOR compose.project.yml
+#     # in .env:
+#     COMPOSE_FILE=compose.yml:compose.project.yml:compose.override.yml
+#
+# Why a separate file: compose.yml is claude-box itself (hub + box-broker) and is the same for every
+# project. A database, a message broker, a cache or a seed-data mount are YOURS — keeping them here
+# means a claude-box upgrade never has to be merged into a file you have edited.
+#
+# THE TRAP: setting COMPOSE_FILE at all disables compose's automatic loading of
+# `compose.override.yml` — the file `gen-hub-mounts.sh` renders the hub's half of the `mounts` table
+# into. List it explicitly as above, or the hub comes up without a single project mount (~/.npm,
+# ~/.gradle, …) and only the boot-time `MOUNT DRIFT` warning says so.
+#
+# Everything below is an EXAMPLE (roughly: a Gradle backend, an Angular frontend, postgres).
+# Delete what you don't need;
+# a project with no extra services needs no compose.project.yml at all — just leave it out of
+# COMPOSE_FILE.
+
+services:
+  # ---- the services your app talks to -------------------------------------------------------
+  # Reachable as `db` / `activemq` / `redis` from the hub AND from every agent box — they are all on
+  # the cbx-<project> network, which is why `service-env` can name them directly.
+  db:
+    image: ${DB_IMAGE:-postgres:17}
+    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
+    # Seed data available inside the container for a reset/import script to load.
+    volumes:
+      - ./db-init:/db-init:ro
+    restart: unless-stopped
+
+  activemq:
+    image: apache/activemq-artemis:latest
+    environment:
+      ARTEMIS_USER: artemis
+      ARTEMIS_PASSWORD: artemis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+  # ---- wiring those into the stack ----------------------------------------------------------
+  # compose MERGES this into the hub defined in compose.yml, so all that is needed here is the extra
+  # dependency. Nothing else about the hub is repeated.
+  hub:
+    depends_on: [db, redis, box-broker]
+    # Only relevant with COMPOSE_PULL_POLICY=build: which toolchain script Dockerfile.addon installs
+    # into the hub image. Copy build-setup.sh.example to build-setup.sh for the shape of one.
+    #build:
+    #  args:
+    #    SETUP_SCRIPT: build-setup.sh

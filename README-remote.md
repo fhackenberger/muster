@@ -28,7 +28,7 @@ compose stack (cbx-<project> network)
 ```
 
 > **Ansible-managed on the acoveo host.** For the `infostars` stack, everything below is
-> automated by `tasks/containers-claude-box.yml` (rsync of this dir to
+> automated by the `claude_box` role + `tasks/containers-claude-box.yml` (rsync of this dir to
 > `/virtual_machines/claude-box-docker`, the templated `infostars.conf` → `.env` symlink, the
 > pinchtab `config.json`, and the GitHub deploy key). The manual steps here document the model and
 > apply to a hand-rolled stack.
@@ -47,8 +47,10 @@ node, pinchtab + Google Chrome, the tuicr review TUI, cbx, entrypoint, and the u
 layers the infostars build toolchain (JDK + gradle + ant) via the **shared `Dockerfile.addon`**
 (`--build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000`). The box mirrors this:
 `claude-box` (base) + `claude-box-infostars` (same `Dockerfile.addon`, `BASE_IMAGE=claude-box`) — the
-latter is what the broker spawns. The toolchain lives once in `build-setup.sh`; the add-on Dockerfile
-is written once. Jenkins builds each base **before** its add-on.
+latter is what the broker spawns. The toolchain lives once in a **setup script of your own**, named by
+`--build-arg SETUP_SCRIPT=<path in the build context>`, defaulting to `build-setup.sh` — your own
+file, made from the shipped `build-setup.sh.example`; the add-on Dockerfile is written once. Jenkins builds each base
+**before** its add-on.
 
 ```sh
 # postgres + sample DB
@@ -67,11 +69,12 @@ NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 \
 
 ```sh
 mkdir -p /srv/cbx/myproject && cd /srv/cbx/myproject
-cp -r path/to/infostars/docker-claude/{compose.yml,box-broker,hub} .
-cp path/to/infostars/docker-claude/.env.example      .env
+cp -r path/to/claude-box/{compose.yml,box-broker,hub} .
+cp path/to/claude-box/.env.example      .env
 cp path/to/infostars/docker-claude/mounts.example     mounts
 ./gen-hub-mounts.sh                                    # renders the hub's volumes -> compose.override.yml
-cp path/to/infostars/docker-claude/service-env       service-env   # REQUIRED: compose env_file
+cp path/to/claude-box/service-env.example      service-env   # REQUIRED: compose env_file
+cp path/to/claude-box/compose.project.yml.example compose.project.yml  # YOUR db/cache/queue, if any
 cp path/to/infostars/docker-claude/port-forwards.example port-forwards
 cp -r path/to/infostars/docker-claude/hub-services.example hub-services  # dev-service manifests
 mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
@@ -103,7 +106,7 @@ drop a `data/pinchtab/config.json` (copy your laptop's, set `server.bind=0.0.0.0
 
 ### GitHub deploy key (SSH)
 
-When this stack is deployed via Ansible (`tasks/containers-claude-box.yml`,
+When this stack is deployed via Ansible (the `claude_box` role,
 tag `containers-claude-box-deploy-key`), an ed25519 keypair is generated **on the remote** in
 `git-identity/` (never committed to git) and mounted into the hub as `~/.gitidentity`. The play
 prints the public key and step-by-step registration instructions during the run. To do it by hand
@@ -146,9 +149,27 @@ register the key read-only instead.
 
 Then:
 
+### The stack is two compose files
+
+`compose.yml` is **claude-box itself** — the hub and the box-broker, identical for every project.
+Anything your project needs beside them (a database, a message queue, a cache, seed data) goes in
+**`compose.project.yml`** (copy `compose.project.yml.example`), merged via `COMPOSE_FILE` in `.env`:
+
 ```sh
-docker compose up -d          # db, activemq, redis, box-broker, hub (clones the repo on first boot)
-                              # reuses the Jenkins-built images by default (see escape hatch below)
+COMPOSE_FILE=compose.yml:compose.project.yml:compose.override.yml
+```
+
+**Note the third entry.** Setting `COMPOSE_FILE` at all *disables* compose's automatic loading of
+`compose.override.yml` — the file `gen-hub-mounts.sh` renders the hub's half of the `mounts` table
+into. Leave it out and the hub starts with no `~/.npm`, `~/.gradle` or `~/.m2` at all, and the only
+symptom is a `MOUNT DRIFT` line in its boot log.
+
+Then:
+
+```sh
+docker compose up -d          # box-broker + hub (clones the repo on first boot), plus whatever
+                              # compose.project.yml adds. Reuses the locally built images by
+                              # default (see escape hatch below)
 ```
 
 ### Escape hatch: build the images locally
@@ -200,7 +221,7 @@ changed" comes from doing one and not the other:
 | `Dockerfile`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
 | `common-setup.sh` (shared toolchain: node, pinchtab, **tuicr**) | Jenkins build | **both** bases — box *and* hub |
 | `box-broker/broker.py`, **`claude-box.sh`** | Jenkins build | `claude-box-broker` |
-| `compose.yml`, `.env`, `service-env`, `mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
+| `compose.yml`, `compose.project.yml`, `.env`, `service-env`, `mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
 
 A change to `mounts` needs one extra step on the host, `./gen-hub-mounts.sh`, which renders the hub's
 half of the table into `compose.override.yml` (Ansible does it as part of the files tag).
@@ -248,13 +269,16 @@ they fail in different ways.
 Everything is driven through `cbx` inside the hub. Rather than typing the full
 `<transport> … docker exec …` each time, the helpers live in **`cbx.bash_aliases`** (next to this
 README) — source it from your `~/.bashrc`, setting the server and the stack's `PROJECT_NAME` first
-(export them before sourcing, or edit the defaults in the file):
+(export them before sourcing, or edit the defaults in the file). Project-specific helpers (`cbxpsql`,
+`cbxfe` — they know your db and your dev ports) are a **separate** file: copy
+`cbx.bash_aliases.project.example`, edit it, and source it *after* the generic one:
 
 ```sh
 # in ~/.bashrc
 export CBX_SERVER=root@hetzner1.acoveo.com   # the claude-box host
 export CBX_PROJECT=infostars                 # PROJECT_NAME of the stack
 source /path/to/claude-box/cbx.bash_aliases
+source /path/to/claude-box/cbx.bash_aliases.project   # optional: cbxpsql / cbxfe / your own
 ```
 
 That gives you:

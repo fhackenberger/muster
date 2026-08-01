@@ -1,10 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# Builds the claude-box image LOCALLY. This is now the dev-only escape hatch: by default claude-box.sh
-# runs the centrally-built image from the acoveo registry (Jenkins builds + pushes it), so you only
-# need this when hacking on the image itself. After building, run the box against your local build by
-# setting CLAUDEBOX_IMAGE=claude-box in ~/.config/claude-box/config (or exporting it).
+# Builds the claude-box image LOCALLY, tagged `claude-box` (= claude-box:latest). This is the dev
+# escape hatch: CI (the Jenkinsfile) builds the same image and tags it `claude-box:stable`, which is
+# what claude-box.sh defaults to — so after building here, run the box against YOUR build by setting
+# CLAUDEBOX_IMAGE=claude-box in ~/.config/claude-box/config (or exporting it).
+#
+# This builds the BASE box image only. A project's toolchain is layered on top by Dockerfile.addon
+# (--build-arg BASE_IMAGE=claude-box --build-arg SETUP_SCRIPT=build-setup.sh).
 #
 # The clip UID is NOT baked in — it's applied at container start from the settings file — so this is
 # a plain build and you only need to rebuild when the Dockerfile/entrypoint change, not when you

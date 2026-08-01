@@ -102,6 +102,57 @@ test_unknown_command_prints_usage() {
 	has "cbx svcs"
 }
 
+# The source tree must stay PROJECT-AGNOSTIC: claude-box is published on its own, so a project name,
+# a private registry or a real credential leaking into a tracked file is a release bug, not a style
+# nit. This is the cheap, mechanical half of that check (the rest is the secret scan in
+# tools/split-out.sh, which reads history rather than the tip).
+test_no_project_defaults() {
+	local bad=""
+	# Every per-stack file that carries credentials or project wiring ships as an .example; the real
+	# one is written by hand or by Ansible and is gitignored. A tracked real file = a leak waiting.
+	for f in mounts port-forwards service-env compose.project.yml build-setup.sh .env; do
+		[ -e "$ROOT/$f.example" ] || [ "$f" = .env ] || fail "missing example: $f.example"
+	done
+	exists "$ROOT/.env.example"
+	exists "$ROOT/service-env.example"
+	exists "$ROOT/compose.project.yml.example"
+	exists "$ROOT/cbx.bash_aliases.project.example"
+	# The build toolchain is the PROJECT's, so claude-box ships only an example of one. (The real
+	# build-setup.sh beside it is not asserted either way: the consuming repo tracks its own, and
+	# claude-box itself must never ship one — which the split's expected-file list enforces.)
+	exists "$ROOT/build-setup.sh.example"
+	# ...and the real ones must NOT be in the source tree.
+	absent "$ROOT/service-env"
+	# compose.yml is the STACK only. The project's own services live in compose.project.yml, so none
+	# of these may appear here — the check is on service KEYS at two-space indent, so a comment
+	# mentioning them (the example does) is fine.
+	for svc in db activemq redis; do
+		grep -q "^  ${svc}:" "$ROOT/compose.yml" && bad="$bad compose.yml:$svc"
+	done
+	[ -z "$bad" ] || fail "compose.yml must not define project services:$bad"
+	# The .example files are worked examples, so they carry a FICTIONAL project ('myapp'), not the one
+	# this repo happens to deploy — someone else's internal service names, URLs and DB users have no
+	# business in a public repo just because they made a convenient sample.
+	#
+	# No hard-coded private registry, and no project/org/host NAME in anything that ships. The bare
+	# names matter, not just the compound ones: an `ARG SETUP_SCRIPT=examples/infostars/build-setup.sh`
+	# default once survived a version of this check that only looked for infostarsFrontend/infostarsWeb.
+	OUT="$(grep -rniE -e 'dockerregistry\.acoveo\.com' -e 'infostars|acoveo|hetzner' "$ROOT/compose.yml" \
+		"$ROOT/.env.example" "$ROOT/claude-box.sh" "$ROOT/hub/cbx" "$ROOT/cbx.bash_aliases" \
+		"$ROOT/Dockerfile" "$ROOT/hub/Dockerfile.base" "$ROOT/Dockerfile.addon" \
+		"$ROOT/common-setup.sh" "$ROOT/build-setup.sh.example" \
+		"$ROOT/service-env.example" "$ROOT/compose.project.yml.example" \
+		"$ROOT/cbx.bash_aliases.project.example" "$ROOT/hub-services.example" \
+		"$ROOT/.gitignore" 2>/dev/null)"
+	[ -z "$OUT" ] || fail "project/registry specifics leaked into a generic file"
+	# GOLDEN_PREP_CMD defaults to a no-op: claude-box knows nothing about anyone's build. Asserted on
+	# the assignment itself rather than by sourcing cbx, which would run the whole script.
+	OUT="$(grep -n '^GOLDEN_PREP_CMD=' "$CBX_BIN")"
+	eq "$(printf '%s' "$OUT" | sed 's/^[0-9]*://')" 'GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-}"' \
+		"hub/cbx must default GOLDEN_PREP_CMD to empty"
+	OUT=""
+}
+
 # =====================================================================  queue / status
 
 test_status_empty() {
@@ -859,6 +910,7 @@ PY
 # =====================================================================  the run
 
 run "syntax: every script parses"                  test_syntax
+run "config: no project defaults in the source tree" test_no_project_defaults
 run "help: every command is documented"            test_help_covers_every_command
 run "help: an unknown command prints usage"        test_unknown_command_prints_usage
 

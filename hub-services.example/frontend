@@ -4,4 +4,4 @@ description=Angular dev server (ng serve) with live reload
 writes_repo=true
 # The script backgrounds ng serve and returns; the `tail -f` keeps the tmux window live so `cbx logs
 # frontend` streams the dev log. Relative path resolves against the repo (the window's cwd).
-command=./infostarsFrontend/scripts/frontend-dev-restart.sh && tail -f /tmp/infostarsFrontend-dev.log
+command=./myappFrontend/scripts/frontend-dev-restart.sh && tail -f /tmp/myappFrontend-dev.log

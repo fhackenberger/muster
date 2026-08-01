@@ -128,8 +128,9 @@ if [ "$REVIEW_TUI" = "-" ]; then REVIEW_TUI=""; fi
 
 # Your project's "make this tree ready to build" command. `cbx golden snapshot --prep` runs it IN THE
 # REPO (not in a copy), so it's an optional convenience around the setup you'd otherwise do by hand —
-# and whatever it installs is captured at the path it will actually be used from.
-GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-npm --prefix infostarsFrontend ci}"
+# and whatever it installs is captured at the path it will actually be used from. Empty by default:
+# claude-box knows nothing about your build — set GOLDEN_PREP_CMD in the stack's .env.
+GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-}"
 
 # Dev services are declared as MANIFESTS — one file per service in this directory (bind-mounted from
 # the stack's hub-services/, so a service can be added or edited by a file sync, no image rebuild).

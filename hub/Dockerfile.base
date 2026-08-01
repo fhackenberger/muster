@@ -2,7 +2,7 @@
 #
 # debian:trixie-slim + common-setup.sh (the same generic runtime the box uses) + the hub-only tooling:
 # openssh, Google Chrome (for the pinchtab server), git-ssh, cbx, and the hub entrypoint. No JDK/gradle
-# — the infostars build toolchain layers on top via Dockerfile.addon (-> claude-box-hub).
+# — your project's build toolchain layers on top via Dockerfile.addon (-> claude-box-hub).
 #
 # The hub runs headless as a single uid-1000 user 'dev' with home /home/dev — the SAME identity the
 # boxes use on the server — so every bind mount (/home/dev/.claude, .pinchtab, .gitidentity, .npm,

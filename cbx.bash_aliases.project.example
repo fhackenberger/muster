@@ -1,0 +1,89 @@
+# cbx.bash_aliases.project — PROJECT-SPECIFIC laptop helpers, sourced AFTER cbx.bash_aliases:
+#
+#     source /path/to/claude-box/cbx.bash_aliases
+#     source /path/to/claude-box/cbx.bash_aliases.project
+#
+# Order matters: everything here builds on the generic file (cbx_service_exec, cbx_box_env, cbxtun,
+# cbx_complete_box), and the generic file's `unalias` line would otherwise clobber these.
+#
+# What lives here is anything that knows what your project IS — which db the stack runs, which ports
+# the dev services bind, how the frontend finds its backend. Everything that does NOT know that is in
+# the generic file, under "BUILDING BLOCKS FOR PROJECT HELPERS"; read that first, because the two
+# helpers below are mostly a thin layer of project knowledge over it. The examples are for a fictional
+# 'myapp' stack; keep the shape, change the specifics.
+# ---------------------------------------------------------------------------------------------
+
+# Re-sourcing this file must be clean, and bash expands an alias mid-parse (failing with
+# "syntax error near `('") if one of these names is still an alias from an older revision.
+unalias cbxpsql cbxfe 2>/dev/null || true
+
+# A psql shell on the stack's postgres (the `db` service), against the DB name given as an arg:
+#
+#   cbxpsql myapp_dev                                   # interactive REPL (clipboard works)
+#   echo 'SELECT 1;' | cbxpsql myapp_dev                # pipe SQL in
+#   cbxpsql myapp_dev --single-transaction < dump.sql   # load a file atomically (all-or-nothing)
+#   cbxpsql myapp_dev -v ON_ERROR_STOP=1 -tA < q.sql    # stop on first error, tab/unaligned out
+#
+# cbx_service_exec does the work: it finds the container by compose label, allocates a PTY only when
+# stdin is a terminal (so the REPL and the pipe cases are both right), and quotes your extra args so
+# they survive the server-side shell. All this adds is WHICH service and WHICH user.
+#
+# --user postgres: the container's postgres superuser, reached over the local socket with peer auth,
+# so no password is involved. CBX_DB_USER connects as a specific db user instead (psql then prompts —
+# never bake a password in here). CBX_DB_SERVICE overrides the service name.
+cbxpsql() {
+	[ -n "${1:-}" ] || {
+		echo "usage: cbxpsql <dbname> [psql args…]   (e.g. cbxpsql myapp_dev --single-transaction < f.sql)" >&2
+		return 2
+	}
+	local db="$1"; shift
+	cbx_service_exec --user postgres "${CBX_DB_SERVICE:-db}" \
+		psql ${CBX_DB_USER:+-U "$CBX_DB_USER"} "$@" "$db"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Open ONE agent's frontend on your laptop:
+#
+#   cbxfe work1        -> http://localhost:4211 serves box 'work1' ng serve
+#   cbxfe work1 --own  -> …and only the box's OWN backend, leaving :8091 free for a local one
+#
+# WHY MORE THAN ONE FORWARD. The page comes from the box's dev server, but its JS calls
+# FRONTEND_DEV_BACKEND_URL — and YOUR BROWSER resolves that URL, so whatever host:port it names has to
+# exist on your laptop and lead to the right backend. The agent picks freely between two at runtime:
+#   * the HUB's backend      -> http://localhost:8091   (the default)
+#   * the box's OWN backend  -> http://localhost:<8900+slot>, i.e. $FRONTEND_DEV_BACKEND_URL_OWN
+# so we tunnel BOTH rather than make you guess. Getting it wrong is not obvious from the browser: the
+# page loads fine and only its API calls fail (ERR_CONNECTION_REFUSED on e.g.
+# http://localhost:8904/myappWeb/rest/config), which reads like a broken backend, not a missing tunnel.
+#
+# The box's own port is READ FROM THE BOX (cbx_box_env) rather than computed from a slot number, and
+# tunneled straight to the BOX — the hub-side socat binds the hub's loopback, which `ssh -L` cannot
+# reach. The two backend ports never collide, so both can be up at once.
+#
+# Ports come from service-env: FRONTEND_DEV_PORT / SERVER_PORT. Override per call with
+# CBX_FRONTEND_PORT / CBX_BACKEND_PORT if your stack uses different ones.
+cbxfe() {
+	local box="" own="" a fe="${CBX_FRONTEND_PORT:-4211}" be="${CBX_BACKEND_PORT:-8091}" hubport
+	for a in "$@"; do case "$a" in --own) own=1 ;; *) box="$a" ;; esac; done
+	[ -n "$box" ] || { echo "usage: cbxfe <box> [--own]   (--own = the box's own backend only, no :$be)" >&2; return 1; }
+
+	# Set on every running box by claude-box.sh, so empty means the box isn't up rather than that it
+	# has no backend forward.
+	hubport="$(cbx_box_env "$box" PORT_FORWARD_BACKEND_TO_HUB)" || return 1
+
+	local -a specs=("${box}:${fe}"); local desc=""
+	[ -n "$own" ] || { specs+=("hub:${be}"); desc=" :${be} (hub)"; }
+	if [ -n "$hubport" ]; then
+		specs+=("${hubport}:${box}:${be}"); desc="${desc} :${hubport} (the box's own)"
+	elif [ -n "$own" ]; then
+		echo "cbxfe: no BACKEND forward for '$box' (is it running?)" >&2; return 1
+	else
+		# Non-fatal: the hub backend is still tunneled, and that is the URL the frontend uses by default.
+		echo "cbxfe: no BACKEND forward for '$box' (is it running?) — tunneling the hub backend only" >&2
+	fi
+	echo "cbxfe: $box -> frontend :$fe, backend${desc}" >&2
+	cbxtun "${specs[@]}"
+}
+
+# Box-name Tab completion for the helpers above, with their own flags. One call each.
+cbx_complete_box cbxfe --own

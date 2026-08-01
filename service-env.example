@@ -1,5 +1,12 @@
-# service-env — settings for the PROJECT's services (backend, frontend, …), given to BOTH the hub
-# and every agent box. Either can run those services, so they must be configured identically.
+# service-env.example — settings for the PROJECT's services (backend, frontend, …), given to BOTH
+# the hub and every agent box. Either can run those services, so they must be configured identically.
+#
+#     cp service-env.example service-env      # REQUIRED: compose refuses to start the hub without it
+#
+# It is an EXAMPLE, like mounts.example / port-forwards.example: the real file holds credentials and
+# API keys, so it is never committed (see .gitignore). Under Ansible it is templated from
+# templates/docker-compose/claude-box/service-env, which pulls the secrets from the vault.
+# The values below are a worked example — one Gradle backend + Angular frontend + postgres stack.
 #
 #   hub    <- compose `env_file:` on the hub service
 #   boxes  <- the box-broker reads this file and passes each entry as `-e KEY=VALUE`
@@ -15,8 +22,6 @@
 # NOTE hostnames here (db, redis, activemq, hub) are docker-network names — they resolve the same
 # from the hub and from every box, since all of them are on the cbx-<project> network.
 #
-# This file is the project's; under Ansible it is templated from
-# templates/docker-compose/claude-box/service-env (which is where secrets come from the vault).
 
 # ---- service ports ----
 # SERVER_PORT is Spring Boot's server.port; FRONTEND_DEV_PORT is read by the project's frontend-dev
@@ -25,16 +30,16 @@
 SERVER_PORT=8091
 FRONTEND_DEV_PORT=4211
 # The FULL app URL, not just host:port — the frontend derives its REST base by stripping
-# /app[-suffix]/* off this value, so a bare host:port loses the /infostarsWeb segment and every REST
+# /app[-suffix]/* off this value, so a bare host:port loses the /myappWeb segment and every REST
 # call 404s. Default setup: the backend runs on the HUB, and the browser (pinchtab's Chrome there, or
 # your laptop via cbxtun/cbxfe) resolves localhost to that same hub — so this one value is right for
 # the hub AND for agent boxes.
-FRONTEND_DEV_BACKEND_URL=http://localhost:8091/infostarsWeb/app
+FRONTEND_DEV_BACKEND_URL=http://localhost:8091/myappWeb/app
 # The path segment the broker appends when it builds FRONTEND_DEV_BACKEND_URL_OWN for each box —
 # the ready-made URL of THAT box's own backend tunnel. Nothing uses _OWN by default; an agent that
 # wants to run a backend inside its box switches with one variable and relaunches the dev loop:
 #     export FRONTEND_DEV_BACKEND_URL="$FRONTEND_DEV_BACKEND_URL_OWN"
-FRONTEND_DEV_BACKEND_PATH=/infostarsWeb/app
+FRONTEND_DEV_BACKEND_PATH=/myappWeb/app
 
 #
 # NEVER use $VAR or ${VAR} in this file. Compose INTERPOLATES them when it loads env_file — against
@@ -50,9 +55,9 @@ FRONTEND_DEV_BACKEND_PATH=/infostarsWeb/app
 # reads (ports, DB, keys); those are shared with the agent boxes by the broker, which commands are not.
 
 # ---- backend wiring (config.properties keys; env overrides the baked-in defaults) ----
-DB_INFOSTARS_PSQL_URL=jdbc:postgresql://db:5432/infotrack_dev
-DB_INFOSTARS_PSQL_USER=infostars_u
-DB_INFOSTARS_PSQL_PASSWORD=test
+DB_MYAPP_PSQL_URL=jdbc:postgresql://db:5432/myapp_dev
+DB_MYAPP_PSQL_USER=myapp_u
+DB_MYAPP_PSQL_PASSWORD=test
 DB_LIQUIBASE_UPGRADE_DISABLED=true
 LIVE_JMSURI=tcp://activemq:61616
 ACTIVEMQ_ENABLE=true

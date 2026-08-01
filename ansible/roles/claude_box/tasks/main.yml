@@ -1,199 +1,147 @@
-# ==== claude-box docker compose containers ====
-- block:
-  - name: Create claude-box container config
-    file: path={{ item }} state=directory owner=root group=root mode="u=rwx,g=rx,o=rx"
-    with_items:
-      - /virtual_machines/claude-box-docker/
-  - name: Sync files for compose
-    synchronize:
-      src: docker-compose/claude-box/
-      dest: /virtual_machines/claude-box-docker/
-      recursive: yes
-      archive: no
-      links: yes
-      perms: yes
-      rsync_opts:
-        - "--exclude=.*.swp"
-        # Generated on the HOST from `mounts` (see below) — never ship a developer's local copy.
-        - "--exclude=compose.override.yml"
-    tags: [containers-claude-box-files]
-  # Take care of setting special permissions: boxes + hub run as uid 1000
-  - name: Take care of special permissions
-    file: path={{ item }} state=directory owner=1000 group=root mode="u=rwx,g=rx,o="
-    with_items:
-      - /virtual_machines/claude-box-docker/data/
-      # The hub's authoritative git repo (dev + every refs/agents/*, and the only clone with the
-      # deploy key). Was data/checkout before the agent-branch workflow — see README-remote.md.
-      - /virtual_machines/claude-box-docker/data/repo/
-      # Prepared checkouts the agent boxes overlay (data/golden/current), plus the staging dir the
-      # hub prepares a new one in before the broker seals it into place.
-      - /virtual_machines/claude-box-docker/data/golden/
-      - /virtual_machines/claude-box-docker/data/golden-staging/
-      - /virtual_machines/claude-box-docker/data/claude/
-      # Per-box state: session id, port-forward slot, and the box's overlay upper layer.
-      - /virtual_machines/claude-box-docker/data/boxes/
-      - /virtual_machines/claude-box-docker/data/pinchtab/
-      # Package caches from the `mounts` table: ~/.npm shared rw with every box, ~/.gradle the hub's
-      # own (each box overlays it read-only — gradle's locks cannot be shared across containers).
-      - /virtual_machines/claude-box-docker/data/npm-cache/
-      - /virtual_machines/claude-box-docker/data/gradle-cache/
-    tags: [containers-claude-box-files]
+# ==== claude-box: the PROJECT-AGNOSTIC half of the deployment ====
+#
+# Everything here is true for ANY claude-box stack: the directory layout, the rsync of the source
+# tree, the uid-1000 data dirs, the rendered hub mounts, the `.env` symlink and the GitHub deploy
+# key. Anything that knows what the project IS — the compose env file, `mounts`, `service-env`,
+# `port-forwards`, the hub-service manifests, seed data — is the CALLER's, and reaches this role as
+# `claude_box_config_files` (see defaults/main.yml).
+#
+# Tags are on the individual tasks rather than on the role, because the whole deploy workflow here is
+# tag-driven (`--tags containers-claude-box-files`, `containers-claude-box-deploy-key`). That only
+# works because the caller uses `import_role` (STATIC): tags do not propagate into an `include_role`.
 
-  # db reset / seed script
-  # Root-only helper: reset db -> liquibase update in the hub -> import the dump.
-  # 0750 because it destroys the dev database and needs the docker socket: root runs it, nobody else.
-  - name: Install the db reset/seed script for root
-    copy: src=files/claude-box/reset-db.sh dest=/virtual_machines/claude-box-docker/data/reset-db.sh owner=root group=root mode="u=rwx,g=rx,o="
-    tags: [containers-claude-box-files]
+- name: Create claude-box container config
+  file: path={{ item }} state=directory owner=root group=root mode="u=rwx,g=rx,o=rx"
+  with_items:
+    - "{{ claude_box_dir }}/"
 
-  # db seed data
-  # The anonymised infostars data dump that data/reset-db.sh imports
-  # World-readable: postgres inside the container runs as its own uid, not root.
-  - name: Ensure the db-init directory exists (holds the data dump compose mounts into db)
-    file: path=/virtual_machines/claude-box-docker/db-init/ state=directory owner=root group=root mode="u=rwx,g=rx,o=rx"
-    tags: [containers-claude-box-files, containers-claude-box-db-dump]
-  - name: Copy the infostars data dump for the db service (once, it is large)
-    copy: src=files/claude-box/infostars_filtered_data_dump.sql.gz dest=/virtual_machines/claude-box-docker/db-init/infostars_filtered_data_dump.sql.gz owner=root group=root mode="u=rw,g=r,o=r" force="{{ claude_box_force_db_dump|default(false)|bool }}"
-    tags: [containers-claude-box-files, containers-claude-box-db-dump]
+- name: Sync files for compose
+  synchronize:
+    # Absolute (see claude_box_source in defaults/main.yml) — `synchronize` looks a relative src up in
+    # the ROLE's files/ dir first, which is not where the stack sources live.
+    src: "{{ claude_box_source }}"
+    dest: "{{ claude_box_dir }}/"
+    recursive: yes
+    archive: no
+    links: yes
+    perms: yes
+    rsync_opts:
+      - "--exclude=.*.swp"
+      # Generated on the HOST from `mounts` (see below) — never ship a developer's local copy.
+      - "--exclude=compose.override.yml"
+  tags: [containers-claude-box-files]
 
-  # compose env file
-  # Templated env (holds the vault-backed tokens/API keys), with .env symlinked
-  # to it so `docker compose` picks it up automatically from the project dir.
-  - name: Template infostars.conf (compose env) to the remote
-    template: src=templates/docker-compose/claude-box/infostars.conf dest=/virtual_machines/claude-box-docker/infostars.conf owner=root group=root mode="u=rw,g=,o=" backup=no
-    tags: [containers-claude-box-files]
-  - name: Symlink .env to infostars.conf so docker compose picks it up
-    file: path=/virtual_machines/claude-box-docker/.env src=infostars.conf state=link force=yes
-    tags: [containers-claude-box-files]
+# Take care of setting special permissions: boxes + hub run as uid 1000. data/ itself plus every
+# subdir in claude_box_data_dirs (the stack's own plumbing; a project adds its caches to that list).
+- name: Take care of special permissions
+  file: path={{ item }} state=directory owner={{ claude_box_uid }} group=root mode="u=rwx,g=rx,o="
+  with_items: "{{ [claude_box_dir ~ '/data/'] + (claude_box_data_dirs | map('regex_replace', '^', claude_box_dir ~ '/data/') | list) }}"
+  tags: [containers-claude-box-files]
 
-  # The ONE mount table: what the hub gets and what every box gets, one row per path (see
-  # mounts.example). Root-owned project set-up — nothing inside a container may edit it. World-readable
-  # (it holds paths, no secrets) because the hub runs as uid 1000 and checks its own mounts against it.
-  - name: Claude box mounts table (hub + boxes)
-    template: src=templates/docker-compose/claude-box/mounts dest=/virtual_machines/claude-box-docker/mounts owner=root group=root mode="u=rw,g=r,o=r" backup=no
-    tags: [containers-claude-box-files]
-  # The broker reads the box column of that table directly, but compose cannot read it — so the hub's
-  # column is rendered into compose.override.yml here. Skipping this is what would let the hub's mounts
-  # drift from the boxes'; the hub warns at boot if they have.
-  - name: Render the hub's volumes from the mounts table
-    command: ./gen-hub-mounts.sh
-    args:
-      chdir: /virtual_machines/claude-box-docker
-    changed_when: false
-    tags: [containers-claude-box-files]
-  # Superseded by `mounts` above (box-only, and hub-writable via the removed `cbx expose`).
-  - name: Remove the superseded box-mounts manifest
-    file: path=/virtual_machines/claude-box-docker/box-mounts state=absent
-    tags: [containers-claude-box-files]
+# GitHub deploy key + the hub's gitconfig live here. Created before the config files below so a
+# caller can template its gitconfig straight into it.
+- name: Ensure git-identity directory exists (holds the deploy key + the hub's gitconfig)
+  file: path={{ claude_box_dir }}/git-identity/ state=directory owner={{ claude_box_uid }} group=root mode="u=rwx,g=,o="
+  tags: [containers-claude-box-files, containers-claude-box-deploy-key]
 
-  # Settings for the project's services (backend/frontend). Handed to the hub via compose `env_file:`
-  # AND to every agent box by the broker, so a service behaves the same whichever side starts it.
-  # Holds vault-backed API keys, hence mode 0600 like infostars.conf.
-  - name: Claude box service-env (backend/frontend settings for hub + boxes)
-    template: src=templates/docker-compose/claude-box/service-env dest=/virtual_machines/claude-box-docker/service-env owner=root group=root mode="u=rw,g=,o=" backup=no
-    tags: [containers-claude-box-files]
+# The project's config files (compose env, mounts, service-env, port-forwards, hub gitconfig, …).
+# The role does not know or care what they are — only that they must exist before gen-hub-mounts.sh
+# runs and before the `.env` symlink is followed. `src` is ABSOLUTE; see the note in defaults.
+- name: Template the project's claude-box config files
+  template:
+    src: "{{ item.src }}"
+    dest: "{{ claude_box_dir }}/{{ item.dest }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('u=rw,g=r,o=r') }}"
+    backup: no
+  loop: "{{ claude_box_config_files }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  tags: [containers-claude-box-files]
 
-  - name: Claude box port-forwards for infostars
-    template: src=templates/docker-compose/claude-box/port-forwards dest=/virtual_machines/claude-box-docker/port-forwards owner=root group=root mode="u=rw,g=,o=" backup=no
-    tags: [containers-claude-box-files]
+# The broker reads the box column of the `mounts` table directly, but compose cannot read it — so the
+# hub's column is rendered into compose.override.yml here. Skipping this is what would let the hub's
+# mounts drift from the boxes'; the hub warns at boot if they have. Needs `mounts` to exist, i.e. the
+# caller must have templated it above.
+- name: Render the hub's volumes from the mounts table
+  command: ./gen-hub-mounts.sh
+  args:
+    chdir: "{{ claude_box_dir }}"
+  changed_when: false
+  tags: [containers-claude-box-files]
 
-  # Dev-service manifests (one file per service) that the hub's `cbx up/svcs/autostart` reads —
-  # compose bind-mounts hub-services/ read-only. owner 1000 because the hub runs as uid 1000 and must
-  # read them. Not secret (no vault vars); still a directory of its own so adding/removing a service
-  # is just a file drop, no image rebuild. To add one, add a file here and to the loop below.
-  - name: Ensure claude-box hub-services directory exists (dev-service manifests)
-    file: path=/virtual_machines/claude-box-docker/hub-services/ state=directory owner=1000 group=root mode="u=rwx,g=rx,o="
-    tags: [containers-claude-box-files]
-  - name: Claude box hub-service manifests (backend/frontend/pinchtab)
-    template: src="templates/docker-compose/claude-box/hub-services/{{ item }}" dest="/virtual_machines/claude-box-docker/hub-services/{{ item }}" owner=1000 group=root mode="u=rw,g=r,o=" backup=no
-    loop:
-      - backend
-      - frontend
-      - pinchtab
-    tags: [containers-claude-box-files]
+# `.env` is a symlink to the templated compose env file (which holds the vault-backed values), so
+# `docker compose` picks it up automatically from the project dir. A symlink rather than a second
+# copy: one file to review, and no way for the two to drift.
+- name: Symlink .env to the compose env file so docker compose picks it up
+  file: path={{ claude_box_dir }}/.env src={{ claude_box_env_file }} state=link force=yes
+  tags: [containers-claude-box-files]
 
-  # pinchtab server config for the hub (mounted at ~/.pinchtab). Holds the vault
-  # token; bound to 0.0.0.0:9867 so the agent boxes reach it by name (hub:9867).
-  - name: Template pinchtab config.json to the remote
-    template: src=templates/docker-compose/claude-box/data/pinchtab/config.json dest=/virtual_machines/claude-box-docker/data/pinchtab/config.json owner=1000 group=root mode="u=rw,g=,o=" backup=no
-    tags: [containers-claude-box-files]
+# Superseded by `mounts` (box-only, and hub-writable via the removed `cbx expose`).
+- name: Remove the superseded box-mounts manifest
+  file: path={{ claude_box_dir }}/box-mounts state=absent
+  tags: [containers-claude-box-files]
 
-  # GitHub deploy key
-  # Generate an SSH keypair on the remote (never checked into git) that can be
-  # registered as a GitHub deploy key for the repo the hub clones on first boot.
-  - name: Ensure git-identity directory exists (holds the deploy key + the hub's gitconfig)
-    file: path=/virtual_machines/claude-box-docker/git-identity/ state=directory owner=1000 group=root mode="u=rwx,g=,o="
-    tags: [containers-claude-box-files, containers-claude-box-deploy-key]
-
-  # The hub's git identity — what `cbx merge` commits as. Without it the hub has no user.name/email
-  # (GIT_CONFIG_GLOBAL points here) and every merge fails with "Please tell me who you are". Managed
-  # here so it can't drift on the server: a hand-written core.sshCommand in this file once overrode
-  # the image's git-ssh wrapper and broke pushes with "Permission denied (publickey)".
-  - name: Template the hub's git identity (gitconfig) to the remote
-    template: src=templates/docker-compose/claude-box/gitconfig dest=/virtual_machines/claude-box-docker/git-identity/gitconfig owner=1000 group=root mode="u=rw,g=r,o=" backup=no
-    tags: [containers-claude-box-files]
-  - name: Generate GitHub deploy key on the remote
-    command: >
-      ssh-keygen -t ed25519 -N ''
-      -C 'claude-box-deploy-key@{{ inventory_hostname }}'
-      -f /virtual_machines/claude-box-docker/git-identity/id_ed25519
-    args:
-      creates: /virtual_machines/claude-box-docker/git-identity/id_ed25519
-    tags: [containers-claude-box-deploy-key]
-  - name: Fix ownership/permissions on the deploy key
-    file: path={{ item.path }} owner=1000 group=root mode={{ item.mode }}
-    with_items:
-      - { path: /virtual_machines/claude-box-docker/git-identity/id_ed25519, mode: "u=rw,g=,o=" }
-      - { path: /virtual_machines/claude-box-docker/git-identity/id_ed25519.pub, mode: "u=rw,g=r,o=r" }
-    tags: [containers-claude-box-deploy-key]
-  - name: Read the deploy public key
-    slurp:
-      src: /virtual_machines/claude-box-docker/git-identity/id_ed25519.pub
-    register: claude_box_deploy_pubkey
-    tags: [containers-claude-box-deploy-key]
-  - name: Show the deploy public key and how to register it on GitHub
-    # msg is a list so the default stdout callback prints one line per element
-    # (a single multi-line string would be shown with literal \n escapes).
-    debug:
-      msg:
-        - "===================== GitHub deploy key ====================="
-        - "Copy the public key line below and add it as a deploy key:"
-        - ""
-        - "  {{ claude_box_deploy_pubkey.content | b64decode | trim }}"
-        - ""
-        - "How to register it on github.com:"
-        - "  1. Open your repository on github.com"
-        - "  2. Settings -> Deploy keys -> Add deploy key"
-        - "  3. Title:  claude-box @ {{ inventory_hostname }}"
-        - "  4. Key:    paste the exact line above (starts with 'ssh-ed25519')"
-        - "  5. Tick \"Allow write access\" only if the hub needs to push"
-        - "  6. Click \"Add key\""
-        - ""
-        - "Then use an SSH-form REPO_URL (git@github.com:owner/repo.git) so the"
-        - "hub authenticates with this key."
-        - ""
-        - "----- Protect the default branch (ruleset) -----"
-        - "Prevent the deploy key (and everyone else) from pushing to the"
-        - "default branch, while still letting the repo owner through:"
-        - "  1. Settings -> Rules -> Rulesets -> New branch ruleset"
-        - "  2. Name:   protect-default-branch"
-        - "  3. Enforcement status:  Active"
-        - "  4. Bypass list -> Add bypass -> Repository admin (Role)"
-        - "       (or add the owner's account explicitly; org repos only)"
-        - "  5. Target branches -> Add target -> Include default branch"
-        - "  6. Enable rules:"
-        - "       - Restrict updates   (blocks direct pushes)"
-        - "       - Restrict deletions"
-        - "       - Block force pushes"
-        - "       - (optional) Require a pull request before merging"
-        - "  7. Create"
-        - "The deploy key is not in the bypass list, so it cannot push to the"
-        - "default branch; the owner still can."
-        - "============================================================="
-    tags: [containers-claude-box-deploy-key]
-
-#- name: Define claude-box docker compose containers
-#  docker_compose: project_src=/virtual_machines/claude-box-docker state=present
-#  vars:
-#    ansible_python_interpreter: /opt/docker-python/bin/python
-
+# GitHub deploy key
+# Generate an SSH keypair on the remote (never checked into git) that can be
+# registered as a GitHub deploy key for the repo the hub clones on first boot.
+- name: Generate GitHub deploy key on the remote
+  command: >
+    ssh-keygen -t ed25519 -N ''
+    -C '{{ claude_box_deploy_key_comment }}'
+    -f {{ claude_box_dir }}/git-identity/id_ed25519
+  args:
+    creates: "{{ claude_box_dir }}/git-identity/id_ed25519"
+  tags: [containers-claude-box-deploy-key]
+- name: Fix ownership/permissions on the deploy key
+  file: path={{ item.path }} owner={{ claude_box_uid }} group=root mode={{ item.mode }}
+  with_items:
+    - { path: "{{ claude_box_dir }}/git-identity/id_ed25519", mode: "u=rw,g=,o=" }
+    - { path: "{{ claude_box_dir }}/git-identity/id_ed25519.pub", mode: "u=rw,g=r,o=r" }
+  tags: [containers-claude-box-deploy-key]
+- name: Read the deploy public key
+  slurp:
+    src: "{{ claude_box_dir }}/git-identity/id_ed25519.pub"
+  register: claude_box_deploy_pubkey
+  tags: [containers-claude-box-deploy-key]
+- name: Show the deploy public key and how to register it on GitHub
+  # msg is a list so the default stdout callback prints one line per element
+  # (a single multi-line string would be shown with literal \n escapes).
+  debug:
+    msg:
+      - "===================== GitHub deploy key ====================="
+      - "Copy the public key line below and add it as a deploy key:"
+      - ""
+      - "  {{ claude_box_deploy_pubkey.content | b64decode | trim }}"
+      - ""
+      - "How to register it on github.com:"
+      - "  1. Open your repository on github.com"
+      - "  2. Settings -> Deploy keys -> Add deploy key"
+      - "  3. Title:  claude-box @ {{ inventory_hostname }}"
+      - "  4. Key:    paste the exact line above (starts with 'ssh-ed25519')"
+      - "  5. Tick \"Allow write access\" only if the hub needs to push"
+      - "  6. Click \"Add key\""
+      - ""
+      - "Then use an SSH-form REPO_URL (git@github.com:owner/repo.git) so the"
+      - "hub authenticates with this key."
+      - ""
+      - "----- Protect the default branch (ruleset) -----"
+      - "Prevent the deploy key (and everyone else) from pushing to the"
+      - "default branch, while still letting the repo owner through:"
+      - "  1. Settings -> Rules -> Rulesets -> New branch ruleset"
+      - "  2. Name:   protect-default-branch"
+      - "  3. Enforcement status:  Active"
+      - "  4. Bypass list -> Add bypass -> Repository admin (Role)"
+      - "       (or add the owner's account explicitly; org repos only)"
+      - "  5. Target branches -> Add target -> Include default branch"
+      - "  6. Enable rules:"
+      - "       - Restrict updates   (blocks direct pushes)"
+      - "       - Restrict deletions"
+      - "       - Block force pushes"
+      - "       - (optional) Require a pull request before merging"
+      - "  7. Create"
+      - "The deploy key is not in the bypass list, so it cannot push to the"
+      - "default branch; the owner still can."
+      - "============================================================="
+  tags: [containers-claude-box-deploy-key]
