@@ -7,7 +7,7 @@ Why versions matter here: `common-setup.sh` deliberately resolves the *latest* n
 at build time, so a commit does not identify an artifact. A tag does — see
 `docs/adr/0001-image-builds.md`.
 
-## [Unreleased]
+## [0.1.0] — 2026-08-02
 
 ### Added
 - First public release. Extracted from the private Ansible repository it grew up in, with its history.
