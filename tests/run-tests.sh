@@ -624,9 +624,12 @@ EOF
 	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
 		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
 	fi
-	cbx up dummy;   ok; has "dummy"
-	cbx svcs;       has "running"
-	cbx down dummy; ok
+	cbx up dummy;   ok; has "started dummy"
+	# svc_list's state column is up|down, not running|stopped. Asserted together with the name so a
+	# stray "up" anywhere else in the listing cannot satisfy it.
+	cbx svcs;       has "dummy        up"
+	cbx down dummy; ok; has "stopped dummy"
+	cbx svcs;       has "dummy        down"
 	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 	unset TMUX_SESSION
 }
