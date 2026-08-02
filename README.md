@@ -11,6 +11,10 @@ colleague's pull request — with a diff, line comments, and a merge you control
 (clone, `npm ci`, warm caches) exists **once**; an agent's divergence costs only what it actually
 changed, so ten agents are ten diffs, not ten checkouts.
 
+It runs on a machine you already have, driven entirely from your terminal. The surface each agent
+works inside is a file you edit; the dev loop it runs is one command away from your browser; and
+nothing about the codebase leaves your own infrastructure.
+
 ```
    your laptop  ──ssh──▶  hub                          the review desk: the repo, the CLI, dev services
                            │  spawns via the broker
@@ -59,18 +63,33 @@ root@other labstack` gives you `lab`, `labhub`, `labbox`, each with its own serv
 
 ## What you get
 
+- **You draw the surface the agents see.** One table (`mounts`) describes what exists inside the hub
+  and inside every box — the checkout, which caches are shared, which are private, what is read-only,
+  what is not there at all. It is one file with a column per side, so the two cannot drift apart, and
+  nothing is exposed because somebody forgot it was. Where the boundary sits is a decision you make
+  per project, not one the tool makes for you.
+- **It is a terminal, not a product.** Everything is `ssh` and shell functions: no web app, no
+  account, no third party between you and your code. Which means it composes —
+  `muster q --text | grep re-review`, a helper of your own beside the shipped ones, a different set
+  per project, a cron job that spawns a box at 6am. And several stacks at once from one shell, each
+  with its own prefix, its own server and its own completion.
+- **Watch the thing it built, not just the diff.** Every box runs its own dev loop, so one command
+  tunnels that agent's dev server — and the backend its JavaScript actually calls — to your browser.
+  You click through the feature on the branch that built it, before deciding whether it lands.
+- **Your hardware, your idle time.** The heavy end runs on a machine you already own and already pay
+  for. A build that crawls on a laptop finishes on the server that sits idle overnight, and ten agents
+  cost ten diffs of disk rather than ten checkouts — so the turnaround improves at no marginal cost,
+  and nothing about your codebase leaves your infrastructure.
 - **A review queue, not a chat log.** `muster q` is a live dashboard: which agents are working, which
   have handed off, which conflict with `dev` or with each other, and the one command that moves each
   one forward.
 - **Real review.** `muster review <box>` opens a TUI on the agent's branch; line comments go back to
   the agent as a prompt. A re-review shows only what changed since you last looked.
 - **Merges you control.** `--squash` for one commit, `--reword` to rewrite every commit message
-  without squashing, `--minto` to merge `dev` *into* a long-lived branch — with conflicts resolved by
+  without squashing, `minto` to merge `dev` *into* a long-lived branch — with conflicts resolved by
   you in a worktree, or handed to an agent that opens directly onto the conflict with both histories.
 - **Isolation that is actually isolated.** Agents never hold credentials for your real origin. They
   push to the hub over `git://` on a private network, and a hook confines them to `refs/agents/*`.
-- **Nothing to remember about ports.** Per-box port forwards, one command to tunnel a box's dev server
-  and its backend to your browser.
 
 ## Documentation
 
