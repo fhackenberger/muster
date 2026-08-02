@@ -53,6 +53,8 @@ Config (env, from compose):
   PINCHTAB_SERVER     e.g. http://hub:9867     PINCHTAB_TOKEN  the pinchtab token
   PORT_FORWARDS_FILE  HOST path of the port-forwards manifest (NAME BOX_PORT HUB_BASE_PORT per line)
   PORT_FORWARD_SLOTS  max concurrent boxes with forwards; each box's slot N -> hub port BASE+N (dflt 16)
+  SERVICE_ENV_FILE    KEY=VALUE lines given to the hub (compose env_file) AND every box, verbatim
+  BOX_ENV_FILE        KEY=VALUE lines for BOXES ONLY, values expanded per box, applied last
   BOX_UID/BOX_GID     synthetic non-root identity inside the box (default 1000/1000)
   MUSTER_SCRIPT    path to muster-box.sh (default /usr/local/bin/muster-box.sh)
 """
@@ -98,6 +100,10 @@ PORT_FORWARD_SLOTS = int(os.environ.get("PORT_FORWARD_SLOTS", "16"))
 # when it runs those services itself. The SAME file is given to the hub via `env_file:` in compose, so
 # a service behaves identically whether the hub or a box runs it.
 SERVICE_ENV_FILE = os.environ.get("SERVICE_ENV_FILE", "")
+# The BOX half of that: KEY=VALUE lines whose values may use $VARIABLES, expanded per box and applied
+# after service-env — so a project can override, for boxes only, a value that is correct on the hub.
+# Optional; a stack without one behaves exactly as before.
+BOX_ENV_FILE = os.environ.get("BOX_ENV_FILE", "")
 BOX_UID = os.environ.get("BOX_UID", "1000")
 BOX_GID = os.environ.get("BOX_GID", "1000")
 MUSTER_SCRIPT = os.environ.get("MUSTER_SCRIPT", "/usr/local/bin/muster-box.sh")
@@ -343,6 +349,62 @@ def parse_service_env():
 			if not ENV_KEY_RE.match(key):
 				raise ValueError(f"bad service-env key {key!r}")
 			out.append(f"{key}={value}")
+	return out
+
+
+def parse_box_env():
+	"""KEY=$TEMPLATE lines from BOX_ENV_FILE — the project's per-box environment.
+
+	service-env is fed VERBATIM to the hub (by compose, as an env_file) and to every box, which is why
+	it must never contain `$VAR`. This file is the opposite: it is read only here, expanded per box,
+	and appended AFTER service-env, so a value defined there can be OVERRIDDEN for boxes only.
+
+	That is the whole point. A URL like http://localhost:8091/app is correct on the hub and correct in
+	your browser through the tunnels, and wrong inside a box, where localhost is the box. One key, two
+	truths, and until now the second one was hard-coded in this file under the project's own variable
+	names (FRONTEND_DEV_BACKEND_URL_OWN) — muster inventing meaning for a name it cannot know."""
+	out = []
+	if not BOX_ENV_FILE or not os.path.exists(BOX_ENV_FILE):
+		return out
+	with open(BOX_ENV_FILE) as fh:
+		for raw in fh:
+			line = raw.strip()
+			if not line or line.startswith("#"):
+				continue
+			if "=" not in line:
+				raise ValueError(f"bad box-env line {line!r} (want: KEY=VALUE)")
+			key, value = line.split("=", 1)
+			key = key.strip()
+			if not ENV_KEY_RE.match(key):
+				raise ValueError(f"bad box-env key {key!r}")
+			out.append(f"{key}={value}")
+	return out
+
+
+def last_wins(lines):
+	"""One line per key, keeping the LAST — which is how box-env overrides service-env.
+
+	`docker run -e A=1 -e A=2` does keep the last, but resting a documented feature on an unwritten
+	CLI detail is how a docker upgrade turns into a stack whose agents quietly talk to the wrong
+	backend. Collapsing here makes the rule ours, and the environment easier to read in
+	`docker inspect` besides."""
+	seen = {}
+	for line in lines:
+		seen[line.split("=", 1)[0]] = line
+	return list(seen.values())
+
+
+def expand_box_env(lines, facts):
+	"""Expand $VARIABLES in box-env values against this box's facts.
+
+	safe_substitute, not substitute: an unknown $name is left exactly as written. A token, a password
+	or a regex containing a stray $ must not be able to fail a spawn — and a typo'd variable that
+	survives into the environment is visible in `docker inspect`, where a KeyError three layers down
+	is not."""
+	out = []
+	for line in lines:
+		key, value = line.split("=", 1)
+		out.append(f"{key}={string.Template(value).safe_substitute(facts)}")
 	return out
 
 
@@ -670,8 +732,122 @@ def ensure_activity_hooks():
 		json.dump(data, fh, indent=2)
 		fh.write("\n")
 	os.replace(tmp, path)
-	os.chown(path, int(BOX_UID), int(BOX_GID))
+	# The broker runs as root, so this hands the rewritten file back to the uid the boxes run as —
+	# claude must be able to write its own settings. Best-effort on purpose: anywhere BUT the broker
+	# (a test, someone running this by hand) the caller is not root and chown raises EPERM, which is
+	# not a reason to fail after the file has already been written correctly.
+	try:
+		os.chown(path, int(BOX_UID), int(BOX_GID))
+	except OSError as e:  # noqa: BLE001
+		print(f"box-broker: could not chown {path} to {BOX_UID}:{BOX_GID} ({e}) — "
+		      f"harmless unless boxes cannot write it", flush=True)
 	print(f"box-broker: registered activity hooks in {path}", flush=True)
+
+
+MEMO_START = "<!-- muster:box start -->"
+MEMO_END = "<!-- muster:box end -->"
+
+
+def box_memo():
+	"""The text every agent should have read before deciding a service is unreachable.
+
+	WHY IT IS SHARED AND NOT PER BOX. The port MAP is a property of the stack — which forwards exist,
+	what each is for, which side of the tunnel is which. Only the numbers are per box, and those are
+	already in the environment, so the memo names the VARIABLES rather than their values and is
+	identical for every box. That is what makes it safe to put in the one ~/.claude every box mounts.
+
+	Values would not be: that directory is a single host dir shared by the hub and all boxes, so a
+	memo carrying real port numbers would be rewritten by whichever box spawned last and read by the
+	others as if it were theirs."""
+	lines = [MEMO_START,
+	         "## muster box: how to reach services",
+	         "",
+	         "You are in an agent box: a container of your own, on the stack's docker network.",
+	         "**`localhost` is this box** — not the hub, and not your reviewer's laptop. Every URL in",
+	         "the shared service settings is written for a browser, so curling one from here returns",
+	         "000 and means nothing about whether the service is up.",
+	         "",
+	         "- The hub answers to `$MUSTER_HUB_HOST` on the network. A service the HUB runs on port P",
+	         "  is `http://$MUSTER_HUB_HOST:P`.",
+	         "- Services YOU run bind inside this box and are published on the hub's loopback so the",
+	         "  reviewer's browser can reach them; that hub-side port is not reachable from here."]
+	fwds = []
+	try:
+		fwds = parse_port_forwards()
+	except (OSError, ValueError):
+		pass
+	if fwds:
+		lines += ["", "| service | in this box | on the hub |", "|---|---|---|"]
+		for fwd_name, _box_port, _hub_base in fwds:
+			lines.append(f"| {fwd_name} | `$PORT_FORWARD_{fwd_name}_FROM` | "
+			             f"`$PORT_FORWARD_{fwd_name}_TO_HUB` |")
+		lines += ["", "Those are environment variables — read them, do not guess the numbers."]
+	if PT_SERVER:
+		# The hub-side column exists FOR THIS. Without it an agent reads two ports, finds one of them
+		# unreachable from where it is standing, and never learns what the other one was for.
+		lines += ["",
+		          "### Looking at your own frontend (pinchtab)",
+		          "",
+		          "`pinchtab` drives a real Chrome — **on the hub, not in this box** — so you can load a",
+		          "page you are serving and take screenshots. The CLI is installed here and already",
+		          "pointed at that server (`$PINCHTAB_SERVER`, `$PINCHTAB_TOKEN`); `pinchtab --help`.",
+		          "",
+		          "Because the browser is on the hub, the URL you give it is resolved THERE. Your dev",
+		          "server is published on the hub's loopback for exactly this reason, so use the hub",
+		          "column above: `http://localhost:$PORT_FORWARD_<NAME>_TO_HUB`. That is the one URL",
+		          "that is right for pinchtab and wrong for curl from this box — and the reverse is true",
+		          "of the in-box port. Same two ports, two different consumers.",
+		          "",
+		          "The service has to be up on the hub (`up pinchtab` there); if it is not, ask your",
+		          "reviewer rather than assuming the page is broken."]
+	keys = []
+	try:
+		keys = [l.split("=", 1)[0] for l in parse_box_env()]
+	except (OSError, ValueError):
+		pass
+	if keys:
+		lines += ["",
+		          "This project sets these for you, already correct for a box (they may differ from",
+		          "the same names on the hub): " + ", ".join(f"`{k}`" for k in keys) + "."]
+	lines.append(MEMO_END)
+	return "\n".join(lines) + "\n"
+
+
+def ensure_box_memo():
+	"""Keep the memo in the shared ~/.claude/CLAUDE.md, between markers.
+
+	Claude loads that file as memory in every session, which is the only channel an agent reads
+	without being told to. Everything outside the markers is someone else's — the block is replaced
+	whole, never merged, and the file is created if it does not exist."""
+	if not CLAUDE_HOME:
+		return
+	path = os.path.join(CLAUDE_HOME, "CLAUDE.md")
+	memo = box_memo()
+	old = ""
+	if os.path.exists(path):
+		try:
+			with open(path) as fh:
+				old = fh.read()
+		except OSError as e:  # noqa: BLE001
+			print(f"box-broker: not touching {path} ({e})", flush=True)
+			return
+	if MEMO_START in old and MEMO_END in old:
+		head, rest = old.split(MEMO_START, 1)
+		_, tail = rest.split(MEMO_END, 1)
+		new = head + memo.rstrip("\n") + tail
+	else:
+		new = (old.rstrip("\n") + "\n\n" if old.strip() else "") + memo
+	if new == old:
+		return
+	tmp = path + ".muster-tmp"
+	with open(tmp, "w") as fh:
+		fh.write(new)
+	os.replace(tmp, path)
+	try:
+		os.chown(path, int(BOX_UID), int(BOX_GID))
+	except OSError:
+		pass
+	print(f"box-broker: refreshed the box memo in {path}", flush=True)
 
 
 def session_args(box_dir, resume):
@@ -729,6 +905,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
 		ensure_activity_hooks()
+		ensure_box_memo()
 	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at
 	# 127.0.0.1:(HUB_BASE_PORT + slot). The box gets PORT_FORWARDS + PORT_FORWARD_<NAME>_FROM/_TO_HUB so
 	# the project's own scripts can wire e.g. MUSTER_DEV_URL and the frontend's backend URL. Running
@@ -823,20 +1000,30 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 			forward_ports[fwd_name] = hub_port
 			env[f"PORT_FORWARD_{fwd_name}_FROM"] = str(box_port)
 			env[f"PORT_FORWARD_{fwd_name}_TO_HUB"] = str(hub_port)
-	# The BACKEND forward is provisioned for every box but NOT used by default: the frontend keeps
-	# pointing at the HUB's backend (the service-env value), which is the one actually running. The
-	# tunnel just sits there ready, so an agent that decides to run its own backend switches with a
-	# single variable — we hand it the finished URL rather than making it work out its slot port:
-	#     export FRONTEND_DEV_BACKEND_URL="$FRONTEND_DEV_BACKEND_URL_OWN"   # then restart the dev loop
-	# It must be a FULL app URL, not host:port — the frontend derives its REST base by stripping
-	# /app[-suffix]/* off it, so a missing path segment sends every REST call to the wrong place.
-	if "BACKEND" in forward_ports:
-		path = ""
-		for e in svc_env:
-			if e.startswith("FRONTEND_DEV_BACKEND_PATH="):
-				path = e.split("=", 1)[1]
-		svc_env.append(f"FRONTEND_DEV_BACKEND_URL_OWN=http://localhost:{forward_ports['BACKEND']}{path}")
-		env["MUSTER_EXTRA_ENV"] = "\n".join(svc_env)
+	# THE PROJECT'S OWN PER-BOX ENVIRONMENT. Everything above is generic — forward names and port
+	# numbers, which muster does know. What those mean to a project is box-env's business: which
+	# variable its dev loop reads, what shape of URL it wants, which of the two backends is the
+	# default. This file used to build FRONTEND_DEV_BACKEND_URL_OWN itself, from a variable name it had
+	# no way to know the meaning of; that is now three lines in a project file.
+	#
+	# Appended LAST so a project can override a service-env value for boxes only — docker keeps the
+	# last -e for a repeated key, and that override is the entire reason this exists.
+	facts = dict(MUSTER_HUB_HOST=urllib.parse.urlsplit(HUB_GIT_URL).hostname or "hub",
+	             MUSTER_BOX=name, MUSTER_BRANCH=f"agent/{name}", MUSTER_DEV_BRANCH=DEV_BRANCH,
+	             MUSTER_PROJECT=PROJECT, MUSTER_WORKDIR=checkout_dst,
+	             MUSTER_GOLDEN=os.path.basename(golden),
+	             MUSTER_SLOT="" if slot is None else str(slot))
+	facts["PORT_FORWARDS"] = env.get("PORT_FORWARDS", "")
+	for fwd_name, hub_port in forward_ports.items():
+		facts[f"PORT_FORWARD_{fwd_name}_TO_HUB"] = str(hub_port)
+	for fwd_name, box_port, _ in forwards:
+		facts[f"PORT_FORWARD_{fwd_name}_FROM"] = str(box_port)
+	for e in svc_env:                                    # service-env values are substitutable too
+		k, v = e.split("=", 1)
+		facts.setdefault(k, v)
+	svc_env.append(f"MUSTER_HUB_HOST={facts['MUSTER_HUB_HOST']}")
+	svc_env.extend(expand_box_env(parse_box_env(), facts))
+	env["MUSTER_EXTRA_ENV"] = "\n".join(last_wins(svc_env))
 	proc = subprocess.run([MUSTER_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "muster-box.sh failed")

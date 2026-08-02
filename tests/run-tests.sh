@@ -115,11 +115,12 @@ test_no_project_defaults() {
 	local bad=""
 	# Every per-stack file that carries credentials or project wiring ships as an .example; the real
 	# one is written by hand or by Ansible and is gitignored. A tracked real file = a leak waiting.
-	for f in mounts port-forwards service-env compose.project.yml build-setup.sh .env; do
+	for f in mounts port-forwards service-env box-env compose.project.yml build-setup.sh .env; do
 		[ -e "$ROOT/$f.example" ] || [ "$f" = .env ] || fail "missing example: $f.example"
 	done
 	exists "$ROOT/.env.example"
 	exists "$ROOT/service-env.example"
+	exists "$ROOT/box-env.example"
 	exists "$ROOT/compose.project.yml.example"
 	exists "$ROOT/muster.bash_aliases.project.example"
 	# The build toolchain is the PROJECT's, so muster ships only an example of one. (The real
@@ -1280,7 +1281,10 @@ test_broker_activity_hooks() {
 		  }
 		}
 	EOF
-	OUT="$(CLAUDE_HOME="$FIX/claude" python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+	# A BOX_UID nobody here can chown to. The broker IS root in production, but the suite is not — and
+	# on a CI runner (uid 1001) even 1000:1000 raises EPERM, which failed this test after the file had
+	# already been written correctly. Handing the file over is best-effort; writing it is not.
+	OUT="$(CLAUDE_HOME="$FIX/claude" BOX_UID=4242 BOX_GID=4242 python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import importlib.util, json, os, sys
 os.environ.setdefault("BROKER_TOKEN", "t")
 spec = importlib.util.spec_from_file_location("b", sys.argv[1])
@@ -1297,6 +1301,85 @@ b.ensure_activity_hooks()
 d2 = json.load(open(os.path.join(os.environ["CLAUDE_HOME"], "settings.json")))
 c2 = [h["command"] for v in d2["hooks"].values() for g in v for h in g["hooks"]]
 assert sorted(c2) == sorted(cmds), (cmds, c2)
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# THE PROJECT'S PER-BOX ENVIRONMENT. muster must not know what FRONTEND_DEV_BACKEND_URL means — it
+# used to build a sibling of it here, under a name it could only have copied from one project. What
+# it does know is forward names and port numbers; box-env is where a project turns those into its own
+# variables, and the override of a service-env value is the case that made it necessary: the same URL
+# is right on the hub and wrong in a box, where localhost is the box.
+test_broker_box_env() {
+	fixture
+	cat > "$FIX/box-env" <<-'EOF'
+		# comments and blanks are ignored
+		FRONTEND_DEV_BACKEND_URL=http://$MUSTER_HUB_HOST:$SERVER_PORT$FRONTEND_DEV_BACKEND_PATH
+		OWN=http://localhost:$PORT_FORWARD_BACKEND_TO_HUB$FRONTEND_DEV_BACKEND_PATH
+		LITERAL=cost is $9.99 and $NOT_A_FACT stays
+	EOF
+	OUT="$(BOX_ENV_FILE="$FIX/box-env" python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+facts = {"MUSTER_HUB_HOST": "hub", "SERVER_PORT": "8091",
+         "FRONTEND_DEV_BACKEND_PATH": "/myappWeb/app", "PORT_FORWARD_BACKEND_TO_HUB": "8913"}
+out = b.expand_box_env(b.parse_box_env(), facts)
+assert "FRONTEND_DEV_BACKEND_URL=http://hub:8091/myappWeb/app" in out, out
+assert "OWN=http://localhost:8913/myappWeb/app" in out, out
+# safe_substitute: an unknown $name and a bare $ survive untouched. A token or a regex with a $ in it
+# must never be able to fail a spawn.
+assert "LITERAL=cost is $9.99 and $NOT_A_FACT stays" in out, out
+# No file at all is the normal case for a project that needs none.
+b.BOX_ENV_FILE = "/nonexistent"
+assert b.parse_box_env() == [], b.parse_box_env()
+# THE OVERRIDE. box-env is appended after service-env and the LAST line for a key wins — collapsed
+# here rather than left to `docker run -e A=1 -e A=2`, so a docker upgrade cannot quietly point every
+# agent at the wrong backend.
+merged = b.last_wins(["FRONTEND_DEV_BACKEND_URL=http://localhost:8091/x", "SERVER_PORT=8091",
+                      "FRONTEND_DEV_BACKEND_URL=http://hub:8091/x"])
+assert merged == ["FRONTEND_DEV_BACKEND_URL=http://hub:8091/x", "SERVER_PORT=8091"], merged
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# The memo goes in the ONE ~/.claude every box mounts, so it must be identical for every box: it names
+# the environment VARIABLES, never their values. It is also the only channel an agent reads without
+# being told to — which is why the ports and the "localhost is this box" rule live there and not in a
+# variable nobody prints.
+test_broker_box_memo() {
+	fixture
+	mkdir -p "$FIX/claude"
+	printf 'MY OWN NOTES\nkeep me\n' > "$FIX/claude/CLAUDE.md"
+	printf 'FRONTEND 4211 4300\nBACKEND  8091 8900\n' > "$FIX/port-forwards"
+	printf 'FRONTEND_DEV_BACKEND_URL=http://$MUSTER_HUB_HOST:1/x\n' > "$FIX/box-env"
+	OUT="$(CLAUDE_HOME="$FIX/claude" PORT_FORWARDS_FILE="$FIX/port-forwards" BOX_ENV_FILE="$FIX/box-env" \
+		PINCHTAB_SERVER=http://hub:9867 python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+b.ensure_box_memo()
+b.ensure_box_memo()                      # idempotent: the broker runs it on every spawn
+txt = open(os.path.join(os.environ["CLAUDE_HOME"], "CLAUDE.md")).read()
+assert txt.count(b.MEMO_START) == 1, txt
+assert "MY OWN NOTES" in txt and "keep me" in txt, txt      # never clobber someone else's memory
+assert "$PORT_FORWARD_FRONTEND_TO_HUB" in txt, txt          # variable NAMES, shared-safe
+assert "4300" not in txt and "4211" not in txt, txt         # never per-box values
+assert "FRONTEND_DEV_BACKEND_URL" in txt, txt               # box-env's keys are advertised
+# pinchtab is WHY the hub-side port exists: the browser runs on the hub, so that column is the one
+# URL that is right for it and wrong for curl from the box. An agent told only half of that learns
+# one port is unreachable and never finds out what the other was for.
+assert "pinchtab" in txt and "on the hub, not in this box" in txt, txt
+assert "$PORT_FORWARD_<NAME>_TO_HUB" in txt, txt
+# …and a stack that runs no pinchtab is not told about one.
+b.PT_SERVER = ""
+assert "pinchtab" not in b.box_memo(), b.box_memo()
 print("ok")
 PYEOF
 )"; RC=$?
@@ -1419,6 +1502,8 @@ run "broker: the branch job survives a recreate"   test_broker_persists_the_bran
 run "broker: query parameters"                     test_broker_query_params
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
+run "broker: box-env, expanded per box"            test_broker_box_env
+run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 
 echo

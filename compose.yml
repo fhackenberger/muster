@@ -85,6 +85,11 @@ services:
       # `env_file:` below, so a backend/frontend is configured identically whether the hub or an
       # agent runs it.
       SERVICE_ENV_FILE: ${STACK_DIR}/service-env
+      # The BOX half of that: KEY=VALUE lines whose values may use $$VARIABLES, expanded per box and
+      # applied AFTER service-env — so a project can override, for boxes only, a value that is right
+      # on the hub and wrong in a box (a `localhost` URL is the standard case). Optional; the broker
+      # ignores a missing file. See box-env.example.
+      BOX_ENV_FILE: ${STACK_DIR}/box-env
       PORT_FORWARDS_FILE: ${STACK_DIR}/port-forwards
       PORT_FORWARD_SLOTS: ${PORT_FORWARD_SLOTS:-16}
     volumes:

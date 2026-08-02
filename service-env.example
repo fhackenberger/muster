@@ -31,14 +31,16 @@ SERVER_PORT=8091
 FRONTEND_DEV_PORT=4211
 # The FULL app URL, not just host:port — the frontend derives its REST base by stripping
 # /app[-suffix]/* off this value, so a bare host:port loses the /myappWeb segment and every REST
-# call 404s. Default setup: the backend runs on the HUB, and the browser (pinchtab's Chrome there, or
-# your laptop via cbxtun/cbxfe) resolves localhost to that same hub — so this one value is right for
-# the hub AND for agent boxes.
+# call 404s. Default setup: the backend runs on the HUB, and the BROWSER (pinchtab's Chrome there, or
+# your laptop via cbxtun/cbxfe) resolves localhost to that same hub.
+#
+# RIGHT FOR THE HUB AND FOR A BROWSER, WRONG INSIDE A BOX, where localhost is the box: an agent that
+# curls it gets 000 and concludes the backend is down. Override it for boxes in `box-env`, which is
+# expanded per box and applied after this file:
+#     FRONTEND_DEV_BACKEND_URL=http://$MUSTER_HUB_HOST:$SERVER_PORT$FRONTEND_DEV_BACKEND_PATH
 FRONTEND_DEV_BACKEND_URL=http://localhost:8091/myappWeb/app
-# The path segment the broker appends when it builds FRONTEND_DEV_BACKEND_URL_OWN for each box —
-# the ready-made URL of THAT box's own backend tunnel. Nothing uses _OWN by default; an agent that
-# wants to run a backend inside its box switches with one variable and relaunches the dev loop:
-#     export FRONTEND_DEV_BACKEND_URL="$FRONTEND_DEV_BACKEND_URL_OWN"
+# Split out so box-env can rebuild the URL around a different host or port without repeating the path
+# (and so an agent's own backend can reuse it) — see box-env.example.
 FRONTEND_DEV_BACKEND_PATH=/myappWeb/app
 
 #

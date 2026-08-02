@@ -16,6 +16,7 @@ boxes/
 # --- per-stack config made from the .example files (holds credentials) ---
 .env
 service-env
+box-env
 mounts
 port-forwards
 hub-services/

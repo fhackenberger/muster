@@ -998,6 +998,33 @@ Jenkins pipeline **before** any image is built — a broken `cbx` should never r
   (default 16); the broker refuses to spawn once slots are exhausted. The slot is stable per box
   (`data/boxes/<name>/slot`), reused across `cbx recreate`. (Project scripts must also bind those
   services to `0.0.0.0` in the box so the forwarder can reach them.)
+- **The other direction — a box reaching the HUB's services:** by the hub's **name on the compose
+  network**, never by `localhost`. Every URL in `service-env` is written for a *browser*
+  (`http://localhost:8091/...` is the hub's backend as tunnelled to your laptop), and a
+  `..._TO_HUB` port is a box's own service as published on the **hub's** loopback. In a box,
+  `localhost` is the box: both connect to nothing, `curl` reports `000`, and an agent reasonably
+  concludes the backend is down. Two things address that:
+  - **`MUSTER_HUB_HOST`** — the hub's service name (from `HUB_GIT_URL`), in every box's environment.
+  - **`box-env`** — the project's own per-box environment (see below), where `FRONTEND_DEV_BACKEND_URL`
+    and friends are rewritten to point at `$MUSTER_HUB_HOST` for boxes only.
+- **`box-env` — the project's per-box environment.** `service-env` is fed verbatim to the hub *and*
+  every box, which is why it must never contain `$VAR`. `box-env` is the opposite: read only by the
+  broker, expanded per box, applied **after** `service-env`, so a key repeated there is **overridden
+  for boxes only**. That override is the whole point — the same URL is correct on the hub and wrong in
+  a box. Substitutable: `$MUSTER_HUB_HOST`, `$MUSTER_BOX`, `$MUSTER_BRANCH`, `$MUSTER_DEV_BRANCH`,
+  `$MUSTER_PROJECT`, `$MUSTER_WORKDIR`, `$MUSTER_GOLDEN`, `$MUSTER_SLOT`, every
+  `$PORT_FORWARD_<NAME>_FROM`/`_TO_HUB`, and every key from `service-env`. Unknown `$name`s survive
+  untouched (`safe_substitute`), so a token with a `$` in it cannot fail a spawn. See
+  `box-env.example`. muster deliberately knows none of these variable names itself.
+- **The box memo.** The broker keeps a fenced block in the shared `~/.claude/CLAUDE.md` — the one file
+  claude loads as memory without being asked — describing that `localhost` is the box, how to reach
+  the hub, the forward table, which keys `box-env` sets, and **how pinchtab works**: the browser runs
+  on the *hub*, so the URL you hand it is resolved there and the `_TO_HUB` port is the right one —
+  the same port that is useless to `curl` from inside the box. That pairing is the whole reason both
+  columns exist, and an agent told only half of it concludes a service is down. It names the
+  *variables*, never their values: that `.claude` is one directory shared by the hub and every box, so
+  anything box-specific in it would be rewritten by whichever box spawned last. Everything outside the
+  markers is left alone, and a stack with no pinchtab is not told about one.
 - **`service-env` configures the hub AND every box.** Project settings a service reads (backend DB /
   ActiveMQ / Redis wiring, API keys, feature flags) live in `service-env`, not in `compose.yml`: the
   hub gets it via compose `env_file:` and the broker passes every entry into each box as

@@ -1,0 +1,55 @@
+# box-env — the PROJECT's per-box environment. Copy to `box-env` beside compose.yml. Optional: a
+# stack without one behaves exactly as it did before this file existed.
+#
+# HOW IT DIFFERS FROM service-env, which is the whole reason it exists:
+#
+#   service-env   fed VERBATIM to the hub (compose `env_file:`) and to every box. One value, both
+#                 sides. Must never contain $VAR — compose would expand it against the HOST, as root,
+#                 while the broker would not, and the two environments would drift apart silently.
+#   box-env       read only by the broker, expanded PER BOX, applied AFTER service-env. $VAR here is
+#                 the point, and a key repeated from service-env OVERRIDES it for boxes only.
+#
+# That override is what nothing else could express. Take a frontend whose dev script reads
+# FRONTEND_DEV_BACKEND_URL:
+#
+#   on the hub          http://localhost:8091/myappWeb/app   correct — the backend runs there
+#   in your browser     http://localhost:8091/myappWeb/app   correct — `cbxtun` tunnels it
+#   inside a box        http://localhost:8091/myappWeb/app   WRONG — localhost is the box
+#
+# An agent that curls the third one gets 000, concludes the backend is down, and quietly verifies
+# against fixtures instead. One line here fixes it for every box, for good:
+#
+#     FRONTEND_DEV_BACKEND_URL=http://$MUSTER_HUB_HOST:$SERVER_PORT$FRONTEND_DEV_BACKEND_PATH
+#
+# WHAT YOU CAN SUBSTITUTE
+#
+#   $MUSTER_HUB_HOST      the hub's name on the stack network — how a box reaches anything the hub runs
+#   $MUSTER_BOX           this box's name          $MUSTER_BRANCH      agent/<box>
+#   $MUSTER_DEV_BRANCH    the branch it is based on  $MUSTER_PROJECT   the stack name
+#   $MUSTER_WORKDIR       the checkout inside the box (/home/dev/repo)
+#   $MUSTER_GOLDEN        the golden it is overlaid on   $MUSTER_SLOT   its port-forward slot
+#   $PORT_FORWARDS        the forward names, comma-separated
+#   $PORT_FORWARD_<NAME>_FROM     the port that forward listens on INSIDE this box
+#   $PORT_FORWARD_<NAME>_TO_HUB   where the hub publishes it (127.0.0.1:<that>) — for the REVIEWER's
+#                                 browser, not reachable from inside the box
+#   …plus every key from service-env.
+#
+# Expansion is `safe_substitute`: an unknown $name is left exactly as written, so a token or a regex
+# containing a stray $ cannot fail a spawn. The flip side is that a TYPO also survives — check with
+#     docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' box-<project>-<name> | grep FRONTEND
+#
+# The keys defined here are also listed in the note muster keeps in the shared ~/.claude/CLAUDE.md, so
+# agents are told these exist rather than having to find them.
+
+# --- worked example, for a fictional 'myapp' -------------------------------------------------------
+
+# The backend runs on the HUB by default, so point boxes at it by name instead of localhost.
+#FRONTEND_DEV_BACKEND_URL=http://$MUSTER_HUB_HOST:$SERVER_PORT$FRONTEND_DEV_BACKEND_PATH
+
+# …and hand over the ready-made URL for the box's OWN backend, for an agent that wants to run one.
+# It is a hub-loopback port, so this URL is for the reviewer's browser (via `cbxfe <box>`), not for
+# curling from inside the box.
+#FRONTEND_DEV_BACKEND_URL_OWN=http://localhost:$PORT_FORWARD_BACKEND_TO_HUB$FRONTEND_DEV_BACKEND_PATH
+
+# The frontend an agent serves, as the hub's pinchtab browser reaches it.
+#MYAPP_DEV_URL=http://localhost:$PORT_FORWARD_FRONTEND_TO_HUB
