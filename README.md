@@ -35,7 +35,6 @@ git clone https://github.com/fhackenberger/muster && cd muster
 cp .env.example .env && $EDITOR .env        # REPO_URL, tokens, MUSTER_PREFIX
 
 # No build toolchain? The published images are your images — nothing to build:
-docker login ghcr.io          # while the repository is private, so are its packages
 docker compose up -d
 
 # Have one (JDK, gradle, whatever)? It is ten lines:

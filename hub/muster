@@ -341,6 +341,12 @@ svc_up() {
 	if svc_running "$svc"; then
 		echo "$SELF: $svc already running ($SELF logs $svc to view)"; return 0
 	fi
+	# The hub's entrypoint starts this server at boot and every service is a WINDOW in it. If it is
+	# gone, tmux would fail with a bare "error connecting to /tmp/tmux-<uid>/default", which says
+	# nothing about what to do.
+	tmux has-session -t "$TMUX_SESSION" 2>/dev/null \
+		|| die "no tmux session '$TMUX_SESSION' — the hub's tmux server is not running. It is started at
+     boot, so recreate the hub: docker compose up -d --force-recreate hub"
 	cmd="$SVC_COMMAND"
 	# workdir overrides the window's default cwd; unquoted so $REPO/$VAR expand in the launch shell.
 	[ -n "$SVC_WORKDIR" ] && cmd="cd $SVC_WORKDIR && $cmd"

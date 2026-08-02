@@ -54,11 +54,10 @@ and keeping it working keeps the published images honest — they are a convenie
 suite. It lives with the code and needs no infrastructure of its own. Tags are `v1.2.3`, `1.2`, and a
 moving `latest` — deploy from a version, not from `latest`.
 
-While the repository is **private**, two things follow that would not for a public one: Actions
-minutes are metered rather than free, so `images.yml` runs on tags only and never on a push; and the
-GHCR packages are private too, so anything pulling them — including a server running
-`docker compose up -d` — needs `docker login ghcr.io` with a token carrying `read:packages`. Neither
-changes the decision, but both are surprises if you meet them at a deploy.
+One thing to check after the first release: a GHCR package is **private until you say otherwise**,
+even from a public repository. Until it is made public (package settings → change visibility) every
+pull needs `docker login ghcr.io` with a token carrying `read:packages` — including the one a server
+does during `docker compose up -d`, where it surfaces as a bare 403.
 
 ## Consequences
 

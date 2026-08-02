@@ -616,11 +616,18 @@ test_service_up_down() {
 description=a sleeper
 command=sleep 600
 EOF
-	export TMUX_SESSION="cbxtest-$$"
+	export TMUX_SESSION="mustertest-$$"
+	# `muster up` only ADDS A WINDOW to a server the hub's entrypoint starts at boot; it does not create
+	# the session. So the fixture has to stand one up the same way, or tmux fails with a bare
+	# "error connecting to /tmp/tmux-<uid>/default". (This is why the test passed for months on a
+	# machine without tmux, where it skipped, and failed the moment CI installed it.)
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
 	cbx up dummy;   ok; has "dummy"
 	cbx svcs;       has "running"
 	cbx down dummy; ok
-	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 	unset TMUX_SESSION
 }
 
