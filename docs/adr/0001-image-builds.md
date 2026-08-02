@@ -51,8 +51,14 @@ and keeping it working keeps the published images honest — they are a convenie
 ### Where
 
 **GitHub Actions → GHCR** (`.github/workflows/images.yml`), triggered by a `v*` tag, gated on the test
-suite. Free for a public repo, lives with the code, needs no infrastructure from anyone adopting it.
-Tags are `v1.2.3`, `1.2`, and a moving `latest` — deploy from a version, not from `latest`.
+suite. It lives with the code and needs no infrastructure of its own. Tags are `v1.2.3`, `1.2`, and a
+moving `latest` — deploy from a version, not from `latest`.
+
+While the repository is **private**, two things follow that would not for a public one: Actions
+minutes are metered rather than free, so `images.yml` runs on tags only and never on a push; and the
+GHCR packages are private too, so anything pulling them — including a server running
+`docker compose up -d` — needs `docker login ghcr.io` with a token carrying `read:packages`. Neither
+changes the decision, but both are surprises if you meet them at a deploy.
 
 ## Consequences
 
@@ -78,7 +84,7 @@ only the role and leave the other two needing a second mechanism.
 
 ```sh
 docker build -f vendor/muster/Dockerfile.addon \
-  --build-arg BASE_IMAGE=ghcr.io/<org>/muster:v1.2.3 \
+  --build-arg BASE_IMAGE=ghcr.io/fhackenberger/muster:v1.2.3 \
   --build-arg SETUP_SCRIPT=build-setup.sh \
   -t myproject-box:stable <dir containing your build-setup.sh>
 ```
