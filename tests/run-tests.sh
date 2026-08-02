@@ -1189,22 +1189,26 @@ PY
 	ok; has ok
 }
 
+# The permission mode reaches claude VERBATIM. muster must not own this vocabulary: the levels are
+# claude's, they change when claude changes, and translating them is exactly how `auto` — claude's
+# mode, in which a small model judges each command — silently became acceptEdits, a different policy
+# from the one the deployment asked for.
 test_broker_box_mode() {
-	OUT="$(MUSTER_BOX_MODE=plan python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+	OUT="$(MUSTER_CLAUDE_PERMISSION_MODE=plan python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import importlib.util, os, sys
 os.environ.setdefault("BROKER_TOKEN", "t")
 spec = importlib.util.spec_from_file_location("b", sys.argv[1])
 b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
 assert b.box_mode_arg() == "--permission-mode plan", b.box_mode_arg()
-# the friendly spellings people actually type
-for given, want in (("accept-edits","acceptEdits"), ("auto","acceptEdits"), ("bypass","bypassPermissions")):
-    b.MUSTER_BOX_MODE = given
-    assert b.box_mode_arg() == f"--permission-mode {want}", (given, b.box_mode_arg())
-# an unknown mode must NOT reach claude: a rejected flag kills the box at startup, which is far
-# harder to diagnose than a mode that quietly did not apply.
-b.MUSTER_BOX_MODE = "turbo"
-assert b.box_mode_arg() == "", b.box_mode_arg()
-b.MUSTER_BOX_MODE = ""
+# Every documented mode goes through unchanged: no aliasing, no case-folding, no mapping.
+for given in ("default", "plan", "acceptEdits", "bypassPermissions", "auto"):
+    b.MUSTER_CLAUDE_PERMISSION_MODE = given
+    assert b.box_mode_arg() == f"--permission-mode {given}", (given, b.box_mode_arg())
+# A mode muster has never heard of is passed on ANYWAY, and only warned about: claude adds modes on
+# its own schedule, and needing a muster release before you can use one is the worse failure.
+b.MUSTER_CLAUDE_PERMISSION_MODE = "somethingNew"
+assert b.box_mode_arg() == "--permission-mode somethingNew", b.box_mode_arg()
+b.MUSTER_CLAUDE_PERMISSION_MODE = ""
 assert b.box_mode_arg() == ""
 print("ok")
 PYEOF
@@ -1325,7 +1329,7 @@ run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
-run "broker: box mode maps to --permission-mode"   test_broker_box_mode
+run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 
 echo

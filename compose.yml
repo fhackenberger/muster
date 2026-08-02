@@ -43,13 +43,14 @@ services:
       PROJECT_NAME: ${PROJECT_NAME}
       BOX_IMAGE: ${BOX_IMAGE:-muster:stable}
       # How every box's claude comes up — project policy, not something you retype per box.
-      #   MUSTER_BOX_MODE    default | plan | accept-edits | auto | bypass  (claude's --permission-mode;
-      #                      an unrecognised value is ignored with a warning rather than killing the box)
+      #   MUSTER_CLAUDE_PERMISSION_MODE  claude's --permission-mode, passed through verbatim:
+      #                      default | plan | acceptEdits | bypassPermissions | auto. Named for the
+      #                      harness because the levels are claude's, not muster's.
       #   MUSTER_BOX_PROMPT  an opening message. $VARIABLES are filled from the broker's own environment
       #                      plus this box's facts: $MUSTER_BOX, $MUSTER_BRANCH, $MUSTER_DEV_BRANCH,
       #                      $MUSTER_BASE_BRANCH, $MUSTER_MERGE_BRANCH, $MUSTER_PROJECT, $MUSTER_WORKDIR,
       #                      $MUSTER_GOLDEN. Unknown names are left alone.
-      MUSTER_BOX_MODE: ${MUSTER_BOX_MODE:-}
+      MUSTER_CLAUDE_PERMISSION_MODE: ${MUSTER_CLAUDE_PERMISSION_MODE:-}
       MUSTER_BOX_PROMPT: ${MUSTER_BOX_PROMPT:-}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       # The prepared "golden" checkouts every box overlays (data/golden/current), and the staging dir

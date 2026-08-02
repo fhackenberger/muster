@@ -109,37 +109,38 @@ MUSTER_VERSION = os.environ.get("MUSTER_VERSION", "unknown")
 
 # HOW A BOX'S CLAUDE STARTS, as project policy rather than something you type every time.
 #
-#   MUSTER_BOX_MODE    the permission mode claude starts in.
-#   MUSTER_BOX_PROMPT  an opening prompt, given to claude as its first message.
+#   MUSTER_CLAUDE_PERMISSION_MODE  passed verbatim to claude's --permission-mode.
+#   MUSTER_BOX_PROMPT              an opening prompt, given to claude as its first message.
 #
 # Both come from the stack's .env, so they are a property of the deployment: every box this broker
 # spawns starts the same way, and a recreate reproduces it.
-MUSTER_BOX_MODE = os.environ.get("MUSTER_BOX_MODE", "").strip()
+#
+# THE NAME SAYS CLAUDE ON PURPOSE, and the value is passed THROUGH. Permission levels belong to the
+# harness, not to muster: they are claude's vocabulary, they change when claude changes, and another
+# agent CLI in a box would bring a different set with different meanings. The neutral-sounding
+# MUSTER_BOX_MODE invited exactly the mistake it shipped with — it translated `auto` to acceptEdits,
+# on the assumption that "auto" was a colloquialism for "accept the edits". It is not: `auto` is
+# claude's own mode, in which a small model judges whether each command may run. Inventing a
+# vocabulary on top of someone else's is how a deployment quietly ends up on a policy nobody chose.
+MUSTER_CLAUDE_PERMISSION_MODE = os.environ.get("MUSTER_CLAUDE_PERMISSION_MODE", "").strip()
 MUSTER_BOX_PROMPT = os.environ.get("MUSTER_BOX_PROMPT", "")
 
-# What claude actually accepts, plus the spellings people reach for. Unknown values are IGNORED with a
-# warning rather than passed through: a rejected flag would make claude exit at startup, and a box
-# that dies on boot is far more expensive to diagnose than a mode that did not apply.
-BOX_MODES = {
-	"default": "default",
-	"plan": "plan",
-	"accept-edits": "acceptEdits", "acceptedits": "acceptEdits", "acceptEdits": "acceptEdits",
-	"auto": "acceptEdits",                    # what "auto" colloquially means: accept edits, still ask to run
-	"bypass": "bypassPermissions", "bypass-permissions": "bypassPermissions",
-	"bypassPermissions": "bypassPermissions",
-}
+# Advisory only — the modes claude documents today. A value outside this list is still passed on,
+# because claude gains modes on its own schedule and muster rejecting one it has not heard of is the
+# more annoying failure. It is worth a line in the log either way: if boxes then die at startup on a
+# flag claude rejects, this is the first place to look.
+KNOWN_CLAUDE_MODES = ("default", "plan", "acceptEdits", "bypassPermissions", "auto")
 
 
 def box_mode_arg():
-	"""`--permission-mode <mode>`, or "" when unset/unrecognised."""
-	if not MUSTER_BOX_MODE:
+	"""`--permission-mode <mode>` exactly as configured, or "" when unset."""
+	if not MUSTER_CLAUDE_PERMISSION_MODE:
 		return ""
-	mode = BOX_MODES.get(MUSTER_BOX_MODE) or BOX_MODES.get(MUSTER_BOX_MODE.lower())
-	if not mode:
-		print(f"box-broker: ignoring MUSTER_BOX_MODE={MUSTER_BOX_MODE!r} — expected one of "
-		      f"{sorted(set(BOX_MODES))}", flush=True)
-		return ""
-	return f"--permission-mode {mode}"
+	if MUSTER_CLAUDE_PERMISSION_MODE not in KNOWN_CLAUDE_MODES:
+		print(f"box-broker: MUSTER_CLAUDE_PERMISSION_MODE={MUSTER_CLAUDE_PERMISSION_MODE!r} is not one of "
+		      f"{list(KNOWN_CLAUDE_MODES)} — passing it to claude as-is. If boxes die at startup, this "
+		      f"is why: claude exits on an unknown --permission-mode.", flush=True)
+	return f"--permission-mode {MUSTER_CLAUDE_PERMISSION_MODE}"
 
 
 def box_prompt(name, facts):
@@ -711,7 +712,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	rows, checkout_dst, checkout_ro = parse_mounts(golden)
 	claude_args = session_args(box_dir, resume)
 	job = box_job(box_dir, base, merge)
-	# Project policy for how this box's claude comes up (see MUSTER_BOX_MODE / MUSTER_BOX_PROMPT).
+	# Project policy for how this box's claude comes up (MUSTER_CLAUDE_PERMISSION_MODE / MUSTER_BOX_PROMPT).
 	# The mode is a flag, so it joins the claude args; the prompt travels separately, base64-encoded,
 	# because it is free text going through two shells.
 	mode_arg = box_mode_arg()
