@@ -47,14 +47,64 @@ cbx() {
 	return 0
 }
 
-# Same, but with a PTY and keystrokes fed in with human-ish delays. cbx's prompts read from /dev/tty
-# and drop pending input first (tty_flush), so a plain pipe would have its answers eaten before the
-# prompt is even drawn — the delay is what makes the input land after each prompt.
+# Wait until the program under test is sitting at a prompt with its input flushed. Two signals, both
+# required: the log stopped growing, AND its last byte is not a newline — every cbx prompt ends in
+# "? " with no newline, so an unterminated last line means "printed a question, now blocked on read".
+# Quiet alone is not enough: $EDITOR runs for a second or two per commit with nothing on stdout, and
+# a key sent then is a key thrown away.
+#
+# Returns 1 if that never happens within ~30s, and the caller then stops feeding rather than typing
+# into the void — a test that fails its assertions beats a suite that hangs.
+_tty_at_prompt() {
+	local f="$1" prev=-1 cur i tail
+	for ((i = 0; i < 200; i++)); do
+		cur="$(wc -c <"$f" 2>/dev/null || echo 0)"
+		if [ "$cur" = "$prev" ] && [ "$cur" != 0 ]; then
+			tail="$(tail -c1 "$f" 2>/dev/null)"
+			[ -n "$tail" ] && return 0        # $( ) strips a trailing newline: non-empty = no newline
+		fi
+		prev="$cur"; sleep 0.15
+	done
+	return 1
+}
+
+# Same as cbx(), but with a PTY and keystrokes fed in one prompt at a time.
+#
+# The timing here is NOT cosmetic. cbx's prompts read from /dev/tty and call tty_flush first, which
+# DISCARDS whatever is already pending — that is the point of it (a stray keypress made during a
+# review must not answer the next question). So a key that arrives while cbx is still working is not
+# queued, it is thrown away, and the prompt then reads EOF.
+#
+# This used to sleep a fixed 0.25s between keys, which is a race against however long the previous
+# key's work takes: `merge --reword` runs $EDITOR once per commit, and on a loaded machine or inside
+# a container that overran the delay, the next key was eaten and the merge silently became a quit.
+# It failed in Jenkins and passed on a laptop, which is the worst way for a test to fail. So instead
+# of guessing a delay, wait for the output to go quiet — cbx is only ever quiet when it is at a
+# prompt with the flush already behind it.
 muster_tty() {
 	local keys="$1"; shift
 	local args; printf -v args ' %q' "$@"
-	OUT="$( { IFS='|'; for k in $keys; do sleep 0.25; printf '%s\n' "$k"; done; sleep 0.4; } \
-		| script -qec "bash $MUSTER_BIN$args" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
+	local log="$TMP/tty.log" fifo="$TMP/tty.in"
+	rm -f "$log" "$fifo"; : > "$log"; mkfifo "$fifo" || { RC=1; OUT="muster_tty: mkfifo failed"; return 0; }
+	# The feeder holds the write end open so cbx sees one continuous stdin rather than EOF after the
+	# first key. If cbx exits early it dies of SIGPIPE here, which is exactly what we want.
+	(
+		exec 3>"$fifo"
+		local k
+		IFS='|'
+		for k in $keys; do
+			_tty_at_prompt "$log" || break
+			printf '%s\n' "$k" >&3 2>/dev/null || break
+		done
+	) &
+	local feeder=$!
+	# `timeout` because closing the fifo does NOT reliably end the child: script owns the pty master,
+	# so cbx's read on /dev/tty can block for good once a key has gone missing. Without this the
+	# suite would hang instead of failing, which is how this cost an afternoon the first time.
+	timeout 120 script -qec "bash $MUSTER_BIN$args" /dev/null <"$fifo" >"$log" 2>&1; RC=$?
+	kill "$feeder" 2>/dev/null; wait "$feeder" 2>/dev/null
+	OUT="$(sed 's/\r$//' "$log")"
+	rm -f "$fifo"
 	return 0
 }
 

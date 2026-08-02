@@ -38,9 +38,6 @@ services:
     # COMPOSE_PULL_POLICY=build to (re)build locally from this dir.
     image: ${BOX_BROKER_IMAGE:-muster-broker:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
-    build:
-      context: .
-      dockerfile: box-broker/Dockerfile
     environment:
       BROKER_TOKEN: ${BROKER_TOKEN}
       PROJECT_NAME: ${PROJECT_NAME}
@@ -101,19 +98,6 @@ services:
     # Same policy as box-broker.
     image: ${HUB_IMAGE:-muster-hub:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
-    build:
-      # The hub image = the shared Dockerfile.addon (your project's toolchain, installed by the script
-      # SETUP_SCRIPT names) layered onto muster-hub-base (hub/Dockerfile.base). Same add-on file the
-      # box uses; FINAL_USER=1000 keeps the hub running as its uid-1000 'dev' user. Override
-      # HUB_BASE_IMAGE to build against a locally-built or registry-qualified base, and SETUP_SCRIPT (in
-      # compose.project.yml) to install your own toolchain — see Dockerfile.addon.
-      context: .
-      dockerfile: Dockerfile.addon
-      args:
-        BASE_IMAGE: ${HUB_BASE_IMAGE:-muster-hub-base:stable}
-        SETUP_SCRIPT: ${SETUP_SCRIPT:-build-setup.sh}
-        GRADLE_VERSION: ${GRADLE_VERSION:-}
-        FINAL_USER: "1000"
     hostname: ${PROJECT_NAME}-hub
     init: true
     # Project services (a db, a cache, …) are added to this list by compose.project.yml, which
@@ -182,19 +166,58 @@ services:
 
   # ------------------------------------------------------------------ build-only
   #
-  # THE BOX ADD-ON IMAGE. Not a service — nothing ever starts it. It exists because the box image is
-  # the one image compose otherwise cannot build: the broker spawns boxes itself and only receives
-  # BOX_IMAGE as an environment value, so `docker compose build` used to produce a hub carrying your
-  # toolchain and leave the boxes without it. You found out when an agent's first build failed.
+  # NONE OF THE THREE BELOW IS A SERVICE. They exist to give `docker compose build` one target per
+  # image; nothing ever starts them.
   #
-  #     docker compose --profile build build          # hub + broker + THIS
+  #     docker compose --profile build build          # broker + hub + box
   #
-  # `profiles:` is what keeps it out of everything else: a profiled service is invisible to
-  # `up`, `down`, `pull`, `ps` and plain `build` unless the profile is switched on. So a deployment
-  # that pulls prebuilt images (ours) never touches it, and no `depends_on` can drag it in.
+  # `profiles:` is what keeps them out of everything else: a profiled service is invisible to `up`,
+  # `down`, `pull`, `ps` and plain `build` unless the profile is switched on. So a deployment that
+  # pulls prebuilt images (ours) never touches them, and no `depends_on` can drag one in.
   #
-  # It builds the SAME Dockerfile.addon as the hub, just onto the box base instead of the hub base —
-  # that is the whole difference between the two add-on images, and why one file serves both.
+  # Why they are here at all, rather than a `build:` on the hub and broker services themselves: with
+  # one, a `docker compose up` whose image is missing — a typo'd tag, a registry that has not been
+  # pushed to yet — silently BUILDS instead of failing. On a server that is the worst of both worlds:
+  # minutes of surprise work, then a hub running an image nobody published and nobody can reproduce.
+  # Without it the same situation is one clear error. A test asserts that no startable service ever
+  # grows a `build:` back.
+
+  # The BROKER image. Generic — no project add-on — so a deployment always pulls it from ghcr; this
+  # exists only for a fork, an air-gapped site, or anyone who would rather not run our binaries.
+  broker-image:
+    profiles: [build]
+    image: ${BOX_BROKER_IMAGE:-muster-broker:stable}
+    build:
+      context: .
+      dockerfile: box-broker/Dockerfile
+    command: ["true"]
+    restart: "no"
+
+  # The HUB add-on image: Dockerfile.addon — your project's toolchain, installed by the script
+  # SETUP_SCRIPT names — layered onto muster-hub-base (hub/Dockerfile.base). Override HUB_BASE_IMAGE
+  # to build against a locally-built or registry-qualified base.
+  hub-image:
+    profiles: [build]
+    image: ${HUB_IMAGE:-muster-hub:stable}
+    build:
+      context: .
+      dockerfile: Dockerfile.addon
+      args:
+        BASE_IMAGE: ${HUB_BASE_IMAGE:-muster-hub-base:stable}
+        # FINAL_USER=1000: the hub runs as its uid-1000 'dev' user, unlike the box, which stays root
+        # and drops privileges in its own entrypoint.
+        FINAL_USER: "1000"
+        SETUP_SCRIPT: ${SETUP_SCRIPT:-build-setup.sh}
+        GRADLE_VERSION: ${GRADLE_VERSION:-}
+    command: ["true"]
+    restart: "no"
+
+  # THE BOX ADD-ON IMAGE — the one image compose otherwise could not build at all: the broker spawns
+  # boxes itself and only receives BOX_IMAGE as an environment value, so `docker compose build` used
+  # to produce a hub carrying your toolchain and leave the boxes without it. You found out when an
+  # agent's first build failed. It is the SAME Dockerfile.addon as the hub, onto the box base instead
+  # of the hub base — that is the whole difference between the two add-on images, and why one file
+  # serves both.
   box-image:
     profiles: [build]
     image: ${BOX_IMAGE:-muster:stable}

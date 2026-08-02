@@ -7,7 +7,10 @@ diff soup.**
 *to muster* — to assemble a force. *to pass muster* — to survive inspection. Both halves of the job.
 
 muster is made for solo devs who don't need pull requests, and who would rather run on their own
-infrastructure than drive their agentic dev loop through the GitHub web UI.
+infrastructure than drive their agentic dev loop through the GitHub web UI. Review stays in the
+terminal too: `muster review <box>` opens [tuicr](https://tuicr.dev) on the agent's branch — scroll
+the diff, leave line and range comments, quit — and the comments go back to that agent as its next
+instruction. An agent can attach comments of its own to the same session before handing over.
 
 Each agent works in its own box: a copy-on-write overlay of one prepared checkout, on its own branch,
 with a real `.git`. When it is done it pushes to the hub, and you review it the way you would review a
@@ -20,16 +23,17 @@ works inside is a file you edit; the dev loop it runs is one command away from y
 nothing about the codebase leaves your own infrastructure.
 
 ```
-                      your laptop
-                       │       ▲
-                   ssh │       │ http, tunnelled: that box's dev server
-                       ▼       │                 running in your browser
-                      hub      │      the review desk: the repo, the CLI, dev services
-                       │  spawns via the broker
-                       ▼       │
-                 box  box  box ┘      one agent each, /home/dev/repo = overlay(golden)
-                  │    │    │         branch agent/<name>
-                  └────┴────┴──push──▶  refs/agents/<name>  ──▶  you review  ──▶  merge into dev
+your laptop
+ │  ▲
+ │  └──────────────────────────────┐   tunnelled http: a box's dev server,
+ │ ssh                             │   running in your own browser
+ ▼                                 │
+hub ──asks──▶ box-broker           │   hub: the repo, the CLI, dev services
+                   │               │   broker: the only holder of the docker socket
+                   ▼               │
+             box  box  box ────────┘   one agent each, /home/dev/repo = overlay(golden)
+              │    │    │              branch agent/<name>
+              └────┴────┴──push──▶  refs/agents/<name>  ──▶  you review  ──▶  merge into dev
 ```
 
 ## Why not just run agents in one checkout
@@ -95,8 +99,9 @@ root@other labstack` gives you `lab`, `labhub`, `labbox`, each with its own serv
 - **A review queue, not a chat log.** `muster q` is a live dashboard: which agents are working, which
   have handed off, which conflict with `dev` or with each other, and the one command that moves each
   one forward.
-- **Real review.** `muster review <box>` opens a TUI on the agent's branch; line comments go back to
-  the agent as a prompt. A re-review shows only what changed since you last looked.
+- **Real review.** `muster review <box>` opens [tuicr](https://tuicr.dev) on the agent's branch; line
+  comments go back to the agent as a prompt. A re-review shows only what changed since you last
+  looked, and nothing is sent until you confirm — opening a diff and backing out records nothing.
 - **Merges you control.** `--squash` for one commit, `--reword` to rewrite every commit message
   without squashing, `minto` to merge `dev` *into* a long-lived branch — with conflicts resolved by
   you in a worktree, or handed to an agent that opens directly onto the conflict with both histories.

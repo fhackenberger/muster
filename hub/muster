@@ -152,6 +152,16 @@ GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-}"
 HUB_SERVICES_DIR="${HUB_SERVICES_DIR:-/work/hub-services}"
 
 die() { echo "$SELF: $*" >&2; exit 1; }
+
+# THE HEADER BLOCK AT THE TOP OF THIS FILE IS THE HELP. Printed from the comments themselves, so the
+# usage cannot drift from the file you are reading — an earlier version sliced it with a hard-coded
+# line range and silently stopped covering new commands as they were added. $SELF is substituted by
+# awk because comments expand nothing: the listing then names whichever symlink you invoked.
+usage() {
+	awk -v self="$SELF" 'NR < 4 { next }
+	     /^#/ { sub(/^# ?/, ""); gsub(/\$SELF/, self); print; next }
+	     { exit }' "$0"
+}
 git_() { git -C "$REPO" "$@"; }
 
 # ---- agent activity -------------------------------------------------------------------------
@@ -2186,7 +2196,7 @@ minto() {
 
 rebase() {
 	[ $# -ge 1 ] || die "rebase needs a box name (or 'all')"
-	local box list behind n=0 ok=0 force="" rstate rage after_rebase
+	local box list behind n=0 ok=0 force="" rstate rage after_rebase repush
 	[ "${2:-}" = --force ] && force=--force
 	if [ "$1" = all ]; then
 		list="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
@@ -2208,8 +2218,14 @@ rebase() {
 		if git_ rev-parse --verify -q "refs/agents/$box" >/dev/null; then
 			behind="$(git_ rev-list --count "refs/agents/$box..$DEV" 2>/dev/null || echo '?')"
 			behind="behind by $behind commit(s)"
+			# This box has already handed off, and the rebase rewrites exactly the commits that ref
+			# points at — so refs/agents/<box> is stale the moment the rebase lands. Say so: an agent
+			# that rebases and stops leaves the reviewer looking at pre-rebase commits that no longer
+			# exist on its branch, and the next 'review' diffs against a base that has moved under it.
+			repush="You have already handed this work off for review, so the ref the hub holds is now stale: once the rebase has completed cleanly, run 'handoff' with NO arguments to re-push the rebased branch (your existing summary is kept). If the rebase left you with conflicts you cannot resolve, do NOT hand off — say so and stop. "
 		else
 			behind="nothing pushed yet"
+			repush=""
 		fi
 		# Same reasoning as in merge(): what to do after the rebase is decided from the box's state, so
 		# an agent that is between tasks is not invited to go and find itself one. Normally every
@@ -2220,9 +2236,9 @@ rebase() {
 		else
 			after_rebase="Then STOP and wait for my next instruction — do NOT start, plan, or pick up any other work."
 		fi
-		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved, so this only replays your own commits on top of it. Resolve any conflicts it reports. It is NOT a request for new changes. ${after_rebase}"; then
+		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved, so this only replays your own commits on top of it. Resolve any conflicts it reports. It is NOT a request for new changes. ${repush}${after_rebase}"; then
 			ok=$((ok + 1))
-			echo "  $box: asked to rebase ($behind)"
+			echo "  $box: asked to rebase ($behind${repush:+, and to re-handoff})"
 		else
 			echo "  $box: NOT reachable, skipped ($behind) — '$SELF box $box' to start it"
 		fi
@@ -2557,11 +2573,12 @@ case "$cmd" in
 			reap)     golden_reap ;;
 			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap" ;;
 		esac ;;
-	# The header block IS the help. Printed by pattern rather than by line number (it used to be a
-	# hard-coded '4,52p', which silently started cutting the usage list in half as commands were added).
-	# The header block IS the help, and it names the command as $SELF so it reads correctly whichever
-	# symlink you invoked. It is printed from COMMENTS, so nothing expands it for us — awk does.
-	*) awk -v self="$SELF" 'NR < 4 { next }
-	          /^#/ { sub(/^# ?/, ""); gsub(/\$SELF/, self); print; next }
-	          { exit }' "$0"; exit 1 ;;
+	# Asking for help is not an error: `--help` prints to stdout and exits 0, so it can be used in a
+	# `set -e` script or a CI check. An unknown command still exits 1, and says which word it did not
+	# understand before the listing — the usage alone leaves you comparing it against what you typed.
+	-h|--help|help) usage; exit 0 ;;
+	*)
+		[ -n "$cmd" ] && echo "$SELF: unknown command '$cmd'" >&2
+		usage >&2
+		exit 1 ;;
 esac

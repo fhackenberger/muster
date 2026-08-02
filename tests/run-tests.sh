@@ -85,6 +85,7 @@ test_help_covers_every_command() {
 	dispatch="$(awk '/^cmd="\$\{1:-\}"/,0' "$MUSTER_BIN" \
 		| sed -n 's/^[[:space:]]*\([a-z|]*\))[[:space:]].*/\1/p' | tr '|' '\n' | grep . | sort -u)"
 	cbx --help
+	ok                                        # asking for help is not an error
 	documented="$(printf '%s\n' "$OUT" | sed -n 's/^ *muster \([a-z]*\).*/\1/p' | sort -u)"
 	# Aliases and `golden` subcommands are documented on their parent's line, not their own.
 	missing="$(comm -23 <(printf '%s\n' "$dispatch") <(printf '%s\n' "$documented") \
@@ -99,7 +100,11 @@ test_help_covers_every_command() {
 test_unknown_command_prints_usage() {
 	cbx bogus-subcommand
 	notok
+	has "unknown command 'bogus-subcommand'"   # say which word, not just the listing
 	has "muster svcs"
+	# `help` is a synonym, and neither spelling may exit non-zero: a CI check or a `set -e` script
+	# that runs it would otherwise fail on a successful call.
+	cbx help; ok; has "muster svcs"
 }
 
 # The source tree must stay PROJECT-AGNOSTIC: muster is published on its own, so a project name,
@@ -178,6 +183,15 @@ assert sorted(active) == ["box-broker", "hub"], f"unprofiled services changed: {
 b = svc["box-image"]["build"]
 assert b["dockerfile"] == "Dockerfile.addon", b["dockerfile"]
 assert "BOX_BASE_IMAGE" in b["args"]["BASE_IMAGE"], b["args"]["BASE_IMAGE"]
+# NOTHING a deployment starts may carry a `build:`. With one, `docker compose up` silently BUILDS when
+# the image is missing — a typo'd tag or a registry that was never pushed to becomes minutes of
+# surprise work on a server, ending in a hub running an image nobody published and nobody can
+# reproduce. Building belongs to the build profile, where you ask for it.
+for n in active:
+    assert "build" not in svc[n], f"{n} is startable AND buildable; move its build: to a [build] profile"
+assert svc["hub-image"]["profiles"] == ["build"], svc["hub-image"]
+assert "HUB_BASE_IMAGE" in svc["hub-image"]["build"]["args"]["BASE_IMAGE"]
+assert svc["hub-image"]["build"]["args"]["FINAL_USER"] == "1000", "the hub runs as uid 1000"
 print("ok")
 PYEOF
 )"; RC=$?
