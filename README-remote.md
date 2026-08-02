@@ -100,10 +100,29 @@ drop an SSH key in `git-identity/` and use a `git@` `REPO_URL` (see the deploy-k
 The **image source** is env-driven in `.env`: `COMPOSE_PULL_POLICY=missing` (default) reuses the
 Jenkins-built `muster-hub` / `muster-broker` images; `=build` rebuilds them locally from
 this dir; `=always` pulls (point `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified
-names for a different host). pinchtab needs its server bound to `0.0.0.0:9867` with `PT_TOKEN`:
-drop a `data/pinchtab/config.json` (copy your laptop's, set `server.bind=0.0.0.0`,
-`server.port=9867`, `server.token=<PT_TOKEN>`). Under Ansible this file is templated from
-`templates/docker-compose/claude-box/data/pinchtab/config.json` with the vault token.
+names for a different host).
+
+**pinchtab** ([pinchtab/pinchtab](https://github.com/pinchtab/pinchtab)) — the headless-Chrome bridge
+agents use to look at what they built — needs **nothing**. The hub seeds `data/pinchtab/config.json`
+from the image on first boot and fills in a token: `PT_TOKEN` from `.env` when you set one, otherwise
+a generated one, which the broker reads back out of that same file for the boxes. So both sides agree
+without a secret for anyone to invent, and `autostart=true` in the shipped manifest means the server
+is up before an agent reaches for it.
+
+A config that is already there is never overwritten, and neither is a token that is already real — so
+dropping in your own is still the way to change anything. The shipped one is bound to `0.0.0.0:9867`
+so boxes on the stack network can reach it, points at the Chrome the hub image installs, and carries
+an IDPI allowlist of `localhost`/`127.0.0.1` only. That allowlist has no wildcard, which is precisely
+why each box's dev server is published on the **hub's** loopback rather than reached by container
+name: the browser is on the hub, so that is the address it can resolve.
+
+Under Ansible the file is templated from
+`templates/docker-compose/claude-box/data/pinchtab/config.json` instead, which exists purely to
+substitute the vault token.
+
+muster also installs **pinchtab's own Claude skill** into the shared `~/.claude/skills` at hub boot,
+fetched from upstream at image-build time — so an agent uses the CLI's session/snapshot workflow
+instead of reconstructing it from `--help`.
 
 ### GitHub deploy key (SSH)
 

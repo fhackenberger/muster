@@ -92,6 +92,9 @@ DEV_BRANCH = os.environ.get("DEV_BRANCH", "dev")
 HUB_GIT_URL = os.environ.get("HUB_GIT_URL", "git://hub/repo")
 PT_SERVER = os.environ.get("PINCHTAB_SERVER", "")
 PT_TOKEN = os.environ.get("PINCHTAB_TOKEN", "")
+# Where the pinchtab SERVER's config lives on the host. Only read when PT_TOKEN is empty — see
+# pinchtab_token().
+PT_CONFIG = os.environ.get("PINCHTAB_CONFIG", "")
 # Per-project port forwards (like `mounts`). File grammar: 'NAME BOX_PORT HUB_BASE_PORT' per line;
 # each box gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
 PORT_FORWARDS_FILE = os.environ.get("PORT_FORWARDS_FILE", "")
@@ -350,6 +353,31 @@ def parse_service_env():
 				raise ValueError(f"bad service-env key {key!r}")
 			out.append(f"{key}={value}")
 	return out
+
+
+def pinchtab_token():
+	"""The token a box's pinchtab CLI must present, which has to be the one the SERVER accepts.
+
+	PINCHTAB_TOKEN (from the stack's PT_TOKEN) wins when it is set. When it is not, the hub generated
+	one into the pinchtab config at first boot, and this reads it back out — that is what lets a fresh
+	stack work with no secret for anyone to invent, and it keeps the two sides in step by having only
+	one place where the token actually lives.
+
+	Read at SPAWN, never cached: the hub may have generated it after this broker started, and a token
+	cached at import would then be empty for the life of the container."""
+	if PT_TOKEN:
+		return PT_TOKEN
+	if not PT_CONFIG:
+		return ""
+	try:
+		with open(PT_CONFIG) as fh:
+			token = (json.load(fh).get("server", {}) or {}).get("token") or ""
+	except (OSError, ValueError, AttributeError):  # noqa: BLE001
+		return ""
+	token = token.strip()
+	# The shipped example's placeholder is not a token; handing it to a box would produce an auth
+	# failure that reads like a broken server.
+	return "" if "change-me" in token else token
 
 
 def parse_box_env():
@@ -972,7 +1000,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		MUSTER_CLAUDE_ARGS=claude_args,
 		MUSTER_CLAUDE_PROMPT_B64=prompt_b64,
 		MUSTER_PINCHTAB_SERVER=PT_SERVER,
-		MUSTER_PINCHTAB_TOKEN=PT_TOKEN,
+		MUSTER_PINCHTAB_TOKEN=pinchtab_token(),
 		MUSTER_EXTRA_MOUNTS="\n".join(mounts),
 		MUSTER_EXTRA_TMPFS="",
 		# Project/service env (service-env), so a backend/frontend an AGENT starts is configured

@@ -201,6 +201,44 @@ if [ -n "${BROKER_URL:-}" ]; then
 	) &
 fi
 
+# PINCHTAB: a config and a token, before anything can autostart the server.
+#
+# The config is generic — bind, port, the Chrome path this image installs, and an IDPI allowlist of
+# loopback only (which is WHY each box's dev server is published on the hub's loopback: that is the
+# address the browser can reach). So the image ships one and it is seeded here rather than being a
+# file every consumer has to reconstruct from their laptop's copy.
+#
+# THE TOKEN is the interesting part. It has to match on both sides: the server reads it from this
+# config, and every box gets it from the broker as PINCHTAB_TOKEN. Three cases, in order:
+#   - a config already there with a real token  -> left completely alone (yours, not ours)
+#   - PT_TOKEN set in the stack .env            -> written in, so the two sides agree
+#   - neither                                   -> generated here, and the broker reads it back out
+#                                                  of this file for the boxes
+# That last case is what makes a fresh stack work with no secret to invent.
+PT_CONFIG="${PINCHTAB_CONFIG:-$HOME/.pinchtab/config.json}"
+if [ -d "$(dirname "$PT_CONFIG")" ]; then
+	if [ ! -f "$PT_CONFIG" ] && [ -f /opt/muster/pinchtab-config.json ]; then
+		cp /opt/muster/pinchtab-config.json "$PT_CONFIG"
+		echo "hub: seeded $PT_CONFIG from the image's default" >&2
+	fi
+	# The token logic is its own script (hub/pinchtab-token.py): it edits JSON someone may have
+	# hand-tuned, so it deserves to be readable and to have a test of its own.
+	if [ -f "$PT_CONFIG" ]; then
+		PT_TOKEN="${PT_TOKEN:-}" muster-pinchtab-token "$PT_CONFIG" \
+			|| echo "hub: could not check the pinchtab token in $PT_CONFIG" >&2
+	fi
+fi
+
+# pinchtab's own Claude skill, from the image into the shared ~/.claude every box mounts. Baking it
+# straight into that path would be pointless — it is a bind mount, so the image's copy is hidden.
+# Overwritten on every boot on purpose: it is upstream's file, versioned with the image, and a local
+# edit here would silently outlive the pinchtab it documents. Keep your own under another name.
+if [ -d /opt/muster/skills ] && [ -d "$HOME/.claude" ]; then
+	mkdir -p "$HOME/.claude/skills"
+	cp -r /opt/muster/skills/. "$HOME/.claude/skills/" 2>/dev/null \
+		&& echo "hub: installed the bundled skills into $HOME/.claude/skills" >&2 || true
+fi
+
 # Start any service whose manifest sets autostart=true (best-effort — a service that fails to launch
 # must never wedge the hub's boot). Everything else stays on-demand via `<cli> up`.
 muster autostart || true

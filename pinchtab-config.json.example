@@ -1,0 +1,124 @@
+{
+  "configVersion": "0.8.0",
+  "server": {
+    "port": "9867",
+    "bind": "0.0.0.0",
+    "token": "change-me-must-equal-PT_TOKEN-in-.env",
+    "stateDir": "",
+    "engine": ""
+  },
+  "browser": {
+    "version": "",
+    "binary": "/usr/bin/google-chrome-stable",
+    "extraFlags": "",
+    "extensionPaths": []
+  },
+  "instanceDefaults": {
+    "mode": "",
+    "noRestore": null,
+    "timezone": "",
+    "blockImages": null,
+    "blockMedia": null,
+    "blockAds": null,
+    "maxTabs": null,
+    "maxParallelTabs": null,
+    "userAgent": "",
+    "noAnimations": null,
+    "humanize": null,
+    "stealthLevel": "",
+    "tabEvictionPolicy": ""
+  },
+  "security": {
+    "allowEvaluate": false,
+    "allowMacro": false,
+    "allowScreencast": false,
+    "allowDownload": false,
+    "allowNetworkIntercept": null,
+    "allowedDomains": [
+      "127.0.0.1",
+      "localhost",
+      "::1"
+    ],
+    "downloadAllowedDomains": [],
+    "downloadMaxBytes": null,
+    "allowUpload": false,
+    "allowClipboard": null,
+    "allowStateExport": null,
+    "stateEncryptionKey": null,
+    "enableActionGuards": null,
+    "uploadMaxRequestBytes": null,
+    "uploadMaxFiles": null,
+    "uploadMaxFileBytes": null,
+    "uploadMaxTotalBytes": null,
+    "maxRedirects": null,
+    "trustedProxyCIDRs": [],
+    "trustedResolveCIDRs": [],
+    "trustLoopbackProxy": null,
+    "attach": {
+      "enabled": null,
+      "allowHosts": [],
+      "allowSchemes": []
+    },
+    "idpi": {
+      "enabled": true,
+      "strictMode": true,
+      "scanContent": true,
+      "wrapContent": true,
+      "customPatterns": [],
+      "scanTimeoutSec": 0,
+      "shieldThreshold": 0
+    }
+  },
+  "profiles": {
+    "baseDir": "",
+    "defaultProfile": ""
+  },
+  "multiInstance": {
+    "strategy": "",
+    "allocationPolicy": "",
+    "instancePortStart": null,
+    "instancePortEnd": null,
+    "restart": {
+      "maxRestarts": null,
+      "initBackoffSec": null,
+      "maxBackoffSec": null,
+      "stableAfterSec": null
+    }
+  },
+  "timeouts": {
+    "actionSec": 0,
+    "navigateSec": 0,
+    "shutdownSec": 0,
+    "waitNavMs": 0
+  },
+  "scheduler": {
+    "enabled": null,
+    "strategy": "",
+    "maxQueueSize": null,
+    "maxPerAgent": null,
+    "maxInflight": null,
+    "maxPerAgentInflight": null,
+    "resultTTLSec": null,
+    "workerCount": null
+  },
+  "observability": {
+    "activity": {
+      "enabled": null,
+      "sessionIdleSec": null,
+      "retentionDays": null,
+      "stateDir": "",
+      "events": {}
+    }
+  },
+  "sessions": {
+    "dashboard": {}
+  },
+  "autoSolver": {
+    "external": {},
+    "credentials": {
+      "login": {},
+      "signup": {},
+      "form": {}
+    }
+  }
+}

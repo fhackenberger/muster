@@ -71,6 +71,21 @@ npm rm -g pinchtab
 rm -rf /tmp/pt
 pinchtab --version
 
+# …and pinchtab's own Claude skill, so an agent uses the CLI's session/snapshot workflow instead of
+# reinventing it from --help. Fetched from upstream at BUILD time rather than vendored: it is
+# pinchtab's file, it changes when pinchtab changes, and a copy in this repo would be a fork nobody
+# remembers to update. It cannot be baked into ~/.claude — that directory is a bind mount at runtime
+# and would hide anything the image left there — so the hub's entrypoint installs it from here.
+mkdir -p /opt/muster/skills/pinchtab
+curl -fsSL -o /opt/muster/skills/pinchtab/SKILL.md \
+	https://raw.githubusercontent.com/pinchtab/pinchtab/main/skills/pinchtab/SKILL.md
+# -f already rejects a 404, but a proxy's courtesy page or an empty body would still "succeed". A
+# skill starts with YAML frontmatter naming itself; check that rather than just the exit status.
+head -1 /opt/muster/skills/pinchtab/SKILL.md | grep -qx -- '---' \
+	|| { echo "pinchtab SKILL.md has no frontmatter — not a skill" >&2; exit 1; }
+grep -q '^name: pinchtab' /opt/muster/skills/pinchtab/SKILL.md \
+	|| { echo "pinchtab SKILL.md is missing 'name: pinchtab'" >&2; exit 1; }
+
 # tuicr (https://tuicr.dev): the code-review TUI `cbx review` opens on an agent's branch — scroll the
 # diff, leave line/range comments, quit, and cbx turns the persisted comments into review feedback for
 # the box. Installed from the project's own install.sh (its documented method) rather than cargo, so

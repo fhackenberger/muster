@@ -76,7 +76,8 @@ RUN chmod 0755 /usr/local/bin/git-ssh \
 # Helper CLI (muster: start/stop services, spawn/kill/recreate boxes via the broker) + entrypoint.
 COPY hub/muster /usr/local/bin/muster
 COPY hub/entrypoint.sh /usr/local/bin/hub-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/muster /usr/local/bin/hub-entrypoint.sh
+COPY hub/pinchtab-token.py /usr/local/bin/muster-pinchtab-token
+RUN chmod 0755 /usr/local/bin/muster /usr/local/bin/hub-entrypoint.sh /usr/local/bin/muster-pinchtab-token
 
 # Tab-completion for a shell inside the hub. In completions/ rather than /etc/bash_completion.d so
 # that bash-completion loads it ON DEMAND, by command name — which is also how the stack's own prefix
@@ -84,6 +85,11 @@ RUN chmod 0755 /usr/local/bin/muster /usr/local/bin/hub-entrypoint.sh
 # only known at runtime.
 COPY hub/muster-completion.bash /usr/share/bash-completion/completions/muster
 RUN chmod 0644 /usr/share/bash-completion/completions/muster
+
+# The pinchtab server's config, as a SEED. The entrypoint copies it into the stack's ./data/pinchtab
+# on first boot and fills in a token, so `up pinchtab` works on a fresh stack with nothing to write by
+# hand. A config already there is never overwritten — this is a default, not a policy.
+COPY pinchtab-config.json.example /opt/muster/pinchtab-config.json
 
 USER 1000
 WORKDIR /home/dev

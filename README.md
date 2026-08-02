@@ -22,6 +22,23 @@ It runs on a machine you already have, driven entirely from your terminal. The s
 works inside is a file you edit; the dev loop it runs is one command away from your browser; and
 nothing about the codebase leaves your own infrastructure.
 
+**It is built for full-stack web development**, where an agent that cannot run the app can only guess
+whether its change worked. So the shape of the stack is not just "a container per agent": each box
+runs its own dev servers, the hub runs the shared ones (a backend, a database), and every dev port is
+tunnelled to one place your browser can reach — yours, or the agent's.
+
+That last part is what [pinchtab](https://github.com/pinchtab/pinchtab) is here for, and muster ships
+a working setup of it: a browser-control API for agents, driving a real headless Chrome that runs **on
+the hub**. An agent serving a page in its own box can open it, click through a flow, read the console
+and take a screenshot — so "the button now works" is something it checked rather than something it
+inferred from the diff. The Chrome, the `pinchtab` CLI and pinchtab's own Claude skill are already
+in the images; the server starts with the hub, its config and token are seeded on first boot, and
+every box is handed the address and token — so there is nothing to set up and no secret to invent.
+Its allowlist is why each box's dev server is published on the hub's loopback: the browser is *there*,
+and that is the address it can reach. Boxes are told all of this in a note muster keeps in the shared
+claude memory, because an agent that has to deduce it will instead decide the app is down and verify
+against fixtures.
+
 ```
 your laptop
  │  ▲

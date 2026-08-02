@@ -121,6 +121,9 @@ test_no_project_defaults() {
 	exists "$ROOT/.env.example"
 	exists "$ROOT/service-env.example"
 	exists "$ROOT/box-env.example"
+	# The working pinchtab server config: the browser half of the stack is muster's to ship, not
+	# something every consumer should have to reconstruct from its laptop's copy.
+	exists "$ROOT/pinchtab-config.json.example"
 	exists "$ROOT/compose.project.yml.example"
 	exists "$ROOT/muster.bash_aliases.project.example"
 	# The build toolchain is the PROJECT's, so muster ships only an example of one. (The real
@@ -1386,6 +1389,68 @@ PYEOF
 	ok; has ok
 }
 
+# pinchtab's token has to be the SAME on both sides — the server reads it from its config, every box
+# gets it from the broker. Making a fresh stack work without inventing a secret means the hub writes
+# one into the config, and the broker reads it back out of the same file. The failure this prevents is
+# quiet: a box with the wrong token gets auth errors that read like a broken browser service.
+test_pinchtab_token() {
+	fixture
+	cp "$ROOT/pinchtab-config.json.example" "$FIX/pt.json"
+	OUT="$(python3 "$ROOT/hub/pinchtab-token.py" "$FIX/pt.json" 2>&1)"; RC=$?
+	ok; has "freshly generated"
+	local first second
+	first="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["server"]["token"])' "$FIX/pt.json")"
+	[ ${#first} -ge 32 ] || fail "generated token looks too short: $first"
+	case "$first" in *change-me*) fail "the placeholder survived: $first" ;; esac
+	# Idempotent: the entrypoint runs this on every boot, and a token that changed each time would
+	# lock out every box spawned before the restart.
+	python3 "$ROOT/hub/pinchtab-token.py" "$FIX/pt.json" >/dev/null 2>&1
+	second="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["server"]["token"])' "$FIX/pt.json")"
+	eq "$second" "$first" "a second run must not change the token"
+	# A CONFIGURED token wins, so a stack that keeps PT_TOKEN in a vault keeps both sides on it.
+	cp "$ROOT/pinchtab-config.json.example" "$FIX/pt2.json"
+	OUT="$(PT_TOKEN=from-the-vault python3 "$ROOT/hub/pinchtab-token.py" "$FIX/pt2.json" 2>&1)"; RC=$?
+	ok
+	eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["server"]["token"])' "$FIX/pt2.json")" \
+		"from-the-vault" "PT_TOKEN must win over generating one"
+	# Everything else in the file survives — it is the user's config, not ours.
+	eq "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["browser"]["binary"])' "$FIX/pt2.json")" \
+		"/usr/bin/google-chrome-stable" "the rest of the config must be untouched"
+	# Unparseable or missing: say so and exit 0. The hub must boot; pinchtab will explain itself far
+	# better than this can, and a hub that refuses to start over a browser config is the worse failure.
+	printf 'not json {\n' > "$FIX/pt3.json"
+	OUT="$(python3 "$ROOT/hub/pinchtab-token.py" "$FIX/pt3.json" 2>&1)"; RC=$?
+	ok; has "leaving"
+	OUT="$(python3 "$ROOT/hub/pinchtab-token.py" /nonexistent/pt.json 2>&1)"; RC=$?
+	ok
+}
+
+# The other half: the broker hands a box the token the SERVER is using. PINCHTAB_TOKEN (from PT_TOKEN)
+# wins; otherwise it comes out of the config the hub just wrote.
+test_broker_pinchtab_token() {
+	fixture
+	cp "$ROOT/pinchtab-config.json.example" "$FIX/pt.json"
+	OUT="$(PINCHTAB_CONFIG="$FIX/pt.json" python3 - "$BROKER_PY" "$FIX/pt.json" <<'PYEOF' 2>&1
+import importlib.util, json, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+cfg = sys.argv[2]
+# The shipped placeholder is not a token. Handing it to a box produces an auth failure that reads
+# like a broken server, so it counts as "none".
+assert b.pinchtab_token() == "", b.pinchtab_token()
+d = json.load(open(cfg)); d["server"]["token"] = "generated-by-the-hub"; json.dump(d, open(cfg, "w"))
+assert b.pinchtab_token() == "generated-by-the-hub", b.pinchtab_token()
+b.PT_TOKEN = "from-env"
+assert b.pinchtab_token() == "from-env", b.pinchtab_token()
+b.PT_TOKEN = ""; b.PT_CONFIG = "/nonexistent"
+assert b.pinchtab_token() == "", b.pinchtab_token()
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 test_broker_box_prompt() {
 	OUT="$(python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import base64, importlib.util, os, sys
@@ -1504,6 +1569,8 @@ run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: box-env, expanded per box"            test_broker_box_env
 run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
+run "pinchtab: the hub seeds a token"              test_pinchtab_token
+run "pinchtab: the broker hands boxes that token"  test_broker_pinchtab_token
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 
 echo

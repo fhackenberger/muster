@@ -78,7 +78,11 @@ services:
       STACK_DIR: ${STACK_DIR}
       MOUNTS_FILE: ${STACK_DIR}/mounts
       PINCHTAB_SERVER: http://hub:9867
-      PINCHTAB_TOKEN: ${PT_TOKEN}
+      # The token every box's pinchtab CLI uses. Optional now: leave PT_TOKEN unset and the hub
+      # generates one into the pinchtab config at first boot, which the broker reads back out of
+      # PINCHTAB_CONFIG below — so the two sides agree without a secret for anyone to invent.
+      PINCHTAB_TOKEN: ${PT_TOKEN:-}
+      PINCHTAB_CONFIG: ${STACK_DIR}/data/pinchtab/config.json
       # Per-project port forwards (like `mounts`): NAME BOX_PORT HUB_BASE_PORT per line. Each box
       # gets a slot N and every forward is published on the hub at 127.0.0.1:(HUB_BASE_PORT + N).
       # Project/service settings (KEY=VALUE) handed to every box. The hub gets the SAME file via
@@ -140,6 +144,9 @@ services:
       # preferences live in ~/.claude.json — OUTSIDE ~/.claude — so they would be container-local here
       # and per-box there: recreating the hub or starting a second box asked for the login again.
       CLAUDE_CONFIG_DIR: /home/dev/.claude
+      # Only so the entrypoint can put a CONFIGURED token into the pinchtab config; when it is unset
+      # the hub generates one there instead. The hub itself does not talk to pinchtab.
+      PT_TOKEN: ${PT_TOKEN:-}
     # Everything PROJECT-specific (backend/frontend wiring, API keys) lives in `service-env` instead
     # of here, because the box-broker hands the very same file to every agent box. That is what makes
     # a backend an AGENT starts behave like the one the hub starts. Keep this `environment:` block for
