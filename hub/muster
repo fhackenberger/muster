@@ -95,7 +95,12 @@ set -euo pipefail
 # hub/entrypoint.sh), so the same code answers to `muster`, to your stack's prefix, and to whatever a
 # second stack chose. Every hint below is printed with $SELF so a copied command names the binary you
 # actually have, not the one this file happens to be called.
-SELF="${0##*/}"
+#
+# MUSTER_SELF overrides it. The laptop aliases invoke `muster` (always present) rather than the
+# prefix (a symlink, and only there once MUSTER_PREFIX has reached the container), and pass the name
+# you typed in this variable — so `cbx q` still prints hints that say `cbx`, without the working
+# command depending on a symlink someone has to deploy first.
+SELF="${MUSTER_SELF:-${0##*/}}"
 
 # Which muster this hub image is. Baked in by the Dockerfile; "unknown" for a hand-built image. The
 # broker and the box image carry the same stamp, and version_drift() below compares all three —

@@ -146,8 +146,10 @@ _muster_env() {
 
 # The `docker exec` into the hub, resolved by compose labels at call time. Emitted as a literal
 # string (the $(docker ps …) subshell is left for the server to evaluate); $MUSTER_PROJECT is inlined.
+# Any arguments are extra `docker exec` flags, inserted before the container id.
 _muster_hub() {
-	printf 'docker exec -it %s%s' "$(_muster_env)" "$(muster_service_cid hub)"
+	local extra=''; [ "$#" -gt 0 ] && extra="$* "
+	printf 'docker exec -it %s%s%s' "$(_muster_env)" "$extra" "$(muster_service_cid hub)"
 }
 
 # run any cbx subcommand on the remote hub:  cbx up backend / cbx ls / cbx box work1 / cbx --help
@@ -156,17 +158,24 @@ _muster_hub() {
 # and interactive → routed through the mosh-able transport; every other subcommand is one-shot text
 # output → ssh, so it prints and stays on your terminal. `cbx q --text` is one-shot, so it stays on
 # ssh with the rest. Either transport carries the dashboard's bell (it's a plain BEL byte).
+#
+# IT RUNS `muster`, NOT THE PREFIX. `muster` is in every image; the prefix is a symlink the hub's
+# entrypoint makes from MUSTER_PREFIX, so it exists only once that variable has actually reached the
+# container — and until the stack's .env has been redeployed it has not. That is a `docker exec`
+# failing with `"cbx": executable file not found in $PATH`, from a laptop where everything looks
+# configured. MUSTER_SELF carries the name you typed instead, so the usage and error messages still
+# say `cbx merge`, and nothing depends on a symlink existing.
 _muster_run() {
-	local args='' live=''
+	local args='' live='' self="${_MUSTER_SELF:-muster}"
 	[ "$#" -gt 0 ] && printf -v args ' %q' "$@"
 	case "${1:-}" in
 		logs) live=1 ;;
 		q|queue) case "${2:-}" in --text|--once|-1) ;; *) live=1 ;; esac ;;
 	esac
 	if [ -n "$live" ]; then
-		_muster_session "$(_muster_hub) cbx$args"
+		_muster_session "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"
 	else
-		_muster_ssh "$(_muster_hub) cbx$args"
+		_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"
 	fi
 }
 
@@ -523,9 +532,11 @@ _muster_complete_fetch() {
 proj="$1"
 hub=$(docker ps -q -f label=com.docker.compose.project="$proj" -f label=com.docker.compose.service=hub) || exit 0
 [ -n "$hub" ] || exit 0
-# `cbx ls` = services table + broker box table. Tag each section's first column and drop anything that
-# isn't a bare name, which throws away the "(broker unreachable)" / "(none — drop a manifest …)" lines.
-docker exec "$hub" cbx ls 2>/dev/null | awk '
+# `muster ls` = services table + broker box table. Tag each section's first column and drop anything
+# that isn't a bare name, which throws away the "(broker unreachable)" / "(none — drop a manifest …)"
+# lines. `muster` and not the prefix: the prefix is a runtime symlink and completion must not be the
+# thing that discovers it is missing.
+docker exec "$hub" muster ls 2>/dev/null | awk '
 	/^== services/ { sec="svc"; next }
 	/^== boxes/    { sec="box"; next }
 	/^==/          { sec="";    next }

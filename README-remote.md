@@ -338,6 +338,20 @@ That gives you:
   stdin is forwarded, and stderr stays on stderr — a local pipe sees only real output. The exit status
   is the command's own. Use `cbxbox` instead when you want the *interactive* tmux attach.
 
+**Tab completion, on both sides.** On the laptop the alias family completes subcommands, box names and
+service names from a cache it refreshes in the background over ssh. Inside the hub — through `cbxhub`
+or a plain `docker exec -it <hub> bash` — the same completion is available for `muster` *and* for your
+prefix, from `/usr/share/bash-completion/completions/muster` in the hub image. That one reads the
+filesystem only (the service manifests, `/work/boxes`, `refs/agents/*`), never the broker, so a Tab
+press cannot block on a timeout.
+
+**The prefix is a name, not a dependency.** `MUSTER_PREFIX` makes the hub symlink `muster` to your
+word for it, so the command is spelled the same from either side. But the laptop aliases do not
+*call* that symlink: they run `muster` — which is in every image — and pass the name you typed as
+`MUSTER_SELF`, which is what the CLI prints in its hints. So `cbx merge work1` works on a hub whose
+`.env` predates the variable, and the day the symlink is missing you get the usual output, not
+`"cbx": executable file not found in $PATH`.
+
 **Export the two variables as their own commands.** Prefixing them to the `source` — `MUSTER_SERVER=…
 MUSTER_PROJECT=… . muster.bash_aliases` — does *not* work: assignments prefixed to a command are temporary
 in bash, so they are gone by the time an alias runs, and because the file's `:=` defaults did see

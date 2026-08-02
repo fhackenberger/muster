@@ -73,10 +73,17 @@ COPY hub/git-ssh /usr/local/bin/git-ssh
 RUN chmod 0755 /usr/local/bin/git-ssh \
 	&& git config --system core.sshCommand /usr/local/bin/git-ssh
 
-# Helper CLI (cbx: start/stop services, spawn/kill/recreate boxes via the broker) + entrypoint.
+# Helper CLI (muster: start/stop services, spawn/kill/recreate boxes via the broker) + entrypoint.
 COPY hub/muster /usr/local/bin/muster
 COPY hub/entrypoint.sh /usr/local/bin/hub-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/muster /usr/local/bin/hub-entrypoint.sh
+
+# Tab-completion for a shell inside the hub. In completions/ rather than /etc/bash_completion.d so
+# that bash-completion loads it ON DEMAND, by command name — which is also how the stack's own prefix
+# gets completion: the entrypoint symlinks completions/<prefix> to this file, because the prefix is
+# only known at runtime.
+COPY hub/muster-completion.bash /usr/share/bash-completion/completions/muster
+RUN chmod 0644 /usr/share/bash-completion/completions/muster
 
 USER 1000
 WORKDIR /home/dev

@@ -8,17 +8,35 @@
 # The two ADD-ON images (muster-<project>, muster-hub) are deliberately absent: they are ten lines of
 # `FROM <base>` + your build-setup.sh, so only you can build them and nobody else can use them.
 #
-# WHY TAGS, NOT BRANCHES, ARE WHAT MATTERS HERE. common-setup.sh resolves the LATEST node, claude and
-# tuicr at build time, so a commit does not identify an artifact — two builds of the same source
-# produce different images. The version tag is therefore the only thing that pins a tested
-# combination, which is the main reason to publish at all. A moving `latest` is published beside it
-# for convenience; do not deploy from it.
+# WHAT IDENTIFIES AN IMAGE. common-setup.sh resolves the LATEST node, claude and tuicr at build time,
+# so a commit does not identify an artifact — two builds of the same source produce different images.
+# A tag does, which is the main reason to publish at all.
+#
+# But a release cannot be the ONLY way to get an image, or every change a consumer wants to run needs
+# a version tag on code that has not been used in anger yet — and tagging then stops meaning "tested"
+# and starts meaning "I wanted to deploy this". So main publishes too, under the name `git describe`
+# gives that commit:
+#
+#   a v0.1.2 tag            ->  0.1.2, 0.1, latest
+#   7 commits past v0.1.1   ->  0.1.1-7-gabc1234, dev
+#
+# That describe string is the whole trick. It is unique per commit, it says at a glance how far past
+# the last release you are, and a consumer computes the SAME string from the submodule it has pinned
+# — so pinning stays exact without anyone tagging anything. `dev` is the moving alias beside it;
+# deploy from the describe tag, not from `dev`, or you cannot tell what is running.
 name: images
 
 on:
   push:
     tags: ["v*"]
+    branches: [main]        # every main commit gets an image, named after `git describe`
   workflow_dispatch:        # for a rebuild when a base OS or a pinned CLI needs picking up
+
+# One build per ref. A push train on main would otherwise publish `dev` out of order, and the loser
+# of that race is the image people are pulling.
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -43,7 +61,22 @@ jobs:
           - name: muster-broker
             dockerfile: box-broker/Dockerfile
     steps:
+      # fetch-depth: 0 — `git describe` needs the tags and the commits back to the last one. The
+      # default shallow checkout has neither, and describe then fails on main.
       - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      # THE version string, computed exactly the way every consumer computes it: `git describe`
+      # against the pinned submodule (Jenkinsfile musterVersion(), the muster_version Ansible fact).
+      # If these two ever disagree the consumer asks GHCR for a tag that was never pushed, so keep
+      # them character-for-character identical: describe --tags, strip a leading v.
+      #
+      # --dirty is not needed here (a clean checkout by definition) but --always is: it degrades to a
+      # bare sha rather than failing, so a repository with no tags yet still publishes something.
+      - id: ver
+        run: |
+          v="$(git describe --tags --always | sed 's/^v//')"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "publishing as $v"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -54,15 +87,22 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
-          # `latest` comes from flavor's default (latest=auto), which applies it to the newest
-          # semver tag. Spelling it out because the obvious-looking alternative,
+          # latest=false, then applied by hand to tag pushes only. `latest=true` would put it on
+          # every main build as well, and `latest` must keep meaning "the newest RELEASE" — that is
+          # the tag someone trying muster for the first time pulls. Note that the tempting
           #     type=raw,value=latest,enable={{is_default_branch}}
-          # is a trap here: on a TAG push the ref is refs/tags/v… so is_default_branch is false and
-          # `latest` would never be produced — on a workflow that only ever runs on tags.
-          flavor: latest=true
+          # is a trap: on a tag push the ref is refs/tags/v… so is_default_branch is false there.
+          #
+          # The last two are the main-branch pair: the describe string, which is what consumers pin,
+          # and the moving `dev` beside it. (No comment lines inside `tags:` — every non-empty line
+          # there is parsed as a tag definition.)
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/main' }}
       - uses: docker/build-push-action@v6
         with:
           # The build context is the repository root for ALL of them — the Dockerfiles COPY shared
@@ -76,12 +116,16 @@ jobs:
           # The version knobs are build-args on purpose: this is where "latest" gets frozen into a
           # release. Bump them in one place — see docs/adr/0001-image-builds.md.
           #
-          # MUSTER_VERSION is the release itself, baked into every image so the hub, the broker and
-          # the boxes can check at runtime that they came from ONE muster (see version_drift() in
-          # hub/muster). The add-on images a project builds inherit it from their base, so the check
-          # works for them too without anyone passing anything.
+          # MUSTER_VERSION is baked into every image so the hub, the broker and the boxes can check
+          # at runtime that they came from ONE muster (see version_drift() in hub/muster). The add-on
+          # images a project builds inherit it from their base, so the check works for them too
+          # without anyone passing anything.
+          #
+          # From steps.ver, NOT steps.meta.outputs.version: metadata-action's `version` is the branch
+          # name on a branch push, so every main image would call itself "main" and drift detection
+          # would go blind exactly where things move fastest.
           build-args: |
-            MUSTER_VERSION=${{ steps.meta.outputs.version }}
+            MUSTER_VERSION=${{ steps.ver.outputs.version }}
             NODE_VERSION=${{ vars.NODE_VERSION || 'v26.2.0' }}
             NPM_VERSION=${{ vars.NPM_VERSION || '11.13.0' }}
             PINCHTAB_VERSION=${{ vars.PINCHTAB_VERSION || '0.13.2' }}

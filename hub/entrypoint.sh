@@ -138,13 +138,40 @@ check_mounts || true
 # A SYMLINK, not a shell alias: it has to work in the tmux service commands, in `docker exec … cbx …`
 # from a script, and for the broker's own calls — none of which read a bashrc. `muster` itself always
 # stays, so anything that hard-codes it (docs, this entrypoint, older tooling) is unaffected.
+#
+# CLI below is the name this hub prints in its own hints: the prefix when there is one, `muster`
+# otherwise. Never a bare `cbx` — that is one stack's name for the command, and hard-coding it here
+# is how a hub whose MUSTER_PREFIX had not been deployed yet failed to autostart its services with
+# "cbx: command not found".
+CLI=muster
 if [ -n "${MUSTER_PREFIX:-}" ] && [ "$MUSTER_PREFIX" != muster ]; then
 	case "$MUSTER_PREFIX" in
 		[a-z][a-z0-9_]*)
-			ln -sf /usr/local/bin/muster "/usr/local/bin/$MUSTER_PREFIX" \
-				&& echo "hub: muster is also available as '$MUSTER_PREFIX'" ;;
+			if ln -sf /usr/local/bin/muster "/usr/local/bin/$MUSTER_PREFIX"; then
+				CLI="$MUSTER_PREFIX"
+				echo "hub: muster is also available as '$MUSTER_PREFIX'"
+			fi ;;
 		*) echo "hub: ignoring MUSTER_PREFIX='$MUSTER_PREFIX' — must start with a lowercase letter, then letters/digits/_" >&2 ;;
 	esac
+else
+	echo "hub: no MUSTER_PREFIX in this container's environment — the CLI is 'muster' only." >&2
+	echo "     Set it in the stack .env and RECREATE the hub (env is fixed at container creation)." >&2
+fi
+
+# Tab-completion for a shell opened with `<prefix>hub` or `docker exec -it … bash`. The script itself
+# registers both names (it reads MUSTER_PREFIX); this symlink is what makes bash-completion FIND it
+# when the first thing you type is the prefix — its on-demand loader looks for a file named after the
+# command. Best-effort: the hub runs as uid 1000, so it is only writable if the image left it so, and
+# completion is a convenience, not a boot requirement.
+# The system directory first (only writable if this hub runs as root), then the per-user one, which
+# bash-completion's loader searches BEFORE the system one — and which the uid-1000 hub can always
+# write.
+COMPDIR=/usr/share/bash-completion/completions
+if [ "$CLI" != muster ] && [ -r "$COMPDIR/muster" ]; then
+	ln -sf muster "$COMPDIR/$CLI" 2>/dev/null \
+		|| { mkdir -p "$HOME/.local/share/bash-completion/completions" \
+		     && ln -sf "$COMPDIR/muster" "$HOME/.local/share/bash-completion/completions/$CLI"; } \
+		|| true
 fi
 
 # Idle tmux server with a landing window, so `cbx up` has somewhere to add service windows and you
@@ -175,13 +202,13 @@ if [ -n "${BROKER_URL:-}" ]; then
 fi
 
 # Start any service whose manifest sets autostart=true (best-effort — a service that fails to launch
-# must never wedge the hub's boot). Everything else stays on-demand via `cbx up`.
-cbx autostart || true
+# must never wedge the hub's boot). Everything else stays on-demand via `<cli> up`.
+muster autostart || true
 
-echo "hub: ready. Services are declared in hub-services/ (cbx svcs), started on-demand:" >&2
-echo "  cbx up <service> | cbx down <service> | cbx svcs   (autostart=true starts one at boot)" >&2
-echo "  cbx box [name] | cbx ls | cbx kill <name> (agent boxes, via the broker)" >&2
-echo "  cbx q | cbx review <box> | cbx merge <box>  (the review queue)" >&2
+echo "hub: ready. Services are declared in hub-services/ ($CLI svcs), started on-demand:" >&2
+echo "  $CLI up <service> | $CLI down <service> | $CLI svcs   (autostart=true starts one at boot)" >&2
+echo "  $CLI box [name] | $CLI ls | $CLI kill <name> (agent boxes, via the broker)" >&2
+echo "  $CLI q | $CLI review <box> | $CLI merge <box>  (the review queue)" >&2
 echo "  docker exec -it \$HOSTNAME tmux attach     (to watch services / open a shell)" >&2
 
 # Stay alive as long as the tmux server is up.

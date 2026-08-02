@@ -50,9 +50,23 @@ and keeping it working keeps the published images honest — they are a convenie
 
 ### Where
 
-**GitHub Actions → GHCR** (`.github/workflows/images.yml`), triggered by a `v*` tag, gated on the test
-suite. It lives with the code and needs no infrastructure of its own. Tags are `v1.2.3`, `1.2`, and a
-moving `latest` — deploy from a version, not from `latest`.
+**GitHub Actions → GHCR** (`.github/workflows/images.yml`), gated on the test suite. It lives with
+the code and needs no infrastructure of its own.
+
+| Trigger | Image tags |
+|---|---|
+| a `v*` tag | `1.2.3`, `1.2`, `latest` |
+| a push to `main` | `1.2.3-7-gabc1234` (`git describe`), `dev` |
+
+Deploy from a version or from a describe string, never from `latest` or `dev`: both move, and a stack
+pinned to a moving tag cannot tell you what it is running.
+
+**Why main publishes at all**, when the argument above is that only a tag identifies a tested
+combination: because otherwise the only way to *use* a change is to tag a release for it, and tagging
+then degrades from "this has been used in anger" to "I wanted to deploy this". The describe string
+keeps the property that matters — one name, one commit, one image — without pretending to be a
+release. A consumer computes the same string from the commit it has pinned (`git describe --tags
+--always` against a submodule) and gets an exact pin for free.
 
 One thing to check after the first release: a GHCR package is **private until you say otherwise**,
 even from a public repository. Until it is made public (package settings → change visibility) every

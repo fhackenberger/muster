@@ -165,6 +165,63 @@ test_no_project_defaults() {
 	OUT=""
 }
 
+# Tab-completion INSIDE the hub (hub/muster-completion.bash — the laptop's lives in
+# muster.bash_aliases and is tested separately). It reads the filesystem only, so the ordinary
+# fixture is all it needs: BOXES_DIR, HUB_SERVICES_DIR and CHECKOUT already point at one.
+#
+# Driven by calling _muster_complete the way bash does — COMP_WORDS + COMP_CWORD in, COMPREPLY out.
+test_hub_completion() {
+	fixture
+	mkdir -p "$FIX/boxes/work1" "$FIX/services"
+	: > "$FIX/services/backend"
+	git_ update-ref refs/agents/handed-off HEAD
+	OUT="$(MUSTER_PREFIX=cbx bash -c '
+		PATH="'"$(dirname "$MUSTER_BIN")"'":$PATH
+		source "'"$ROOT"'/hub/muster-completion.bash"
+		try() { COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); _muster_complete; echo "${COMPREPLY[*]}"; }
+		echo "REGISTERED: $(complete -p muster cbx 2>&1 | grep -c _muster_complete)"
+		echo "CMDS: $(try muster "")"
+		echo "BOXES: $(try muster review "")"
+		echo "SVCS: $(try muster up "")"
+		echo "FLAGS: $(try muster merge work1 --)"
+	' 2>&1)"; RC=$?
+	ok
+	# Both names complete: `muster` from the script itself, the stack's prefix from MUSTER_PREFIX.
+	has "REGISTERED: 2"
+	has "merge"                     # subcommands come from the dispatch case, so this cannot go stale
+	# A box with a container directory AND one that only has a handoff ref — review/merge/drop apply
+	# to the second too, and it is the one a hand-written list of running containers would miss.
+	case "$OUT" in *"BOXES: "*work1*) ;; *) fail "a box directory should complete" ;; esac
+	case "$OUT" in *handed-off*) ;; *) fail "a box with only refs/agents/<box> should complete" ;; esac
+	case "$OUT" in *"SVCS: backend"*) ;; *) fail "service manifests should complete" ;; esac
+	# Flags are scraped from the header block, which is also what --help prints.
+	case "$OUT" in *--squash*--reword*|*--reword*--squash*) ;; *) fail "merge flags should complete" ;; esac
+	OUT=""
+}
+
+# THE IMAGE NAME IS A CONTRACT ACROSS TWO REPOSITORIES. A consumer pins muster as a submodule and
+# asks GHCR for `git describe` of the commit it pinned; this workflow has to name the image the same
+# way, or the consumer 404s on a server long after everything here looked green. Only muster's half
+# can be tested here, so test that half.
+test_images_workflow_names_images_by_describe() {
+	local wf="$ROOT/.github/workflows/images.yml"
+	exists "$wf" || return 0
+	OUT="$(cat "$wf")"
+	has "describe --tags --always"
+	# main must publish, or consuming any unreleased change needs a version tag invented for it.
+	has "branches: [main]"
+	has "type=raw,value=dev"
+	# MUSTER_VERSION must come from that describe step and NOT from metadata-action: on a branch push
+	# metadata's version output is the branch name, so every main image would call itself "main" and
+	# version_drift() would go blind exactly where things move fastest.
+	has 'MUSTER_VERSION=${{ steps.ver.outputs.version }}'
+	hasnt 'MUSTER_VERSION=${{ steps.meta.outputs.version }}'
+	# `latest` stays on releases: it is what a first-time reader pulls. Asserted on the flavor line
+	# rather than by banning the string, which the comment above it legitimately mentions.
+	has "flavor: latest=false"
+	OUT=""
+}
+
 # The box add-on is buildable but must NEVER be part of a deployment: a profiled service is excluded
 # from up/down/pull/ps/build unless the profile is switched on. If that profile is ever dropped, a
 # `docker compose up -d` on a server would try to BUILD it (and start a stray container), which is
@@ -673,7 +730,14 @@ test_aliases_forward_to_the_hub() {
 	al 'cbx ls'
 	ssh_has "ssh -t root@test.example docker exec -it"
 	ssh_has "label=com.docker.compose.service=hub"
-	ssh_has "cbx ls"
+	# THE REMOTE BINARY IS `muster`, NEVER THE PREFIX. `muster` is in every image; the prefix is a
+	# symlink the hub entrypoint makes from MUSTER_PREFIX, so it only exists once that variable has
+	# reached the container — and calling it before then is `"cbx": executable file not found in
+	# $PATH`, from a laptop where everything looks configured. MUSTER_SELF carries the name that was
+	# typed, so the CLI's own hints still read `cbx …`.
+	ssh_has "muster ls"
+	ssh_has "-e MUSTER_SELF=cbx"
+	ssh_hasnt " cbx ls"
 }
 
 # `cbx logs` and the live `cbx q` are long-lived and interactive, so they take the mosh-able
@@ -1175,6 +1239,8 @@ run "help: every command is documented"            test_help_covers_every_comman
 run "help: an unknown command prints usage"        test_unknown_command_prints_usage
 
 run "compose: the box build service is profiled"    test_build_only_service_is_profiled
+run "hub: tab-completion for both names"           test_hub_completion
+run "ci: images are named by git describe"         test_images_workflow_names_images_by_describe
 run "status: empty stack"                          test_status_empty
 run "queue: lists a handoff"                       test_queue_lists_a_handoff
 run "queue: flags conflicts with dev"              test_queue_flags_conflicts_with_dev
