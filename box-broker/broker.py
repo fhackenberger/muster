@@ -625,6 +625,33 @@ def ensure_activity_hooks():
 	if not isinstance(hooks, dict):
 		return
 	changed = False
+	# FIRST, DROP OUR OWN STALE ENTRIES. settings.json lives in the stack's data dir and outlives every
+	# image, so hooks written by a previous muster are still in it — including `cbx-activity`, the name
+	# this helper had before the rename. Claude runs them, the binary is not there, and every box now
+	# greets you with "SessionStart:startup hook error … cbx-activity: not found". Adding the new entry
+	# does not fix that; the old one has to go.
+	#
+	# Narrow on purpose: only commands that are exactly a former spelling of OURS, in whichever event
+	# they sit. Hooks someone else put in this file are none of our business.
+	stale = {f"cbx-activity {state}" for _, state in ACTIVITY_HOOKS}
+	for event, entries in list(hooks.items()):
+		if not isinstance(entries, list):
+			continue
+		kept = []
+		for grp in entries:
+			if not isinstance(grp, dict):
+				kept.append(grp)
+				continue
+			was = grp.get("hooks", [])
+			inner = [h for h in was
+			         if not (isinstance(h, dict) and h.get("command") in stale)]
+			if len(inner) != len(was):
+				changed = True
+			if not inner:
+				continue          # the group held nothing but the stale hook — drop the group too
+			grp["hooks"] = inner
+			kept.append(grp)
+		hooks[event] = kept
 	for event, state in ACTIVITY_HOOKS:
 		cmd = f"muster-activity {state}"
 		entries = hooks.setdefault(event, [])

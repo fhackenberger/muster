@@ -825,6 +825,46 @@ test_aliases_project_helpers() {
 	AL_PROJECT_FILE=1 al 'cbxpsql'; notok; has "usage: cbxpsql"
 }
 
+# LAPTOP-SIDE COMPLETION. Subcommands and flags come from the cache — i.e. from the `muster --help` of
+# the hub that is actually deployed — with a hard-coded floor for a cold cache. That is the fix for
+# the failure this test exists to prevent: `minto` shipped in the CLI and stayed missing from a
+# hand-kept list here, so `cbx minto <TAB>` completed nothing and read as "no such command".
+test_aliases_completion() {
+	alias_fixture
+	cat > "$FIX/complete-cache" <<-'EOF'
+		svc backend
+		box work1
+		branch dev
+		branch release/2025
+		cmd minto
+		cmd afutureverb
+		flag merge --squash
+		flag merge --reword
+		flag minto --here
+		flag afutureverb --brandnew
+	EOF
+	# One shell: stub the cache, then ask for several completions and label each answer. The word being
+	# completed is passed SEPARATELY from the line, because it is usually empty ("what can follow
+	# this?") and an empty trailing word does not survive word-splitting one string.
+	al "_muster_complete_cache() { cat '$FIX/complete-cache'; };
+	    try() { local w=(\$1); COMP_WORDS=(\"\${w[@]}\" \"\$3\"); COMP_CWORD=\${#w[@]};
+	            _muster_complete; echo \"\$2: \${COMPREPLY[*]}\"; };
+	    try 'cbx'              FIRSTWORD   'mint';
+	    try 'cbx minto'        BRANCHES    '';
+	    try 'cbx minto'        MINTOFLAGS  '--';
+	    try 'cbx merge'        FLAGSBEFORE '--';
+	    try 'cbx merge work1'  FLAGSAFTER  '--';
+	    try 'cbx afutureverb'  FROMHUB     '--'"
+	has "FIRSTWORD: minto"
+	has "BRANCHES: dev release/2025"
+	case "$OUT" in *"MINTOFLAGS: "*--here*) ;; *) fail "minto flags should complete" ;; esac
+	# BOTH orders: `merge --squash <box>` and `merge <box> --squash` are both valid command lines.
+	case "$OUT" in *"FLAGSBEFORE: "*--reword*) ;; *) fail "flags must complete BEFORE the box name" ;; esac
+	case "$OUT" in *"FLAGSAFTER: "*--reword*) ;; *) fail "flags must complete after the box name" ;; esac
+	# A verb this file has never heard of, taken from the hub's help — the whole point of caching them.
+	has "FROMHUB: --brandnew"
+}
+
 # THE reason the factory exists: two stacks, one shell, no re-sourcing and no cross-talk.
 test_aliases_two_stacks_side_by_side() {
 	alias_fixture
@@ -1216,6 +1256,53 @@ PYEOF
 	ok; has ok
 }
 
+# settings.json lives in the stack's DATA dir, so it outlives every image and accumulates whatever
+# past versions of muster wrote into it. After the rename that meant every box started with
+#   SessionStart:startup hook error … cbx-activity: not found
+# because the pre-rename hook was still registered and claude dutifully ran it. Adding the new entry
+# does not remove the old one — this is that removal, and it must not touch anything else in a file
+# that also holds the login and the user's own hooks.
+test_broker_activity_hooks() {
+	fixture
+	mkdir -p "$FIX/claude"
+	cat > "$FIX/claude/settings.json" <<-'EOF'
+		{
+		  "model": "opus",
+		  "hooks": {
+		    "SessionStart": [
+		      {"hooks": [{"type": "command", "command": "cbx-activity idle"}]},
+		      {"hooks": [{"type": "command", "command": "my-own-hook"}]}
+		    ],
+		    "UserPromptSubmit": [
+		      {"hooks": [{"type": "command", "command": "cbx-activity busy"},
+		                 {"type": "command", "command": "keep-me"}]}
+		    ]
+		  }
+		}
+	EOF
+	OUT="$(CLAUDE_HOME="$FIX/claude" python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, json, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+b.ensure_activity_hooks()
+d = json.load(open(os.path.join(os.environ["CLAUDE_HOME"], "settings.json")))
+cmds = [h["command"] for v in d["hooks"].values() for g in v for h in g["hooks"]]
+assert not [c for c in cmds if c.startswith("cbx-activity")], cmds
+assert "my-own-hook" in cmds and "keep-me" in cmds, cmds        # other people's hooks survive
+assert d.get("model") == "opus", d                              # and so does everything else
+assert "muster-activity idle" in cmds, cmds
+# Running it twice must not duplicate anything — the broker calls it on every spawn.
+b.ensure_activity_hooks()
+d2 = json.load(open(os.path.join(os.environ["CLAUDE_HOME"], "settings.json")))
+c2 = [h["command"] for v in d2["hooks"].values() for g in v for h in g["hooks"]]
+assert sorted(c2) == sorted(cmds), (cmds, c2)
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 test_broker_box_prompt() {
 	OUT="$(python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import base64, importlib.util, os, sys
@@ -1304,6 +1391,7 @@ run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the
 run "aliases: tunnel specs"                        test_aliases_tunnel_specs
 run "aliases: refuse an unconfigured stack"        test_aliases_refuse_without_a_server
 run "aliases: cbxcp argument checking"             test_aliases_cbxcp_argument_checking
+run "aliases: completion (cmds, flags, branches)"   test_aliases_completion
 run "aliases: project helpers"                     test_aliases_project_helpers
 run "aliases: two stacks side by side"             test_aliases_two_stacks_side_by_side
 run "aliases: project helpers are per stack"       test_aliases_project_helpers_are_per_stack
@@ -1330,6 +1418,7 @@ run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
 run "broker: permission mode passes through"       test_broker_box_mode
+run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 
 echo

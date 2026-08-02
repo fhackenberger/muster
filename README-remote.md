@@ -338,8 +338,12 @@ That gives you:
   stdin is forwarded, and stderr stays on stderr — a local pipe sees only real output. The exit status
   is the command's own. Use `cbxbox` instead when you want the *interactive* tmux attach.
 
-**Tab completion, on both sides.** On the laptop the alias family completes subcommands, box names and
-service names from a cache it refreshes in the background over ssh. Inside the hub — through `cbxhub`
+**Tab completion, on both sides.** On the laptop the alias family completes subcommands, flags, box
+names, service names and branches from a cache it refreshes in the background over ssh. The
+subcommands and flags are parsed from the **deployed hub's own `muster --help`**, not from a list in
+the alias file: the two are deployed by different paths and drift apart for weeks, and a completion
+that has never heard of `minto` reads as "that command does not exist". Flags complete at any
+position — `merge --squash <box>` and `merge <box> --squash` are both valid, so both complete. Inside the hub — through `cbxhub`
 or a plain `docker exec -it <hub> bash` — the same completion is available for `muster` *and* for your
 prefix, from `/usr/share/bash-completion/completions/muster` in the hub image. That one reads the
 filesystem only (the service manifests, `/work/boxes`, `refs/agents/*`), never the broker, so a Tab

@@ -543,6 +543,25 @@ docker exec "$hub" muster ls 2>/dev/null | awk '
 	sec != "" && $1 ~ /^[A-Za-z0-9][-A-Za-z0-9_]*$/ { print sec, $1 }'
 # Boxes with a handoff waiting but no running container — review/merge/drop still apply to them.
 docker exec "$hub" git -C /home/dev/repo for-each-ref --format='box %(refname:strip=2)' refs/agents/ 2>/dev/null
+# Branches, for the commands that take one (minto, push, pull).
+docker exec "$hub" git -C /home/dev/repo for-each-ref --format='branch %(refname:strip=2)' refs/heads/ 2>/dev/null
+# SUBCOMMANDS AND FLAGS, FROM THE HUB'S OWN HELP. Not from a list kept here: this file and the hub
+# image are deployed by different paths and drift apart for weeks at a time, and a completion that
+# has never heard of `minto` is worse than none — it looks like the command does not exist. `muster
+# --help` IS the header block of the CLI that is actually installed, so whatever that hub can do is
+# exactly what completes.
+#
+# One `<self> <cmd>` line opens a block; its indented continuation lines belong to the same command,
+# which is where flags like [--reword|-r] live.
+docker exec "$hub" muster --help 2>/dev/null | awk '
+	match($0, /^[[:space:]]+muster[[:space:]]+[a-z][a-z0-9]*/) { split($0, w, " "); cmd = w[2]; print "cmd", cmd }
+	cmd != "" {
+		line = $0
+		while (match(line, /--[a-z][a-z-]*/)) {
+			print "flag", cmd, substr(line, RSTART, RLENGTH)
+			line = substr(line, RSTART + RLENGTH)
+		}
+	}'
 REMOTE
 }
 
@@ -610,6 +629,8 @@ _muster_complete_cache() {
 }
 
 _muster_names() { _muster_complete_cache | awk -v k="$1" '$1==k {print $2}' | sort -u; }
+# Flags are cached as `flag <cmd> <--flag>`, so they need the extra column.
+_muster_flags() { _muster_complete_cache | awk -v c="$1" '$1=="flag" && $2==c {print $3}' | sort -u; }
 
 # Force the next Tab to re-fetch — after `cbx box foo`, `cbx kill foo`, or a handoff.
 _muster_refresh() { rm -f "$(_muster_cache_file)"; _muster_complete_cache >/dev/null; echo "${_MUSTER_SELF:-cbx}: completion cache refreshed"; }
@@ -620,28 +641,40 @@ _muster_complete() {
 	cmd="${COMP_WORDS[1]:-}"
 	COMPREPLY=()
 
+	# THE COMMAND LIST AND THE FLAGS COME FROM THE HUB (cached with the box/service names): they are
+	# parsed from the `muster --help` of the image that is actually deployed, so a command added there
+	# completes here without this file being redeployed — the two travel by different paths and drift
+	# apart for weeks. The literals below are the fallback for a cold cache or an older hub that does
+	# not emit them; they are a floor, not the list.
 	if [ "$COMP_CWORD" -eq 1 ]; then
-		COMPREPLY=($(compgen -W "svcs up down logs autostart box kill recreate ls forwards
-			status q review fix prereview merge drop rebase export import pull push
-			golden expose hide" -- "$cur"))
+		# sort -u: the cache and the fallback overlap, and readline shows duplicates verbatim.
+		COMPREPLY=($(compgen -W "$(_muster_names cmd)
+			svcs up down logs autostart box kill recreate ls forwards
+			status q review fix prereview merge drop rebase minto export import pull push
+			golden expose hide" -- "$cur" | sort -u))
 		return
 	fi
 
-	# Flags first: once the word starts with '-' the positional rules below don't apply.
+	# Flags first: once the word starts with '-' the positional rules below don't apply. This is
+	# deliberately independent of POSITION — `merge --squash <box>` and `merge <box> --squash` are both
+	# valid, so both must complete.
 	if [[ $cur == -* ]]; then
-		local flags=""
+		local flags
+		flags="$(_muster_flags "$cmd")"
+		# Short flags and anything the help block spells in prose rather than as [--flag].
 		case "$cmd" in
-			review)    flags="--full --net --tui --plain" ;;
-			merge)     flags="--squash --edit --landed" ;;
-			fix)       flags="-m --force" ;;
-			prereview) flags="--force" ;;
-			rebase)    flags="--force" ;;
-			recreate)  flags="--fresh" ;;
-			q|queue)   flags="--text --once --no-bell -n" ;;
-			pull)      flags="--rebase" ;;
-			golden)    [ "${COMP_WORDS[2]:-}" = snapshot ] && flags="--prep" ;;
+			merge)     flags="$flags --squash --edit --landed --reword -r" ;;
+			review)    flags="$flags --full --net --tui --plain" ;;
+			minto)     flags="$flags --here --box --intent --land --landed --abort --pull" ;;
+			fix)       flags="$flags -m --force" ;;
+			prereview) flags="$flags --force" ;;
+			rebase)    flags="$flags --force" ;;
+			recreate)  flags="$flags --fresh" ;;
+			q|queue)   flags="$flags --text --once --no-bell -n" ;;
+			pull)      flags="$flags --rebase" ;;
+			golden)    [ "${COMP_WORDS[2]:-}" = snapshot ] && flags="$flags --prep" ;;
 		esac
-		COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+		COMPREPLY=($(compgen -W "$flags" -- "$cur" | sort -u))
 		return
 	fi
 
@@ -654,6 +687,8 @@ _muster_complete() {
 		           COMPREPLY=($(compgen -W "$(_muster_names box)" -- "$cur")) ;;
 		recreate|rebase)
 		           COMPREPLY=($(compgen -W "$(_muster_names box) all" -- "$cur")) ;;
+		# Branch arguments. `minto <branch>` merges dev INTO it, `push`/`pull` name one explicitly.
+		minto|push) COMPREPLY=($(compgen -W "$(_muster_names branch)" -- "$cur")) ;;
 		golden)    [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "snapshot seal ls reap" -- "$cur")) ;;
 		expose|hide) COMPREPLY=($(compgen -f -- "$cur")) ;;
 	esac
