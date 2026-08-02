@@ -13,8 +13,19 @@ is replaced by `tests/stub-broker.py` — same HTTP contract, records every requ
 can assert on *what cbx asked it to do* — and every git operation runs against a scratch repo with a
 bare "origin" beside it. Runs in the Jenkins pipeline before any image is built.
 
-Requires `git`, `jq`, `curl`, `python3`. `tmux` and `script` are optional; the tests that need them
-skip with a notice rather than failing.
+Requires `git`, `jq`, `curl`, `python3` and `python3-yaml`. `tmux` and `script` are optional; the
+tests that need them skip with a notice rather than failing.
+
+The **hub base image ships all of them**, so the simplest way to run the suite anywhere — a CI agent
+with nothing installed, a colleague's laptop — is in the image muster itself ships:
+
+```sh
+docker run --rm -v "$PWD:/w" -w /w -e TMPDIR=/tmp --entrypoint= \
+  ghcr.io/fhackenberger/muster-hub-base:<version> ./tests/run-tests.sh
+```
+
+`--entrypoint=` because the image's own entrypoint would otherwise clone a repo and start tmux;
+`TMPDIR=/tmp` keeps the scratch fixtures inside the container instead of the mounted workspace.
 
 ## How a test is written
 

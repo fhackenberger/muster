@@ -43,8 +43,13 @@ RUN NODE_VERSION="${NODE_VERSION}" NPM_VERSION="${NPM_VERSION}" PINCHTAB_VERSION
 # Hub-specific runtime deps. openssh-client clones + commits. Google Chrome is for the pinchtab SERVER
 # (pinchtab drives a REAL system browser); google-chrome-stable's .deb pulls in all the Chrome runtime
 # libs. xauth/xvfb are the headless X plumbing. curl comes from common-setup above.
+#
+# python3-yaml is for the TEST SUITE, not the hub: with git, jq, curl, bash, tmux and python3 already
+# here from common-setup, this one package makes the image a complete environment for
+# tests/run-tests.sh — so a consumer's CI can run muster's tests in the very image muster ships,
+# rather than assembling a lookalike on a build agent. Dogfooding, and it costs ~150 kB.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		openssh-client xauth xvfb gnupg \
+		openssh-client xauth xvfb gnupg python3-yaml \
 	&& curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
 		| gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
 	&& echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
