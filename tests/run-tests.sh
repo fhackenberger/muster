@@ -208,11 +208,13 @@ test_images_workflow_names_images_by_describe() {
 	exists "$wf" || return 0
 	OUT="$(cat "$wf")"
 	has "describe --tags --always"
-	# main must publish, or consuming any unreleased change needs a version tag invented for it.
-	has "branches: [main]"
-	has "type=raw,value=dev"
+	# The default branch must publish, or consuming any unreleased change needs a version tag
+	# invented for it. muster's default branch is master, not main — getting that wrong is a
+	# workflow that never runs and a `dev` tag that never appears.
+	has "branches: [master]"
+	has "type=raw,value=dev,enable={{is_default_branch}}"
 	# MUSTER_VERSION must come from that describe step and NOT from metadata-action: on a branch push
-	# metadata's version output is the branch name, so every main image would call itself "main" and
+	# metadata's version output is the branch name, so every master image would call itself "master" and
 	# version_drift() would go blind exactly where things move fastest.
 	has 'MUSTER_VERSION=${{ steps.ver.outputs.version }}'
 	hasnt 'MUSTER_VERSION=${{ steps.meta.outputs.version }}'

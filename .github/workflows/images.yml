@@ -14,7 +14,7 @@
 #
 # But a release cannot be the ONLY way to get an image, or every change a consumer wants to run needs
 # a version tag on code that has not been used in anger yet — and tagging then stops meaning "tested"
-# and starts meaning "I wanted to deploy this". So main publishes too, under the name `git describe`
+# and starts meaning "I wanted to deploy this". So master publishes too, under the name `git describe`
 # gives that commit:
 #
 #   a v0.1.2 tag            ->  0.1.2, 0.1, latest
@@ -29,10 +29,10 @@ name: images
 on:
   push:
     tags: ["v*"]
-    branches: [main]        # every main commit gets an image, named after `git describe`
+    branches: [master]      # every commit on the default branch gets an image, named after `git describe`
   workflow_dispatch:        # for a rebuild when a base OS or a pinned CLI needs picking up
 
-# One build per ref. A push train on main would otherwise publish `dev` out of order, and the loser
+# One build per ref. A push train on master would otherwise publish `dev` out of order, and the loser
 # of that race is the image people are pulling.
 concurrency:
   group: images-${{ github.ref }}
@@ -62,7 +62,7 @@ jobs:
             dockerfile: box-broker/Dockerfile
     steps:
       # fetch-depth: 0 — `git describe` needs the tags and the commits back to the last one. The
-      # default shallow checkout has neither, and describe then fails on main.
+      # default shallow checkout has neither, and describe then fails on a branch build.
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
       # THE version string, computed exactly the way every consumer computes it: `git describe`
@@ -88,12 +88,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
           # latest=false, then applied by hand to tag pushes only. `latest=true` would put it on
-          # every main build as well, and `latest` must keep meaning "the newest RELEASE" — that is
-          # the tag someone trying muster for the first time pulls. Note that the tempting
-          #     type=raw,value=latest,enable={{is_default_branch}}
-          # is a trap: on a tag push the ref is refs/tags/v… so is_default_branch is false there.
+          # every master build as well, and `latest` must keep meaning "the newest RELEASE" — that is
+          # the tag someone trying muster for the first time pulls. And `latest` cannot use
+          # {{is_default_branch}} the way the two below do: on a TAG push the ref is refs/tags/v…, so
+          # that template is false exactly when a release is being published.
           #
-          # The last two are the main-branch pair: the describe string, which is what consumers pin,
+          # The last two are the default-branch pair: the describe string, which is what consumers pin,
           # and the moving `dev` beside it. (No comment lines inside `tags:` — every non-empty line
           # there is parsed as a tag definition.)
           flavor: latest=false
@@ -101,8 +101,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.ref == 'refs/heads/main' }}
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.ver.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=dev,enable={{is_default_branch}}
       - uses: docker/build-push-action@v6
         with:
           # The build context is the repository root for ALL of them — the Dockerfiles COPY shared
@@ -122,7 +122,7 @@ jobs:
           # without anyone passing anything.
           #
           # From steps.ver, NOT steps.meta.outputs.version: metadata-action's `version` is the branch
-          # name on a branch push, so every main image would call itself "main" and drift detection
+          # name on a branch push, so every master image would call itself "master" and drift detection
           # would go blind exactly where things move fastest.
           build-args: |
             MUSTER_VERSION=${{ steps.ver.outputs.version }}

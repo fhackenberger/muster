@@ -26,7 +26,7 @@ nothing about the codebase leaves your own infrastructure.
 your laptop
  │  ▲
  │  └──────────────────────────────┐   tunnelled http: a box's dev server,
- │ ssh                             │   running in your own browser
+ │ ssh                             │   visible in your own browser
  ▼                                 │
 hub ──asks──▶ box-broker           │   hub: the repo, the CLI, dev services
                    │               │   broker: the only holder of the docker socket

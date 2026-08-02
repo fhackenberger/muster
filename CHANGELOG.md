@@ -7,7 +7,7 @@ Why versions matter here: `common-setup.sh` deliberately resolves the *latest* n
 at build time, so a commit does not identify an artifact. A tag does — see
 `docs/adr/0001-image-builds.md`.
 
-Every commit on `main` is published as well, under its `git describe` name (`0.1.1-7-gabc1234`) and a
+Every commit on `master` is published as well, under its `git describe` name (`0.1.1-7-gabc1234`) and a
 moving `dev`, so running an unreleased change never requires cutting a release for it. Those are not
 releases and are not listed here.
 

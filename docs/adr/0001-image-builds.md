@@ -56,12 +56,12 @@ the code and needs no infrastructure of its own.
 | Trigger | Image tags |
 |---|---|
 | a `v*` tag | `1.2.3`, `1.2`, `latest` |
-| a push to `main` | `1.2.3-7-gabc1234` (`git describe`), `dev` |
+| a push to `master` | `1.2.3-7-gabc1234` (`git describe`), `dev` |
 
 Deploy from a version or from a describe string, never from `latest` or `dev`: both move, and a stack
 pinned to a moving tag cannot tell you what it is running.
 
-**Why main publishes at all**, when the argument above is that only a tag identifies a tested
+**Why the default branch publishes at all**, when the argument above is that only a tag identifies a tested
 combination: because otherwise the only way to *use* a change is to tag a release for it, and tagging
 then degrades from "this has been used in anger" to "I wanted to deploy this". The describe string
 keeps the property that matters — one name, one commit, one image — without pretending to be a
