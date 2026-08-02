@@ -1109,6 +1109,50 @@ PY
 	ok; has ok
 }
 
+test_broker_box_mode() {
+	OUT="$(MUSTER_BOX_MODE=plan python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+assert b.box_mode_arg() == "--permission-mode plan", b.box_mode_arg()
+# the friendly spellings people actually type
+for given, want in (("accept-edits","acceptEdits"), ("auto","acceptEdits"), ("bypass","bypassPermissions")):
+    b.MUSTER_BOX_MODE = given
+    assert b.box_mode_arg() == f"--permission-mode {want}", (given, b.box_mode_arg())
+# an unknown mode must NOT reach claude: a rejected flag kills the box at startup, which is far
+# harder to diagnose than a mode that quietly did not apply.
+b.MUSTER_BOX_MODE = "turbo"
+assert b.box_mode_arg() == "", b.box_mode_arg()
+b.MUSTER_BOX_MODE = ""
+assert b.box_mode_arg() == ""
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+test_broker_box_prompt() {
+	OUT="$(python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import base64, importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+os.environ["FROM_THE_ENVIRONMENT"] = "infra-value"
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+b.MUSTER_BOX_PROMPT = "agent $MUSTER_BOX on $MUSTER_BRANCH; env=$FROM_THE_ENVIRONMENT; $NOT_SET stays"
+out = base64.b64decode(b.box_prompt("work1", {"MUSTER_BOX": "work1", "MUSTER_BRANCH": "agent/work1"})).decode()
+assert "agent work1 on agent/work1" in out, out
+assert "env=infra-value" in out, out          # the broker's own environment is in scope
+assert "$NOT_SET stays" in out, out           # unknown names are left alone, so prose with $ is safe
+# empty prompt -> nothing to pass, not an empty argument
+b.MUSTER_BOX_PROMPT = "   "
+assert b.box_prompt("work1", {}) == ""
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 # =====================================================================  the run
 
 run "syntax: every script parses"                  test_syntax
@@ -1199,6 +1243,8 @@ run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
+run "broker: box mode maps to --permission-mode"   test_broker_box_mode
+run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 
 echo
 if [ "$TESTS_FAILED" = 0 ]; then

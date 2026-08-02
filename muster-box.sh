@@ -54,6 +54,7 @@ set -euo pipefail
 #   MUSTER_PINCHTAB_SERVER/_TOKEN point the box's pinchtab CLI straight at a server (no relay)
 #   MUSTER_DEV_URL                the dev-server URL to expose to the box
 #   MUSTER_CLAUDE_ARGS            extra args appended to the detached `claude` (e.g. --resume <id>)
+#   MUSTER_CLAUDE_PROMPT_B64      base64 opening prompt, decoded and passed as claude's first message
 #   MUSTER_EXTRA_MOUNTS           newline-separated src:dst[:ro] binds (broker-validated)
 
 # Settings live in one simple shell file shared with build.sh, so the clip UID (which must
@@ -347,6 +348,20 @@ fi
 # box that never starts. `;` not `&&`: a bootstrap that fails must not stop claude from launching.
 if [ "$DETACH" = 1 ]; then
 	_claude="claude${MUSTER_CLAUDE_ARGS:+ ${MUSTER_CLAUDE_ARGS}}"
+	# An opening prompt for the box (broker: MUSTER_BOX_PROMPT). It arrives base64-encoded and is
+	# decoded HERE, in the innermost shell, precisely because the line below is built by one shell,
+	# re-parsed by tmux and run by another: a prompt is free text and will contain quotes, $ and
+	# newlines. Base64 has none of those, so it survives every layer untouched — the same reason
+	# cbxexec sends its command that way.
+	# The \\\" and \\\$ are load-bearing. This string is built HERE, re-parsed by the `bash -lc` below,
+	# and only then run by the shell tmux starts — so both the quotes and the $( ) have to survive two
+	# layers to be expanded by the LAST one. Escape too little and the outer shell decodes it early:
+	# the prompt is then word-split into separate tmux arguments (or, once quoted, spliced into a
+	# command line where its own quotes and backticks are live). Decoding in the innermost shell inside
+	# double quotes is what makes an arbitrary prompt safe — the result of a command substitution is
+	# not re-scanned, so quotes, $ and backticks in it stay literal.
+	[ -n "${MUSTER_CLAUDE_PROMPT_B64:-}" ] && \
+		_claude="$_claude \\\"\\\$(printf %s ${MUSTER_CLAUDE_PROMPT_B64} | base64 -d)\\\""
 	_init="${MUSTER_INIT_CMD:+${MUSTER_INIT_CMD}; }"
 	RUN_CMD=(bash -lc "tmux new-session -d -s main -n claude \"${_init}${_claude}; echo; echo claude exited - type claude to relaunch; exec bash -l\"; exec sleep infinity")
 fi

@@ -56,8 +56,10 @@ Config (env, from compose):
   BOX_UID/BOX_GID     synthetic non-root identity inside the box (default 1000/1000)
   MUSTER_SCRIPT    path to muster-box.sh (default /usr/local/bin/muster-box.sh)
 """
+import base64
 import json
 import os
+import string
 import re
 import shutil
 import subprocess
@@ -104,6 +106,59 @@ MUSTER_SCRIPT = os.environ.get("MUSTER_SCRIPT", "/usr/local/bin/muster-box.sh")
 # can tell you when the two have drifted apart — three images, three build paths, and otherwise
 # nothing at all stops a 0.2 broker from driving a 0.1 hub.
 MUSTER_VERSION = os.environ.get("MUSTER_VERSION", "unknown")
+
+# HOW A BOX'S CLAUDE STARTS, as project policy rather than something you type every time.
+#
+#   MUSTER_BOX_MODE    the permission mode claude starts in.
+#   MUSTER_BOX_PROMPT  an opening prompt, given to claude as its first message.
+#
+# Both come from the stack's .env, so they are a property of the deployment: every box this broker
+# spawns starts the same way, and a recreate reproduces it.
+MUSTER_BOX_MODE = os.environ.get("MUSTER_BOX_MODE", "").strip()
+MUSTER_BOX_PROMPT = os.environ.get("MUSTER_BOX_PROMPT", "")
+
+# What claude actually accepts, plus the spellings people reach for. Unknown values are IGNORED with a
+# warning rather than passed through: a rejected flag would make claude exit at startup, and a box
+# that dies on boot is far more expensive to diagnose than a mode that did not apply.
+BOX_MODES = {
+	"default": "default",
+	"plan": "plan",
+	"accept-edits": "acceptEdits", "acceptedits": "acceptEdits", "acceptEdits": "acceptEdits",
+	"auto": "acceptEdits",                    # what "auto" colloquially means: accept edits, still ask to run
+	"bypass": "bypassPermissions", "bypass-permissions": "bypassPermissions",
+	"bypassPermissions": "bypassPermissions",
+}
+
+
+def box_mode_arg():
+	"""`--permission-mode <mode>`, or "" when unset/unrecognised."""
+	if not MUSTER_BOX_MODE:
+		return ""
+	mode = BOX_MODES.get(MUSTER_BOX_MODE) or BOX_MODES.get(MUSTER_BOX_MODE.lower())
+	if not mode:
+		print(f"box-broker: ignoring MUSTER_BOX_MODE={MUSTER_BOX_MODE!r} — expected one of "
+		      f"{sorted(set(BOX_MODES))}", flush=True)
+		return ""
+	return f"--permission-mode {mode}"
+
+
+def box_prompt(name, facts):
+	"""The opening prompt for this box, with $VARIABLES filled in, base64-encoded for the launcher.
+
+	SUBSTITUTION uses string.Template against the broker's own environment plus the per-box facts
+	below, so a prompt can say what this box is without the deployment having to know: e.g.
+	    MUSTER_BOX_PROMPT='You are agent $MUSTER_BOX on $MUSTER_BRANCH, based on $MUSTER_DEV_BRANCH.'
+	`safe_substitute` leaves unknown names untouched — a stray $ in prose must not blow up a spawn.
+
+	BASE64 because the result travels through two layers of shell parsing (muster-box.sh builds a
+	`bash -lc` that builds a tmux command), and a prompt is exactly the sort of string that contains
+	quotes, backticks and newlines. Same reason `cbxexec` does it."""
+	if not MUSTER_BOX_PROMPT.strip():
+		return ""
+	mapping = dict(os.environ)
+	mapping.update(facts)
+	text = string.Template(MUSTER_BOX_PROMPT).safe_substitute(mapping)
+	return base64.b64encode(text.encode()).decode()
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 GOLDEN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
@@ -656,6 +711,22 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	rows, checkout_dst, checkout_ro = parse_mounts(golden)
 	claude_args = session_args(box_dir, resume)
 	job = box_job(box_dir, base, merge)
+	# Project policy for how this box's claude comes up (see MUSTER_BOX_MODE / MUSTER_BOX_PROMPT).
+	# The mode is a flag, so it joins the claude args; the prompt travels separately, base64-encoded,
+	# because it is free text going through two shells.
+	mode_arg = box_mode_arg()
+	if mode_arg:
+		claude_args = f"{claude_args} {mode_arg}"
+	prompt_b64 = box_prompt(name, {
+		"MUSTER_BOX": name,
+		"MUSTER_BRANCH": f"agent/{name}",
+		"MUSTER_DEV_BRANCH": DEV_BRANCH,
+		"MUSTER_BASE_BRANCH": job.get("base", DEV_BRANCH),
+		"MUSTER_MERGE_BRANCH": job.get("merge", ""),
+		"MUSTER_PROJECT": PROJECT,
+		"MUSTER_WORKDIR": checkout_dst,
+		"MUSTER_GOLDEN": os.path.basename(golden),
+	})
 	mounts, vols = [], []
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
 	if checkout_ro:
@@ -694,6 +765,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		MUSTER_CLAUDE_DIR=CLAUDE_HOME,
 		MUSTER_WORKDIR=checkout_dst,
 		MUSTER_CLAUDE_ARGS=claude_args,
+		MUSTER_CLAUDE_PROMPT_B64=prompt_b64,
 		MUSTER_PINCHTAB_SERVER=PT_SERVER,
 		MUSTER_PINCHTAB_TOKEN=PT_TOKEN,
 		MUSTER_EXTRA_MOUNTS="\n".join(mounts),

@@ -1,27 +1,35 @@
 # muster
 
-**Run several coding agents at once, each in its own container, and review their work as real git
-branches instead of a diff soup.**
+**Run several coding agents at once, each in its own container on one prepared checkout — the clone,
+the `npm ci`, the warm caches exist once — and review their work as real git branches instead of a
+diff soup.**
 
 *to muster* — to assemble a force. *to pass muster* — to survive inspection. Both halves of the job.
 
+muster is made for solo devs who don't need pull requests, and who would rather run on their own
+infrastructure than drive their agentic dev loop through the GitHub web UI.
+
 Each agent works in its own box: a copy-on-write overlay of one prepared checkout, on its own branch,
 with a real `.git`. When it is done it pushes to the hub, and you review it the way you would review a
-colleague's pull request — with a diff, line comments, and a merge you control. The expensive part
-(clone, `npm ci`, warm caches) exists **once**; an agent's divergence costs only what it actually
-changed, so ten agents are ten diffs, not ten checkouts.
+colleague's pull request — with a diff, line comments, and a merge you control. An agent's
+divergence costs only what it actually changed, so ten agents are ten diffs on disk, not ten
+checkouts — and none of them waits for a dependency install.
 
 It runs on a machine you already have, driven entirely from your terminal. The surface each agent
 works inside is a file you edit; the dev loop it runs is one command away from your browser; and
 nothing about the codebase leaves your own infrastructure.
 
 ```
-   your laptop  ──ssh──▶  hub                          the review desk: the repo, the CLI, dev services
-                           │  spawns via the broker
-                           ▼
-                     box  box  box                     one agent each, /home/dev/repo = overlay(golden)
-                      │    │    │                      branch agent/<name>
-                      └────┴────┴──push──▶  refs/agents/<name>  ──▶  you review  ──▶  merge into dev
+                      your laptop
+                       │       ▲
+                   ssh │       │ http, tunnelled: that box's dev server
+                       ▼       │                 running in your browser
+                      hub      │      the review desk: the repo, the CLI, dev services
+                       │  spawns via the broker
+                       ▼       │
+                 box  box  box ┘      one agent each, /home/dev/repo = overlay(golden)
+                  │    │    │         branch agent/<name>
+                  └────┴────┴──push──▶  refs/agents/<name>  ──▶  you review  ──▶  merge into dev
 ```
 
 ## Why not just run agents in one checkout
@@ -71,8 +79,12 @@ root@other labstack` gives you `lab`, `labhub`, `labbox`, each with its own serv
 - **It is a terminal, not a product.** Everything is `ssh` and shell functions: no web app, no
   account, no third party between you and your code. Which means it composes —
   `muster q --text | grep re-review`, a helper of your own beside the shipped ones, a different set
-  per project, a cron job that spawns a box at 6am. And several stacks at once from one shell, each
-  with its own prefix, its own server and its own completion.
+  per project, a cron job that spawns a box at 6am.
+- **One stack per project, several at once.** A stack is per project — its own hub, its own prepared
+  checkout, its own boxes and dev services — and your laptop drives as many as you like from a single
+  shell: `muster_stack app root@one myapp` and `muster_stack lab root@two labstack` each generate
+  their own command family, pointing at their own server, with their own completion cache. The images
+  are shared, so a second project costs a compose stack rather than a second installation.
 - **Watch the thing it built, not just the diff.** Every box runs its own dev loop, so one command
   tunnels that agent's dev server — and the backend its JavaScript actually calls — to your browser.
   You click through the feature on the branch that built it, before deciding whether it lands.
