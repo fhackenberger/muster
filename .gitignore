@@ -26,3 +26,6 @@ compose.override.yml
 # --- python bytecode from the test suite's stub broker ---
 __pycache__/
 *.pyc
+
+# --- the project's own build toolchain (made from build-setup.sh.example) ---
+build-setup.sh
