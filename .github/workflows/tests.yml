@@ -1,0 +1,24 @@
+# The offline suite: hub/muster, box-bin/muster-box-init and the broker's pure helpers. No docker, no
+# network, no stack — the broker is stubbed and every git operation runs against a scratch repo. It is
+# fast enough to gate every push, and it is the only thing standing between a bad `muster` and the
+# images, so it runs before anything is built (images.yml waits on it).
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_call:            # so images.yml can require a green run rather than duplicating it
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # jq and curl are used by the suite itself; tmux and util-linux(script) only unlock the tests
+      # that would otherwise skip, so a runner without them still reports a truthful pass.
+      - name: install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq tmux python3-yaml
+      - name: run the suite
+        run: ./tests/run-tests.sh

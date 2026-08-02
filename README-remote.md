@@ -1,9 +1,9 @@
-# Remote claude-box — per-project compose stack on a shared root server
+# Remote muster — per-project compose stack on a shared root server
 
-Run claude-box on a server you SSH into as **root, with no host user accounts**. Each project is
+Run muster on a server you SSH into as **root, with no host user accounts**. Each project is
 one `docker-compose` stack (bind mounts, like your other stacks). A **hub** container owns the git
 repo + identity and runs the dev services (backend, `ng serve`, pinchtab + Chrome) on demand;
-**agent boxes** are separate `claude-box` containers spawned by a socket-holding **box-broker**.
+**agent boxes** are separate `muster` containers spawned by a socket-holding **box-broker**.
 You detach/reattach to boxes with tmux over SSH. A second project is just a second copy of the
 stack, fully isolated.
 
@@ -15,7 +15,7 @@ branches instead of a diff soup from N agents sharing one working tree.
 ```
 compose stack (cbx-<project> network)
   db (dbtest) · activemq (artemis) · redis · box-broker[socket] · hub[services + git repo]
-                                                    │ runs claude-box.sh
+                                                    │ runs muster-box.sh
                                                     ▼
                                        box-<project>-<name>  (claude, uid 1000, no socket)
                                          /home/dev/repo = overlay(golden) + own upper layer
@@ -27,26 +27,27 @@ compose stack (cbx-<project> network)
                           the same path the boxes use, so baked-in absolute paths stay valid
 ```
 
-> **Ansible-managed on the acoveo host.** For the `infostars` stack, everything below is
-> automated by the `claude_box` role + `tasks/containers-claude-box.yml` (rsync of this dir to
-> `/virtual_machines/claude-box-docker`, the templated `infostars.conf` → `.env` symlink, the
-> pinchtab `config.json`, and the GitHub deploy key). The manual steps here document the model and
-> apply to a hand-rolled stack.
+> **Deploying with a config-management tool?** `ansible/roles/claude_box` in this repository does
+> everything below for you: the directory layout and its uid-1000 ownership, the rsync of this tree,
+> `gen-hub-mounts.sh`, the `.env` symlink and the GitHub deploy key. It takes the project-specific
+> files (the env, `mounts`, `service-env`, `hub-services/`, the pinchtab config) as a variable, so the
+> generic half stays generic. The manual steps here document the model, and are what you follow for a
+> hand-rolled stack.
 
 ## One-time host prep (per server)
 
 Docker + the sample-DB image. The **box / hub / box-broker images are built by the `Jenkinsfile`**
-(as `claude-box`, `claude-box-hub-base`, `claude-box-hub`, `claude-box-broker`, moving tag
-`master→stable`, `build/test→latest`, else `dev`) — Jenkins and the claude-box host are the same
+(as `muster`, `muster-hub-base`, `muster-hub`, `muster-broker`, moving tag
+`master→stable`, `build/test→latest`, else `dev`) — Jenkins and the muster host are the same
 machine, so the stack reuses those local tags directly (no registry round-trip). No accounts, no
 toolchain install.
 
 Both the box and the hub are a lean **base** on `debian:trixie-slim` + a project **add-on**:
-`claude-box-hub-base` (`hub/Dockerfile.base`) carries the project-agnostic hub tooling (git/ssh, tmux,
-node, pinchtab + Google Chrome, the tuicr review TUI, cbx, entrypoint, and the uid-1000 `dev` user), and `claude-box-hub`
-layers the infostars build toolchain (JDK + gradle + ant) via the **shared `Dockerfile.addon`**
-(`--build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000`). The box mirrors this:
-`claude-box` (base) + `claude-box-infostars` (same `Dockerfile.addon`, `BASE_IMAGE=claude-box`) — the
+`muster-hub-base` (`hub/Dockerfile.base`) carries the project-agnostic hub tooling (git/ssh, tmux,
+node, pinchtab + Google Chrome, the tuicr review TUI, cbx, entrypoint, and the uid-1000 `dev` user), and `muster-hub`
+layers the myapp build toolchain (JDK + gradle + ant) via the **shared `Dockerfile.addon`**
+(`--build-arg BASE_IMAGE=muster-hub-base --build-arg FINAL_USER=1000`). The box mirrors this:
+`muster` (base) + `muster-myapp` (same `Dockerfile.addon`, `BASE_IMAGE=muster`) — the
 latter is what the broker spawns. The toolchain lives once in a **setup script of your own**, named by
 `--build-arg SETUP_SCRIPT=<path in the build context>`, defaulting to `build-setup.sh` — your own
 file, made from the shipped `build-setup.sh.example`; the add-on Dockerfile is written once. Jenkins builds each base
@@ -54,29 +55,29 @@ file, made from the shipped `build-setup.sh.example`; the add-on Dockerfile is w
 
 ```sh
 # postgres + sample DB
-docker build -t infostars/dbtest  path/to/infostars/docker-postgre-test
+docker build -t myapp/dbtest  path/to/myapp/docker-postgre-test
 ```
 
-Trigger the **claude-box images** Jenkins job to build them (or, to build the box image by hand
+Trigger the **muster images** Jenkins job to build them (or, to build the box image by hand
 without Jenkins):
 
 ```sh
 NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 \
-  path/to/infostars/docker-claude/build.sh
+  path/to/myapp/docker-claude/build.sh
 ```
 
 ## Per-project stack
 
 ```sh
 mkdir -p /srv/cbx/myproject && cd /srv/cbx/myproject
-cp -r path/to/claude-box/{compose.yml,box-broker,hub} .
-cp path/to/claude-box/.env.example      .env
-cp path/to/infostars/docker-claude/mounts.example     mounts
+cp -r path/to/muster/{compose.yml,box-broker,hub} .
+cp path/to/muster/.env.example      .env
+cp path/to/myapp/docker-claude/mounts.example     mounts
 ./gen-hub-mounts.sh                                    # renders the hub's volumes -> compose.override.yml
-cp path/to/claude-box/service-env.example      service-env   # REQUIRED: compose env_file
-cp path/to/claude-box/compose.project.yml.example compose.project.yml  # YOUR db/cache/queue, if any
-cp path/to/infostars/docker-claude/port-forwards.example port-forwards
-cp -r path/to/infostars/docker-claude/hub-services.example hub-services  # dev-service manifests
+cp path/to/muster/service-env.example      service-env   # REQUIRED: compose env_file
+cp path/to/muster/compose.project.yml.example compose.project.yml  # YOUR db/cache/queue, if any
+cp path/to/myapp/docker-claude/port-forwards.example port-forwards
+cp -r path/to/myapp/docker-claude/hub-services.example hub-services  # dev-service manifests
 mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
 chown -R 1000:1000 data                                 # boxes + hub run as uid 1000
 $EDITOR .env            # set PROJECT_NAME, STACK_DIR=$(pwd), REPO_URL, tokens, API keys
@@ -97,7 +98,7 @@ and put an HTTPS token in `git-identity/git-credentials` (`https://user:token@gi
 drop an SSH key in `git-identity/` and use a `git@` `REPO_URL` (see the deploy-key section below).
 
 The **image source** is env-driven in `.env`: `COMPOSE_PULL_POLICY=missing` (default) reuses the
-Jenkins-built `claude-box-hub` / `claude-box-broker` images; `=build` rebuilds them locally from
+Jenkins-built `muster-hub` / `muster-broker` images; `=build` rebuilds them locally from
 this dir; `=always` pulls (point `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified
 names for a different host). pinchtab needs its server bound to `0.0.0.0:9867` with `PT_TOKEN`:
 drop a `data/pinchtab/config.json` (copy your laptop's, set `server.bind=0.0.0.0`,
@@ -113,7 +114,7 @@ prints the public key and step-by-step registration instructions during the run.
 instead:
 
 ```sh
-ssh-keygen -t ed25519 -N '' -C "claude-box-deploy-key@$(hostname)" -f git-identity/id_ed25519
+ssh-keygen -t ed25519 -N '' -C "muster-deploy-key@$(hostname)" -f git-identity/id_ed25519
 cat git-identity/id_ed25519.pub    # paste this on github.com
 ```
 
@@ -151,7 +152,7 @@ Then:
 
 ### The stack is two compose files
 
-`compose.yml` is **claude-box itself** — the hub and the box-broker, identical for every project.
+`compose.yml` is **muster itself** — the hub and the box-broker, identical for every project.
 Anything your project needs beside them (a database, a message queue, a cache, seed data) goes in
 **`compose.project.yml`** (copy `compose.project.yml.example`), merged via `COMPOSE_FILE` in `.env`:
 
@@ -174,8 +175,8 @@ docker compose up -d          # box-broker + hub (clones the repo on first boot)
 
 ### Escape hatch: build the images locally
 
-By default (`COMPOSE_PULL_POLICY=missing`) the stack **reuses the Jenkins-built** `claude-box-hub`
-and `claude-box-broker` images and never rebuilds them. If you'd rather build from this directory —
+By default (`COMPOSE_PULL_POLICY=missing`) the stack **reuses the Jenkins-built** `muster-hub`
+and `muster-broker` images and never rebuilds them. If you'd rather build from this directory —
 e.g. you changed a `Dockerfile`, or Jenkins hasn't run yet — flip the policy in `.env`:
 
 ```sh
@@ -196,17 +197,17 @@ docker compose build hub box-broker   # build just these two from this dir
 docker compose up -d                  # they now exist locally, so `missing` uses them
 ```
 
-The hub build layers `Dockerfile.addon` onto `claude-box-hub-base`. Compose pulls that base from the
+The hub build layers `Dockerfile.addon` onto `muster-hub-base`. Compose pulls that base from the
 registry by default, so the above just works when `docker login` has run. To build **fully offline**
 (or after editing `hub/Dockerfile.base`), build the base first and point the hub at the local tag:
 
 ```sh
-docker build -t claude-box-hub-base:local -f hub/Dockerfile.base .   # context = the claude-box dir
-HUB_BASE_IMAGE=claude-box-hub-base:local docker compose build hub
+docker build -t muster-hub-base:local -f hub/Dockerfile.base .   # context = the muster dir
+HUB_BASE_IMAGE=muster-hub-base:local docker compose build hub
 ```
 
 The **box image** the broker spawns is separate: set `BOX_IMAGE` in `.env` (default
-`claude-box:stable`), or build it locally with `build.sh` (see host prep). To go the other way and
+`muster:stable`), or build it locally with `build.sh` (see host prep). To go the other way and
 pull from the registry on a *different* host, set `COMPOSE_PULL_POLICY=always` and point
 `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified names.
 
@@ -217,18 +218,18 @@ changed" comes from doing one and not the other:
 
 | What you changed | Travels via | Carried by |
 |---|---|---|
-| `hub/cbx`, `hub/entrypoint.sh`, `hub/git-ssh`, `hub/Dockerfile.base` | Jenkins build | `claude-box-hub-base` → `claude-box-hub` |
-| `Dockerfile`, `box-bin/*` | Jenkins build | `claude-box` → `claude-box-infostars` |
+| `hub/muster`, `hub/entrypoint.sh`, `hub/git-ssh`, `hub/Dockerfile.base` | Jenkins build | `muster-hub-base` → `muster-hub` |
+| `Dockerfile`, `box-bin/*` | Jenkins build | `muster` → `muster-myapp` |
 | `common-setup.sh` (shared toolchain: node, pinchtab, **tuicr**) | Jenkins build | **both** bases — box *and* hub |
-| `box-broker/broker.py`, **`claude-box.sh`** | Jenkins build | `claude-box-broker` |
+| `box-broker/broker.py`, **`muster-box.sh`** | Jenkins build | `muster-broker` |
 | `compose.yml`, `compose.project.yml`, `.env`, `service-env`, `mounts`, `port-forwards`, `hub-services/*`, `git-identity/*` | file sync (Ansible / rsync) | — |
 
 A change to `mounts` needs one extra step on the host, `./gen-hub-mounts.sh`, which renders the hub's
 half of the table into `compose.override.yml` (Ansible does it as part of the files tag).
 
-Two traps in that table. **`claude-box.sh` is `COPY`d into the *broker* image**, not the box image —
+Two traps in that table. **`muster-box.sh` is `COPY`d into the *broker* image**, not the box image —
 a change there needs a broker rebuild. And **each add-on image must be rebuilt after its base**
-(`claude-box` before `claude-box-infostars`); rebuilding only the add-on silently keeps the old base.
+(`muster` before `muster-myapp`); rebuilding only the add-on silently keeps the old base.
 The Jenkinsfile orders them correctly.
 
 ```sh
@@ -254,11 +255,11 @@ cbx recreate all                                    # boxes: new image + new env
 Verify what actually landed, rather than assuming:
 
 ```sh
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' infostars-box-broker-1 | grep -E 'MOUNTS_FILE|SERVICE_ENV_FILE'
-docker exec infostars-box-broker-1 grep -c SERVICE_ENV_FILE /usr/local/bin/broker.py   # code, not env
-docker exec -u dev box-infostars-<name> printenv DB_INFOSTARS_PSQL_URL
-docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' box-infostars-<name>
-docker logs infostars-hub 2>&1 | grep 'MOUNT DRIFT'     # hub's own mounts vs the `mounts` table
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' myapp-box-broker-1 | grep -E 'MOUNTS_FILE|SERVICE_ENV_FILE'
+docker exec myapp-box-broker-1 grep -c SERVICE_ENV_FILE /usr/local/bin/broker.py   # code, not env
+docker exec -u dev box-myapp-<name> printenv DB_MYAPP_PSQL_URL
+docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' box-myapp-<name>
+docker logs myapp-hub 2>&1 | grep 'MOUNT DRIFT'     # hub's own mounts vs the `mounts` table
 ```
 
 The first two are the useful pair: env comes from the **file sync**, the code from the **image**, and
@@ -267,18 +268,18 @@ they fail in different ways.
 ## Laptop aliases
 
 Everything is driven through `cbx` inside the hub. Rather than typing the full
-`<transport> … docker exec …` each time, the helpers live in **`cbx.bash_aliases`** (next to this
+`<transport> … docker exec …` each time, the helpers live in **`muster.bash_aliases`** (next to this
 README) — source it from your `~/.bashrc`, setting the server and the stack's `PROJECT_NAME` first
 (export them before sourcing, or edit the defaults in the file). Project-specific helpers (`cbxpsql`,
 `cbxfe` — they know your db and your dev ports) are a **separate** file: copy
-`cbx.bash_aliases.project.example`, edit it, and source it *after* the generic one:
+`muster.bash_aliases.project.example`, edit it, and source it *after* the generic one:
 
 ```sh
 # in ~/.bashrc
-export CBX_SERVER=root@hetzner1.acoveo.com   # the claude-box host
-export CBX_PROJECT=infostars                 # PROJECT_NAME of the stack
-source /path/to/claude-box/cbx.bash_aliases
-source /path/to/claude-box/cbx.bash_aliases.project   # optional: cbxpsql / cbxfe / your own
+export MUSTER_SERVER=root@cbx.example.com   # the muster host
+export MUSTER_PROJECT=myapp                 # PROJECT_NAME of the stack
+source /path/to/muster/muster.bash_aliases
+source /path/to/muster/muster.bash_aliases.project   # optional: cbxpsql / cbxfe / your own
 ```
 
 That gives you:
@@ -286,7 +287,7 @@ That gives you:
 - **`cbx …`** — run any cbx subcommand on the remote hub (`cbx up backend`, `cbx ls`, `cbx box work1`).
 - **`cbxhub`** — a persistent tmux shell in the hub you can detach (Ctrl-b d) / reconnect to.
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
-- **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql infotrack_dev`).
+- **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql myapp_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
 - **`cbxfe <box>` / `cbxfe <box> --own`** — project shorthand: open **one agent's** frontend at
   `http://localhost:4211`, with **both** candidate backends tunnelled alongside it — the hub's
@@ -294,7 +295,7 @@ That gives you:
   points at). Several forwards, because `FRONTEND_DEV_BACKEND_URL` is resolved by **your browser**,
   not by the box, and the agent may have switched it to its own backend at any point. Tunnelling both
   means you never have to know which: a missed one shows up only as failing API calls
-  (`ERR_CONNECTION_REFUSED` on e.g. `http://localhost:8904/infostarsWeb/rest/config`) on a page that
+  (`ERR_CONNECTION_REFUSED` on e.g. `http://localhost:8904/myappWeb/rest/config`) on a page that
   otherwise loads fine. `--own` tunnels *only* the box's own backend, leaving `:8091` free on your
   laptop for a backend of your own.
 - **`cbxsync [--rebase]`** — take new origin commits onto the dev branch (`cbx pull`) and then tell
@@ -324,7 +325,7 @@ That gives you:
   clean enough to pipe into your local tools:
 
   ```sh
-  cbxexec work1 gradle -q :infostarsEJB:test | tee test.log
+  cbxexec work1 gradle -q :myappEJB:test | tee test.log
   cbxexec work1 cat /home/dev/repo/build/reports/x.json | jq .failures
   cbxexec hub 'cbx q --text' | grep -i blocked
   cbxexec work1 'grep -rn TODO /home/dev/repo | wc -l'     # …the pipe runs IN the box
@@ -337,8 +338,8 @@ That gives you:
   stdin is forwarded, and stderr stays on stderr — a local pipe sees only real output. The exit status
   is the command's own. Use `cbxbox` instead when you want the *interactive* tmux attach.
 
-**Export the two variables as their own commands.** Prefixing them to the `source` — `CBX_SERVER=…
-CBX_PROJECT=… . cbx.bash_aliases` — does *not* work: assignments prefixed to a command are temporary
+**Export the two variables as their own commands.** Prefixing them to the `source` — `MUSTER_SERVER=…
+MUSTER_PROJECT=… . muster.bash_aliases` — does *not* work: assignments prefixed to a command are temporary
 in bash, so they are gone by the time an alias runs, and because the file's `:=` defaults did see
 them they don't fall back to the placeholder either. The variable simply ends up unset, and ssh then
 reports `Could not resolve hostname : Name or service not known`, which looks like a DNS fault. The
@@ -349,7 +350,7 @@ and **live box names** for `cbx review|merge|drop|fix|rebase|kill|recreate|…`,
 `cbxtun` (which completes `hub:` / `<box>:` and leaves the cursor on the colon for the port). Service
 names complete for `cbx up|down|logs`.
 
-Names live on the server, so they are fetched once over ssh and cached for **`CBX_COMPLETE_TTL`**
+Names live on the server, so they are fetched once over ssh and cached for **`MUSTER_COMPLETE_TTL`**
 seconds (default 60). **Tab never waits on the network once that cache exists**: past the TTL the
 cached list still answers immediately and the refetch is detached into the background for the *next*
 Tab. Only the very first completion in a terminal — with nothing to answer from — goes over the wire
@@ -364,10 +365,10 @@ On the one cold-start Tab that does go over the wire, the terminal's own **progr
 for the duration (OSC `9;4`, indeterminate — Ghostty, WezTerm, Windows Terminal, ConEmu; others ignore
 it silently). It has to be the terminal's indicator rather than a printed message, because readline
 owns the command line while a completion function runs and anything written into the display is
-overwritten or leaves debris. `CBX_COMPLETE_PROGRESS=0` turns it off.
+overwritten or leaves debris. `MUSTER_COMPLETE_PROGRESS=0` turns it off.
 
 **Transport.** Long-lived interactive sessions — **`cbxhub`, `cbxbox`, and `cbx logs`** — default to
-**ssh**. Set **`CBX_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
+**ssh**. Set **`MUSTER_TRANSPORT=mosh`** (per call or globally) to opt into **mosh** for roaming: it
 survives laptop sleep, Wi-Fi→LTE, and IP changes with no frozen-SSH hangs, and composes with the tmux
 persistence those already give you. mosh needs **UDP 60000-61000** open to the server — provisioned by
 `tasks/firewall.yml` (a UFW rule); on a hand-rolled host, open it yourself. It still uses ssh for the
@@ -378,14 +379,14 @@ your laptop clipboard via an OSC 52 escape sequence, which ssh passes through tr
 predictive terminal drops (a long-standing mosh gap). tmux forwards the sequence either way
 (`set-clipboard external`), so on ssh a copy from claude lands in your laptop clipboard and on mosh it
 vanishes. Use mosh when roaming matters more than copy-paste. Note
-that an exported `CBX_TRANSPORT` in your `~/.bashrc` wins over the file default — `echo "$CBX_TRANSPORT"`
+that an exported `MUSTER_TRANSPORT` in your `~/.bashrc` wins over the file default — `echo "$MUSTER_TRANSPORT"`
 if a transport change seems ignored.
 
 **One-shot commands** (`cbx --help`, `cbx ls`, `cbx q --text`, `cbx review …`) always use **ssh**,
-regardless of `CBX_TRANSPORT` — their output prints to your terminal and stays in scrollback. mosh is
+regardless of `MUSTER_TRANSPORT` — their output prints to your terminal and stays in scrollback. mosh is
 an alternate-screen app: it would render the output and then wipe it on exit, and it buys nothing for
 a sub-second command. The long-lived ones — `cbxhub`, `cbxbox`, `cbx logs` and the bare `cbx q`
-dashboard — honor `CBX_TRANSPORT`. **`cbxtun` is always ssh** too — mosh can't port-forward.
+dashboard — honor `MUSTER_TRANSPORT`. **`cbxtun` is always ssh** too — mosh can't port-forward.
 
 The hub container is resolved by its compose labels at call time (so it survives compose's `-1`
 suffix and renames); the `$(…)` lookup runs on the server, and trailing args (`up backend`) are
@@ -442,8 +443,8 @@ Two things make this work where the old `*_CMD` env vars did:
   *settings* (ports, DB, keys) still belong in `service-env` — those are shared with the agent boxes; the
   command that starts a service is the hub's alone.
 
-On the acoveo host these are Ansible-managed: edit `templates/docker-compose/claude-box/hub-services/<name>`
-(add the file to the loop in `tasks/containers-claude-box.yml`), not the copy on the server.
+If you deploy with the bundled Ansible role, these are templated: edit them in your own repository
+and let the deploy write them, rather than editing the copy on the server.
 
 ### Viewing service logs
 
@@ -467,7 +468,7 @@ Attach / detach a box (a box is a separate container, not reached through the hu
 
 ```sh
 cbxbox work1                                                                                # Ctrl-b d to detach
-ssh -t "$CBX_SERVER" docker exec -it -u dev "box-${CBX_PROJECT}-work1" tmux attach -t main   # equivalent, raw
+ssh -t "$MUSTER_SERVER" docker exec -it -u dev "box-${MUSTER_PROJECT}-work1" tmux attach -t main   # equivalent, raw
 ```
 
 **Inside that tmux** (config: `tmux.conf`, installed as `/etc/tmux.conf` by `common-setup.sh`, so it
@@ -544,8 +545,8 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   a review request). The bell is a bare byte on stdout, so it rides the `docker exec -it` + `ssh -t`
   PTY to your laptop's terminal — nothing to install, works through the alias. Everything is polled
   from the hub's own files, so the interval is cheap; the origin fetch is throttled separately
-  (`CBX_WATCH_FETCH`, 60s). `q` or Ctrl-C quits, Enter refreshes now, `-n SECS` sets the interval
-  (`CBX_WATCH_INTERVAL`), `--no-bell` mutes it. Piped or redirected output is never watched — it
+  (`MUSTER_WATCH_FETCH`, 60s). `q` or Ctrl-C quits, Enter refreshes now, `-n SECS` sets the interval
+  (`MUSTER_WATCH_INTERVAL`), `--no-bell` mutes it. Piped or redirected output is never watched — it
   prints the table once, exactly like `--text`.
 - **`cbx review` opens a review TUI** — [tuicr](https://tuicr.dev), installed into the hub image by
   `common-setup.sh` — on the branch's work since it **forked** from `dev`
@@ -669,7 +670,7 @@ Two details worth knowing:
   beside those files that would then point at nothing. (After a fix round the sha moves, so the next
   review is a fresh session anyway.) `cbx merge` / `cbx drop` clear the record with the branch.
 
-**Choosing a different TUI, or none.** `CBX_REVIEW_TUI` overrides the command:
+**Choosing a different TUI, or none.** `MUSTER_REVIEW_TUI` overrides the command:
 
 | Value | Effect |
 |---|---|
@@ -766,7 +767,7 @@ cbx: [b]ox — an agent resolves it  [h]ere — a worktree, you resolve it  [a]b
 ```
 
 **`[b]ox`** spawns an agent that opens **onto the conflicted tree**: the broker takes
-`?base=<target>&merge=<dev>` and `cbx-box-init` does the checkout and the merge in the box's tmux
+`?base=<target>&merge=<dev>` and `muster-box-init` does the checkout and the merge in the box's tmux
 window *before claude starts* — setup is never left to a prompt, which is advisory and asynchronous.
 The agent gets both branches (`hub/<target>`, `hub/dev`), `merge.conflictstyle=zdiff3` so every hunk
 shows the common **base** and not just the two sides, and a briefing built around `git log --merge`,
@@ -845,7 +846,7 @@ agent can sweep into a commit by accident.
 Most days you don't need it: **`cbx rebase all`** moves agents onto a newer `dev` with a `git fetch`
 + `rebase` in each box, no golden and no recreate. Refresh only when dependencies changed.
 
-Watch the UI yourself: SSH-tunnel the dev ports with **`cbxtun`** (from `cbx.bash_aliases`), then open
+Watch the UI yourself: SSH-tunnel the dev ports with **`cbxtun`** (from `muster.bash_aliases`), then open
 the app in your laptop browser. Each argument is a forward spec — `PORT` or `hub:PORT` for a hub
 service, `<box>:PORT` for an agent box, optionally prefixed `LOCAL:` to change the laptop port. The
 laptop listens on `127.0.0.1` at the same port numbers, so a frontend's `http://localhost:PORT`
@@ -860,8 +861,8 @@ cbxtun 9867                  # a single hub port (e.g. pinchtab)
 cbxtun 4300:work1:4200       # box 'work1' :4200 published on your laptop's :4300
 ```
 
-The old single-port `cbxui` is renamed to `cbxtun` (re-source `cbx.bash_aliases`; it drops the stale
-`cbxui` function on load).
+The old single-port `mustertun` is renamed to `cbxtun` (re-source `muster.bash_aliases`; it drops the stale
+`mustertun` function on load).
 
 ## One mount table (`mounts`)
 
@@ -913,7 +914,7 @@ environment.
 ./tests/run-tests.sh minto        # only tests whose name matches
 ```
 
-`hub/cbx`, `box-bin/cbx-box-init` and the broker's pure helpers are covered by an offline suite: the
+`hub/muster`, `box-bin/muster-box-init` and the broker's pure helpers are covered by an offline suite: the
 broker is replaced by a stub with the same HTTP contract (which records what cbx asked it to do), and
 every git operation runs against a scratch repo with a bare "origin" beside it. It runs in the
 Jenkins pipeline **before** any image is built — a broken `cbx` should never reach an image. See
@@ -922,12 +923,12 @@ Jenkins pipeline **before** any image is built — a broken `cbx` should never r
 ## Notes
 
 - **Agent activity:** each box's claude writes `busy` / `waiting` / `idle` to `$HOME/.cbx-state` via
-  `cbx-activity` hooks, which the broker registers in the stack's shared `~/.claude/settings.json`
+  `muster-activity` hooks, which the broker registers in the stack's shared `~/.claude/settings.json`
   (merging — your other settings and hooks are preserved, and an unparseable file is left alone).
   That path is the box's home anchor, which the hub already mounts read-only, so `cbx ls` /
   `cbx status` read it directly. Commands that type into a session (`fix`, `prereview`, `rebase`)
   refuse while an agent is working; `--force` overrides. `waiting` is deliberately not guarded —
-  claude is asking *you* something. A `busy` older than `CBX_ACTIVITY_STALE` (default 900s) reads as
+  claude is asking *you* something. A `busy` older than `MUSTER_ACTIVITY_STALE` (default 900s) reads as
   `stale` and does not block, so missing or broken hooks can only cost you the protection, never the
   ability to work.
 - **One claude login for the whole stack:** the hub and every box run with
@@ -938,7 +939,7 @@ Jenkins pipeline **before** any image is built — a broken `cbx` should never r
   `~/.claude` therefore shared the token but not the account, so every additional box (and every hub
   recreate) ran the login/onboarding flow again. Pointing `CLAUDE_CONFIG_DIR` at the shared dir puts
   the whole config there, so you log in once. Set on the hub in `compose.yml` (Ansible sync) and on
-  boxes in `claude-box.sh`'s headless branch (image rebuild) — both paths must land, see *Deploying*.
+  boxes in `muster-box.sh`'s headless branch (image rebuild) — both paths must land, see *Deploying*.
 - **Isolation:** a box sees its own overlay of the golden plus whatever the `mounts` table adds, has no
   docker socket, no credentials for the real origin, and can't see the hub's filesystem or another
   box's upper layer. Its only shared surface is the network (`hub:8080/4200/9867/9418`).
@@ -972,7 +973,7 @@ Jenkins pipeline **before** any image is built — a broken `cbx` should never r
   the **hub's loopback**: a box in slot N gets a socat (in the hub's netns, run from the box image)
   mapping hub `127.0.0.1:(HUB_BASE_PORT + N)` → `box:BOX_PORT`. The box receives `PORT_FORWARDS` +
   `PORT_FORWARD_<NAME>_FROM`/`_TO_HUB`, and the **project's own scripts** turn those into e.g.
-  `CLAUDEBOX_DEV_URL=http://localhost:$PORT_FORWARD_FRONTEND_TO_HUB` (pinchtab loads the frontend) and
+  `MUSTER_DEV_URL=http://localhost:$PORT_FORWARD_FRONTEND_TO_HUB` (pinchtab loads the frontend) and
   the frontend's backend URL `http://localhost:$PORT_FORWARD_BACKEND_TO_HUB` (so an agent's frontend
   hits its OWN backend). Everything is `localhost` from the hub browser — allowlisted by default, and
   `Host: localhost` passes ng serve's host-check. Concurrency is bounded by `PORT_FORWARD_SLOTS`
@@ -999,5 +1000,5 @@ Jenkins pipeline **before** any image is built — a broken `cbx` should never r
 - **Images** are built by the `Jenkinsfile` (box / hub / box-broker); the stack reuses them by
   default and only builds locally when `COMPOSE_PULL_POLICY=build`. Flip `PUSH_TO_REGISTRY` in the
   Jenkins job to also publish them for pulling on another host.
-- The laptop `claude-box.sh` flow is unchanged — the server behavior is all env-gated
-  (`CLAUDEBOX_HEADLESS` etc.), off by default.
+- The laptop `muster-box.sh` flow is unchanged — the server behavior is all env-gated
+  (`MUSTER_HEADLESS` etc.), off by default.

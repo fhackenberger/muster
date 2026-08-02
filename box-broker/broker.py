@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """box-broker — the only container with the docker socket.
 
-It is "claude-box.sh as a service": the hub asks it (over the internal compose network, gated by
-a shared token) to create/kill/list agent boxes, and the broker runs the modified claude-box.sh
+It is "muster-box.sh as a service": the hub asks it (over the internal compose network, gated by
+a shared token) to create/kill/list agent boxes, and the broker runs the modified muster-box.sh
 with a VETTED environment. The hub can influence only the box NAME; image, uid, network,
 privileges, the socket and the mount list are the broker's. What a box sees comes from the
 `mounts` table (MOUNTS_FILE), which is root-owned project config synced by Ansible — the hub
@@ -19,7 +19,7 @@ shared read-only by every box as an overlayfs lowerdir; each box writes into its
 N agents cost N x (their own diff) instead of N full checkouts. The mount is performed by DOCKER
 (a local-driver volume with type=overlay), so neither this broker nor the box needs CAP_SYS_ADMIN.
 Each box therefore gets a REAL .git and works on its own branch (agent/<box>), pushing to the hub;
-the hub reviews and merges. See hub/cbx and README-remote.md. A spawn may name a different base
+the hub reviews and merges. See hub/muster and README-remote.md. A spawn may name a different base
 branch and a branch to merge into it (POST /box/<name>?base=…&merge=…), which is how `cbx minto`
 hands an agent a conflicted merge that is already set up when claude starts.
 
@@ -35,7 +35,7 @@ Config (env, from compose):
   BROKER_TOKEN        shared secret; required in the X-Broker-Token header
   BROKER_PORT         listen port (default 8099; not published to the LAN)
   PROJECT_NAME        used for the box name prefix  box-<project>-<name>
-  BOX_IMAGE           the claude-box image (default: claude-box)
+  BOX_IMAGE           the muster image (default: muster)
   BOX_NETWORK         docker network the box joins (e.g. cbx-<project>)
   GOLDEN_DIR          HOST path holding the sealed goldens + the `current` symlink
   GOLDEN_STAGING      HOST path the hub prepares new goldens in (sealed via /golden/seal)
@@ -54,7 +54,7 @@ Config (env, from compose):
   PORT_FORWARDS_FILE  HOST path of the port-forwards manifest (NAME BOX_PORT HUB_BASE_PORT per line)
   PORT_FORWARD_SLOTS  max concurrent boxes with forwards; each box's slot N -> hub port BASE+N (dflt 16)
   BOX_UID/BOX_GID     synthetic non-root identity inside the box (default 1000/1000)
-  CLAUDEBOX_SCRIPT    path to claude-box.sh (default /usr/local/bin/claude-box.sh)
+  MUSTER_SCRIPT    path to muster-box.sh (default /usr/local/bin/muster-box.sh)
 """
 import json
 import os
@@ -69,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TOKEN = os.environ.get("BROKER_TOKEN", "")
 PORT = int(os.environ.get("BROKER_PORT", "8099"))
 PROJECT = os.environ.get("PROJECT_NAME", "project")
-BOX_IMAGE = os.environ.get("BOX_IMAGE", "claude-box")
+BOX_IMAGE = os.environ.get("BOX_IMAGE", "muster")
 BOX_NETWORK = os.environ.get("BOX_NETWORK", "")
 GOLDEN_DIR = os.environ.get("GOLDEN_DIR", "")
 GOLDEN_STAGING = os.environ.get("GOLDEN_STAGING", "")
@@ -98,7 +98,7 @@ PORT_FORWARD_SLOTS = int(os.environ.get("PORT_FORWARD_SLOTS", "16"))
 SERVICE_ENV_FILE = os.environ.get("SERVICE_ENV_FILE", "")
 BOX_UID = os.environ.get("BOX_UID", "1000")
 BOX_GID = os.environ.get("BOX_GID", "1000")
-CLAUDEBOX_SCRIPT = os.environ.get("CLAUDEBOX_SCRIPT", "/usr/local/bin/claude-box.sh")
+MUSTER_SCRIPT = os.environ.get("MUSTER_SCRIPT", "/usr/local/bin/muster-box.sh")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 GOLDEN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
@@ -247,7 +247,7 @@ def parse_service_env():
 	line, '#' comments, no quoting rules and no shell expansion — the value is taken literally to the
 	end of the line. Keys are validated; a malformed line is rejected loudly rather than silently
 	shipping something odd into every box. Values cannot contain newlines (the list is newline-joined
-	when handed to claude-box.sh)."""
+	when handed to muster-box.sh)."""
 	out = []
 	if not SERVICE_ENV_FILE or not os.path.exists(SERVICE_ENV_FILE):
 		return out
@@ -546,7 +546,7 @@ def ensure_activity_hooks():
 		return
 	changed = False
 	for event, state in ACTIVITY_HOOKS:
-		cmd = f"cbx-activity {state}"
+		cmd = f"muster-activity {state}"
 		entries = hooks.setdefault(event, [])
 		if not isinstance(entries, list):
 			continue
@@ -593,7 +593,7 @@ def box_job(box_dir, base, merge):
 	"""The box's branch job, persisted so a RECREATE reproduces it.
 
 	`cbx minto` spawns a box whose branch is based on some other branch (base) with $DEV merged into it
-	(merge) — see cbx-box-init. Both are normally a no-op on recreate, because the box's upper layer
+	(merge) — see muster-box-init. Both are normally a no-op on recreate, because the box's upper layer
 	still holds the branch and init resumes it; but a recreate --fresh discards the upper layer, and
 	without these the box would silently come back based on DEV_BRANCH with no merge in progress —
 	i.e. quietly the wrong thing, which is worse than failing."""
@@ -624,7 +624,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		ensure_activity_hooks()
 	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at
 	# 127.0.0.1:(HUB_BASE_PORT + slot). The box gets PORT_FORWARDS + PORT_FORWARD_<NAME>_FROM/_TO_HUB so
-	# the project's own scripts can wire e.g. CLAUDEBOX_DEV_URL and the frontend's backend URL. Running
+	# the project's own scripts can wire e.g. MUSTER_DEV_URL and the frontend's backend URL. Running
 	# out of slots refuses the spawn (alloc_slot raises).
 	forwards = parse_port_forwards()
 	slot = alloc_slot(box_dir) if forwards else None
@@ -658,37 +658,37 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	record_volumes(name, vols)
 	env = dict(os.environ)
 	env.update(
-		CLAUDEBOX_HEADLESS="1",
-		CLAUDEBOX_DETACH="1",
-		CLAUDEBOX_IMAGE=BOX_IMAGE,
-		CLAUDEBOX_USER="dev",
-		CLAUDEBOX_UID=BOX_UID,
-		CLAUDEBOX_GID=BOX_GID,
-		CLAUDEBOX_NAME=container,
-		CLAUDEBOX_NETWORK=BOX_NETWORK,
-		CLAUDEBOX_SHARED=anchor,
-		CLAUDEBOX_CLAUDE_DIR=CLAUDE_HOME,
-		CLAUDEBOX_WORKDIR=checkout_dst,
-		CLAUDEBOX_CLAUDE_ARGS=claude_args,
-		CLAUDEBOX_PINCHTAB_SERVER=PT_SERVER,
-		CLAUDEBOX_PINCHTAB_TOKEN=PT_TOKEN,
-		CLAUDEBOX_EXTRA_MOUNTS="\n".join(mounts),
-		CLAUDEBOX_EXTRA_TMPFS="",
+		MUSTER_HEADLESS="1",
+		MUSTER_DETACH="1",
+		MUSTER_IMAGE=BOX_IMAGE,
+		MUSTER_USER="dev",
+		MUSTER_UID=BOX_UID,
+		MUSTER_GID=BOX_GID,
+		MUSTER_NAME=container,
+		MUSTER_NETWORK=BOX_NETWORK,
+		MUSTER_SHARED=anchor,
+		MUSTER_CLAUDE_DIR=CLAUDE_HOME,
+		MUSTER_WORKDIR=checkout_dst,
+		MUSTER_CLAUDE_ARGS=claude_args,
+		MUSTER_PINCHTAB_SERVER=PT_SERVER,
+		MUSTER_PINCHTAB_TOKEN=PT_TOKEN,
+		MUSTER_EXTRA_MOUNTS="\n".join(mounts),
+		MUSTER_EXTRA_TMPFS="",
 		# Project/service env (service-env), so a backend/frontend an AGENT starts is configured
 		# exactly like the one the hub starts. Some entries are rewritten per box below.
-		CLAUDEBOX_EXTRA_ENV="\n".join(svc_env),
+		MUSTER_EXTRA_ENV="\n".join(svc_env),
 		# Runs in the box's tmux window before claude: puts the box on its own agent/<name> branch,
-		# based on the hub's DEV_BRANCH, with the hub as its only remote (see box-bin/cbx-box-init).
-		CLAUDEBOX_INIT_CMD="cbx-box-init" if not checkout_ro else "",
-		CBX_BOX="" if checkout_ro else name,
-		CBX_HUB_GIT_URL=HUB_GIT_URL,
-		CBX_DEV_BRANCH=DEV_BRANCH,
+		# based on the hub's DEV_BRANCH, with the hub as its only remote (see box-bin/muster-box-init).
+		MUSTER_INIT_CMD="muster-box-init" if not checkout_ro else "",
+		MUSTER_BOX="" if checkout_ro else name,
+		MUSTER_HUB_GIT_URL=HUB_GIT_URL,
+		MUSTER_DEV_BRANCH=DEV_BRANCH,
 		# `cbx minto`: base the branch on something other than DEV_BRANCH, and (merge) leave that branch
 		# merged-and-conflicted before claude starts. Doing it in the INIT command rather than as a
 		# prompt is the point — a prompt is advisory and asynchronous, so "the agent never actually ran
 		# the setup" would be a failure you could only find by attaching to the tmux session.
-		CBX_BASE_BRANCH=job.get("base", ""),
-		CBX_MERGE_BRANCH=job.get("merge", ""),
+		MUSTER_BASE_BRANCH=job.get("base", ""),
+		MUSTER_MERGE_BRANCH=job.get("merge", ""),
 		HOME="/tmp",
 	)
 	forward_ports = {}
@@ -712,10 +712,10 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 			if e.startswith("FRONTEND_DEV_BACKEND_PATH="):
 				path = e.split("=", 1)[1]
 		svc_env.append(f"FRONTEND_DEV_BACKEND_URL_OWN=http://localhost:{forward_ports['BACKEND']}{path}")
-		env["CLAUDEBOX_EXTRA_ENV"] = "\n".join(svc_env)
-	proc = subprocess.run([CLAUDEBOX_SCRIPT], env=env, capture_output=True, text=True)
+		env["MUSTER_EXTRA_ENV"] = "\n".join(svc_env)
+	proc = subprocess.run([MUSTER_SCRIPT], env=env, capture_output=True, text=True)
 	if proc.returncode != 0:
-		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "claude-box.sh failed")
+		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "muster-box.sh failed")
 	start_forwarders(name, slot, forwards)  # after the box exists
 	return {"box": name, "container": container, "workdir": checkout_dst, "session": claude_args,
 	        "golden": os.path.basename(golden), "branch": f"agent/{name}",
@@ -817,7 +817,7 @@ def pull_box_image(wait=False):
 	skipped and failures are logged (not raised). wait=False (spawns) skips if a pull is already in
 	flight; wait=True (recreate) blocks for it then pulls, so the new box gets the newest image."""
 	if "/" not in BOX_IMAGE:
-		return  # bare local tag (e.g. build.sh's 'claude-box') — nothing to pull
+		return  # bare local tag (e.g. build.sh's 'muster') — nothing to pull
 	if not _pull_lock.acquire(blocking=wait):
 		return  # a pull is already running (and we're not waiting)
 	try:

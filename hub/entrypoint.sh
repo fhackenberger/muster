@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# claude-box-hub entrypoint. PID 1 under compose `init: true` (tini reaps zombies).
+# muster-hub entrypoint. PID 1 under compose `init: true` (tini reaps zombies).
 #
 # Brings up cheap: clone the repo on first boot, serve it to the boxes, start an idle tmux server,
 # then wait. The heavy dev services (backend / frontend / pinchtab) are started ON DEMAND via
@@ -130,6 +130,22 @@ check_mounts() {
 	[ "$drift" = 0 ] || echo "hub: fix with  ./gen-hub-mounts.sh && docker compose up -d hub  (on the host)" >&2
 }
 check_mounts || true
+
+# The stack's own name for the CLI. On the laptop each stack gets its own command family from a prefix
+# (`muster_stack app …` -> `app`, `apphub`, `appbox`, …), and it would be a poor joke if the name changed the
+# moment you stepped into the hub through `apphub`. So the hub answers to the same word.
+#
+# A SYMLINK, not a shell alias: it has to work in the tmux service commands, in `docker exec … cbx …`
+# from a script, and for the broker's own calls — none of which read a bashrc. `muster` itself always
+# stays, so anything that hard-codes it (docs, this entrypoint, older tooling) is unaffected.
+if [ -n "${MUSTER_PREFIX:-}" ] && [ "$MUSTER_PREFIX" != muster ]; then
+	case "$MUSTER_PREFIX" in
+		[a-z][a-z0-9_]*)
+			ln -sf /usr/local/bin/muster "/usr/local/bin/$MUSTER_PREFIX" \
+				&& echo "hub: muster is also available as '$MUSTER_PREFIX'" ;;
+		*) echo "hub: ignoring MUSTER_PREFIX='$MUSTER_PREFIX' — must start with a lowercase letter, then letters/digits/_" >&2 ;;
+	esac
+fi
 
 # Idle tmux server with a landing window, so `cbx up` has somewhere to add service windows and you
 # can always attach a shell. tmux keeps running as long as the session lives.

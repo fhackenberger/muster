@@ -1,10 +1,10 @@
 # Dockerfile.addon — YOUR project's build toolchain layered onto EITHER base image. Written ONCE for
 # both add-on images; pick the base with BASE_IMAGE:
-#   box add-on:  --build-arg BASE_IMAGE=claude-box                                      -> claude-box-<project>
-#   hub add-on:  --build-arg BASE_IMAGE=claude-box-hub-base --build-arg FINAL_USER=1000 -> claude-box-hub
+#   box add-on:  --build-arg BASE_IMAGE=muster                                      -> muster-<project>
+#   hub add-on:  --build-arg BASE_IMAGE=muster-hub-base --build-arg FINAL_USER=1000 -> muster-hub
 #
 # The toolchain itself is not in here: SETUP_SCRIPT names a script IN THE BUILD CONTEXT (= the
-# claude-box dir) that installs it, so the ONE add-on Dockerfile serves every project and the
+# muster dir) that installs it, so the ONE add-on Dockerfile serves every project and the
 # versions live in one place. It defaults to `build-setup.sh` — YOUR file, made from the shipped
 # `build-setup.sh.example` (and gitignored, like service-env and mounts). Keep several and choose
 # between them with --build-arg SETUP_SCRIPT=…, or set it under `hub: build: args:` in

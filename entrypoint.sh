@@ -3,10 +3,10 @@ set -e
 
 # Runs as root. Recreates the host user inside the container so /etc/passwd, $HOME, and the
 # bind mounts under /home/<user> all line up with whoever launched the box, then drops to that
-# user. The identity is passed by claude-box.sh:
-: "${HOST_USER:?entrypoint: HOST_USER not set (run via claude-box.sh)}"
-: "${HOST_UID:?entrypoint: HOST_UID not set (run via claude-box.sh)}"
-: "${HOST_GID:?entrypoint: HOST_GID not set (run via claude-box.sh)}"
+# user. The identity is passed by muster-box.sh:
+: "${HOST_USER:?entrypoint: HOST_USER not set (run via muster-box.sh)}"
+: "${HOST_UID:?entrypoint: HOST_UID not set (run via muster-box.sh)}"
+: "${HOST_GID:?entrypoint: HOST_GID not set (run via muster-box.sh)}"
 
 # Primary group (match by GID; reuse whatever name already owns it).
 if ! getent group "$HOST_GID" >/dev/null 2>&1; then
@@ -20,8 +20,8 @@ fi
 USER_NAME="$(getent passwd "$HOST_UID" | cut -d: -f1)"
 
 # Set the clipboard proxy's UID to the runtime value (passed from the settings file) so it
-# matches the host 'claude-box-clip' account the X server authorizes — no rebuild to change it.
-CLIP_USER="claude-box-clip"
+# matches the host 'muster-clip' account the X server authorizes — no rebuild to change it.
+CLIP_USER="muster-clip"
 CLIP_UID="${CLIP_UID:-60001}"
 if [ "$CLIP_UID" = "$HOST_UID" ]; then
 	echo "entrypoint: CLIP_UID ($CLIP_UID) must differ from your UID ($HOST_UID)" >&2
@@ -65,10 +65,10 @@ case "${1:-}" in
 	claude) [ -t 0 ] && stty susp undef 2>/dev/null || true ;;
 esac
 
-# --root (claude-box.sh): stay root and exec the command directly, skipping the privilege drop.
+# --root (muster-box.sh): stay root and exec the command directly, skipping the privilege drop.
 # The identity + bind mounts above are still set up so paths line up; this is just for in-box
 # administration (apt install, etc).
-if [ "${CLAUDEBOX_ROOT:-}" = "1" ]; then
+if [ "${MUSTER_ROOT:-}" = "1" ]; then
 	exec "$@"
 fi
 

@@ -4,11 +4,11 @@
 ./tests/run-tests.sh              # everything (~40s)
 ./tests/run-tests.sh minto        # only tests whose name matches
 KEEP=1 ./tests/run-tests.sh       # keep the scratch fixtures to poke at
-CBX_BIN=/tmp/cbx ./tests/run-tests.sh   # test a modified copy
+MUSTER_BIN=/tmp/cbx ./tests/run-tests.sh   # test a modified copy
 ```
 
 **No docker, no network, no running stack.** What's under test is the part that holds the logic:
-`hub/cbx` (all of it), `box-bin/cbx-box-init`, and `box-broker/broker.py`'s pure helpers. The broker
+`hub/muster` (all of it), `box-bin/muster-box-init`, and `box-broker/broker.py`'s pure helpers. The broker
 is replaced by `tests/stub-broker.py` — same HTTP contract, records every request as JSON so a test
 can assert on *what cbx asked it to do* — and every git operation runs against a scratch repo with a
 bare "origin" beside it. Runs in the Jenkins pipeline before any image is built.
@@ -36,7 +36,7 @@ empty state dirs, with every path cbx reads exported. Helpers live in `lib.sh`:
 | | |
 |---|---|
 | `cbx …` | run cbx → `$OUT`, `$RC` |
-| `cbx_tty "a\|m" merge x --reword` | drive an interactive prompt over a PTY (see below) |
+| `muster_tty "a\|m" merge x --reword` | drive an interactive prompt over a PTY (see below) |
 | `handoff <box> [n]` | n commits on top of dev, pushed to `refs/agents/<box>`, with a note |
 | `commit_on <start> <newref\|-> <msg> <file> <content>` | a commit, without moving the hub's checkout |
 | `box_up <box>` | register a box with the stub broker so `ls`/`kill`/`say` behave |
@@ -49,9 +49,9 @@ Two conventions worth knowing, because both encode a real property of the system
   throwaway linked worktrees (`commit_on`) rather than by checking anything out. The one exception is
   a commit *on* `dev` itself, which `commit_on` makes in place — moving the checked-out branch with
   `update-ref` would leave a stale index and every later command would see phantom staged changes.
-- **Interactive prompts need `cbx_tty`, not a pipe.** cbx drops pending terminal input before drawing
+- **Interactive prompts need `muster_tty`, not a pipe.** cbx drops pending terminal input before drawing
   a prompt (`tty_flush`, so a review TUI's leftover keystrokes can't answer the next question), which
-  eats piped input before the prompt exists. `cbx_tty` runs cbx under `script` and feeds keys with a
+  eats piped input before the prompt exists. `muster_tty` runs cbx under `script` and feeds keys with a
   delay, which is also a more faithful test of what a person does.
 
 ## Checking the suite has teeth
@@ -59,9 +59,9 @@ Two conventions worth knowing, because both encode a real property of the system
 Mutate a copy and confirm the *right* test goes red:
 
 ```sh
-cp hub/cbx /tmp/cbx
+cp hub/muster /tmp/cbx
 sed -i 's/die "refusing to merge a minto box into $DEV"/true/' /tmp/cbx
-CBX_BIN=/tmp/cbx ./tests/run-tests.sh      # -> FAIL minto: --box queue, review and land
+MUSTER_BIN=/tmp/cbx ./tests/run-tests.sh      # -> FAIL minto: --box queue, review and land
 ```
 
 Three such mutations are checked by hand whenever the suite changes: reverting the review

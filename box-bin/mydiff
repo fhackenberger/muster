@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # Review this before running `handoff` — anything you catch here is a review round you don't spend.
 
-DEV="${CBX_DEV_BRANCH:-dev}"
+DEV="${MUSTER_DEV_BRANCH:-dev}"
 cd "$(git rev-parse --show-toplevel)"
 
 git fetch -q hub 2>/dev/null || true

@@ -1,30 +1,30 @@
 #!/bin/bash
 set -euo pipefail
 
-# Builds the claude-box image LOCALLY, tagged `claude-box` (= claude-box:latest). This is the dev
-# escape hatch: CI (the Jenkinsfile) builds the same image and tags it `claude-box:stable`, which is
-# what claude-box.sh defaults to — so after building here, run the box against YOUR build by setting
-# CLAUDEBOX_IMAGE=claude-box in ~/.config/claude-box/config (or exporting it).
+# Builds the muster image LOCALLY, tagged `muster` (= muster:latest). This is the dev
+# escape hatch: CI (the Jenkinsfile) builds the same image and tags it `muster:stable`, which is
+# what muster-box.sh defaults to — so after building here, run the box against YOUR build by setting
+# MUSTER_IMAGE=muster in ~/.config/muster/config (or exporting it).
 #
 # This builds the BASE box image only. A project's toolchain is layered on top by Dockerfile.addon
-# (--build-arg BASE_IMAGE=claude-box --build-arg SETUP_SCRIPT=build-setup.sh).
+# (--build-arg BASE_IMAGE=muster --build-arg SETUP_SCRIPT=build-setup.sh).
 #
 # The clip UID is NOT baked in — it's applied at container start from the settings file — so this is
 # a plain build and you only need to rebuild when the Dockerfile/entrypoint change, not when you
 # change the UID. docker is elevated automatically if the daemon needs it.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-box/config"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/muster/config"
 # shellcheck source=/dev/null
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
-IMAGE="${CLAUDEBOX_IMAGE:-claude-box}"
+IMAGE="${MUSTER_IMAGE:-muster}"
 
 # Capture the node/npm versions currently active on the host (typically via fnm) and pin the
 # container's toolchain to match. Override by exporting NODE_VERSION / NPM_VERSION before building.
 NODE_VERSION="${NODE_VERSION:-$(node --version 2>/dev/null || true)}"
 NPM_VERSION="${NPM_VERSION:-$(npm --version 2>/dev/null || true)}"
 if [ -z "$NODE_VERSION" ] || [ -z "$NPM_VERSION" ]; then
-	echo "claude-box: node/npm not found on PATH — cannot pin the container toolchain" >&2
-	echo "claude-box: activate your fnm node (or set NODE_VERSION / NPM_VERSION) and retry" >&2
+	echo "muster: node/npm not found on PATH — cannot pin the container toolchain" >&2
+	echo "muster: activate your fnm node (or set NODE_VERSION / NPM_VERSION) and retry" >&2
 	exit 1
 fi
 
@@ -36,7 +36,7 @@ if command -v pinchtab >/dev/null 2>&1; then
 	PINCHTAB_VERSION="${PINCHTAB_VERSION:-$(pinchtab --version 2>/dev/null | awk '{print $NF}')}"
 fi
 if [ -z "${PINCHTAB_VERSION:-}" ]; then
-	echo "claude-box: pinchtab not found on PATH — not pinning the container CLI; using the Dockerfile default version." >&2
+	echo "muster: pinchtab not found on PATH — not pinning the container CLI; using the Dockerfile default version." >&2
 fi
 
 BUILD_ARGS=(
@@ -58,5 +58,5 @@ if [ -n "${TUICR_VERSION:-}" ]; then BUILD_ARGS+=(--build-arg TUICR_VERSION="$TU
 DOCKER="docker"
 docker info >/dev/null 2>&1 || DOCKER="sudo docker"
 
-echo "claude-box: building '$IMAGE' (node ${NODE_VERSION} / npm ${NPM_VERSION} / pinchtab ${PINCHTAB_VERSION:-default}${CLAUDE_REFRESH:+ / claude-refresh ${CLAUDE_REFRESH}})" >&2
+echo "muster: building '$IMAGE' (node ${NODE_VERSION} / npm ${NPM_VERSION} / pinchtab ${PINCHTAB_VERSION:-default}${CLAUDE_REFRESH:+ / claude-refresh ${CLAUDE_REFRESH}})" >&2
 exec $DOCKER build "${BUILD_ARGS[@]}" -t "$IMAGE" "$HERE"

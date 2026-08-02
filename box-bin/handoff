@@ -11,7 +11,7 @@ set -euo pipefail
 # commit message. Force-push is intentional and safe: refs/agents/<box> is this box's OWN ref, and
 # amending/rebasing during a fix round is normal.
 
-: "${CBX_BOX:?handoff: CBX_BOX not set (this only works inside a server-mode box)}"
+: "${MUSTER_BOX:?handoff: MUSTER_BOX not set (this only works inside a server-mode box)}"
 cd "$(git rev-parse --show-toplevel)"
 
 summary="$*"
@@ -29,10 +29,10 @@ if [ -n "$summary" ]; then
 	git notes --ref=cbx add -f -m "$summary" HEAD
 fi
 
-git push -q -f hub "HEAD:refs/agents/${CBX_BOX}"
+git push -q -f hub "HEAD:refs/agents/${MUSTER_BOX}"
 git notes --ref=cbx list >/dev/null 2>&1 && git push -q -f hub refs/notes/cbx:refs/notes/cbx || true
 
-ahead="$(git rev-list --count "hub/${CBX_DEV_BRANCH:-dev}..HEAD" 2>/dev/null || echo '?')"
-echo "handoff: pushed ${branch} -> refs/agents/${CBX_BOX} (${ahead} commit(s) ahead of ${CBX_DEV_BRANCH:-dev})"
+ahead="$(git rev-list --count "hub/${MUSTER_DEV_BRANCH:-dev}..HEAD" 2>/dev/null || echo '?')"
+echo "handoff: pushed ${branch} -> refs/agents/${MUSTER_BOX} (${ahead} commit(s) ahead of ${MUSTER_DEV_BRANCH:-dev})"
 [ -n "$summary" ] && echo "handoff: summary recorded — the reviewer sees it in 'cbx q'"
 echo "handoff: waiting for review. Feedback arrives as a message in this session."

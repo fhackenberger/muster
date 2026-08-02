@@ -5,9 +5,9 @@
 #     # in .env:
 #     COMPOSE_FILE=compose.yml:compose.project.yml:compose.override.yml
 #
-# Why a separate file: compose.yml is claude-box itself (hub + box-broker) and is the same for every
+# Why a separate file: compose.yml is muster itself (hub + box-broker) and is the same for every
 # project. A database, a message broker, a cache or a seed-data mount are YOURS — keeping them here
-# means a claude-box upgrade never has to be merged into a file you have edited.
+# means a muster upgrade never has to be merged into a file you have edited.
 #
 # THE TRAP: setting COMPOSE_FILE at all disables compose's automatic loading of
 # `compose.override.yml` — the file `gen-hub-mounts.sh` renders the hub's half of the `mounts` table

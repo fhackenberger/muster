@@ -1,6 +1,6 @@
-# claude-box — the LEAN, project-agnostic agent base: debian:trixie-slim + common-setup.sh (node,
+# muster — the LEAN, project-agnostic agent base: debian:trixie-slim + common-setup.sh (node,
 # pinchtab, git, socat, …) + Claude + the clipboard proxy. No JDK/gradle — YOUR project's build
-# toolchain layers on top via Dockerfile.addon (-> claude-box-<project>, what the broker spawns).
+# toolchain layers on top via Dockerfile.addon (-> muster-<project>, what the broker spawns).
 FROM debian:trixie-slim
 
 # Minimal deps needed just to install Claude below (ca-certificates + curl). The rest of the shared
@@ -79,7 +79,7 @@ ENV LANG=C.UTF-8
 # Unprivileged identity that is the ONLY X client authorized to touch the clipboard. The UID
 # here is just a placeholder — the entrypoint resets it at startup to the runtime CLIP_UID,
 # so changing the UID needs no rebuild, only the settings file + a matching host account.
-ARG CLIP_USER=claude-box-clip
+ARG CLIP_USER=muster-clip
 RUN useradd -r -u 60001 -M -s /usr/sbin/nologin ${CLIP_USER} \
 	&& groupadd clipusers
 
@@ -91,9 +91,9 @@ RUN printf '%s\n' \
 		'Defaults:%clipusers !requiretty, !use_pty' \
 		'Defaults:%clipusers env_keep += "DISPLAY"' \
 		'%clipusers ALL=('"${CLIP_USER}"') NOPASSWD: /usr/bin/xclip, /usr/bin/xsel' \
-		> /etc/sudoers.d/claude-box-clip \
-	&& chmod 0440 /etc/sudoers.d/claude-box-clip \
-	&& visudo -cf /etc/sudoers.d/claude-box-clip
+		> /etc/sudoers.d/muster-clip \
+	&& chmod 0440 /etc/sudoers.d/muster-clip \
+	&& visudo -cf /etc/sudoers.d/muster-clip
 
 # Transparent shims: identical CLI to the real tools (argv, stdin/stdout, exit code all pass
 # straight through), routed through the unprivileged clip user. /usr/local/bin precedes /usr/bin
@@ -103,15 +103,15 @@ RUN for t in xclip xsel; do \
 		&& chmod 0755 /usr/local/bin/$t; \
 	done
 
-# Agent-side git CLIs (server mode only; harmless on a laptop box, where CBX_BOX is unset):
-#   cbx-box-init  puts the box on its own agent/<box> branch against the hub (run by claude-box.sh
-#                 via CLAUDEBOX_INIT_CMD before claude starts)
+# Agent-side git CLIs (server mode only; harmless on a laptop box, where MUSTER_BOX is unset):
+#   muster-box-init  puts the box on its own agent/<box> branch against the hub (run by muster-box.sh
+#                 via MUSTER_INIT_CMD before claude starts)
 #   handoff       push the branch to the hub for review, with a summary as a git note
 #   mydiff        exactly what this box will hand over (its branch vs the hub's dev)
-#   cbx-activity  Claude Code hook: records busy/idle/waiting for the hub (see cbx ls / cbx status)
-COPY box-bin/cbx-box-init box-bin/handoff box-bin/mydiff box-bin/cbx-activity /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/cbx-box-init /usr/local/bin/handoff /usr/local/bin/mydiff \
-	/usr/local/bin/cbx-activity
+#   muster-activity  Claude Code hook: records busy/idle/waiting for the hub (see cbx ls / cbx status)
+COPY box-bin/muster-box-init box-bin/handoff box-bin/mydiff box-bin/muster-activity /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/muster-box-init /usr/local/bin/handoff /usr/local/bin/mydiff \
+	/usr/local/bin/muster-activity
 
 # Root entrypoint: materialize the runtime user from HOST_USER/UID/GID, then drop privileges.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

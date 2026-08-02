@@ -1,17 +1,17 @@
-# claude-box-hub-base — the PROJECT-AGNOSTIC hub base image.
+# muster-hub-base — the PROJECT-AGNOSTIC hub base image.
 #
 # debian:trixie-slim + common-setup.sh (the same generic runtime the box uses) + the hub-only tooling:
 # openssh, Google Chrome (for the pinchtab server), git-ssh, cbx, and the hub entrypoint. No JDK/gradle
-# — your project's build toolchain layers on top via Dockerfile.addon (-> claude-box-hub).
+# — your project's build toolchain layers on top via Dockerfile.addon (-> muster-hub).
 #
 # The hub runs headless as a single uid-1000 user 'dev' with home /home/dev — the SAME identity the
 # boxes use on the server — so every bind mount (/home/dev/.claude, .pinchtab, .gitidentity, .npm,
 # .gradle, .m2) and the shared caches land at one path everywhere. (The box materializes its user
 # dynamically at runtime; the hub's is created here.)
 #
-# BUILD CONTEXT = the claude-box dir (NOT hub/), so this can COPY the shared common-setup.sh at its
+# BUILD CONTEXT = the muster dir (NOT hub/), so this can COPY the shared common-setup.sh at its
 # root; the hub's own files are referenced as hub/<file>. Build it with, e.g.:
-#   docker build -f hub/Dockerfile.base -t claude-box-hub-base .
+#   docker build -f hub/Dockerfile.base -t muster-hub-base .
 FROM debian:trixie-slim
 
 # The hub's uid-1000 user. Home /home/dev matches the boxes' server user, unifying every bind-mount path.
@@ -20,7 +20,7 @@ RUN groupadd -g 1000 dev \
 
 # Shared tooling (base utils, Node + npm via fnm, the pinchtab binary, the tuicr review TUI, tmux, git
 # bash-completion, the ghostty terminfo, socat) — installed by common-setup.sh, the SAME script the
-# claude-box image uses.
+# muster image uses.
 ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
 ARG PINCHTAB_VERSION=0.13.2
@@ -61,9 +61,9 @@ RUN chmod 0755 /usr/local/bin/git-ssh \
 	&& git config --system core.sshCommand /usr/local/bin/git-ssh
 
 # Helper CLI (cbx: start/stop services, spawn/kill/recreate boxes via the broker) + entrypoint.
-COPY hub/cbx /usr/local/bin/cbx
+COPY hub/muster /usr/local/bin/muster
 COPY hub/entrypoint.sh /usr/local/bin/hub-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/cbx /usr/local/bin/hub-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/muster /usr/local/bin/hub-entrypoint.sh
 
 USER 1000
 WORKDIR /home/dev

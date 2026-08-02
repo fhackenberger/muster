@@ -1,0 +1,79 @@
+# Publish the three PROJECT-AGNOSTIC images to GHCR. See docs/adr/0001-image-builds.md for why these
+# three and not the other two.
+#
+#   muster            the box base   — node, claude, tuicr, pinchtab, git, tmux, clipboard
+#   muster-hub-base   the hub base   — the above + openssh, Chrome, git-ssh, the muster CLI
+#   muster-broker     the broker     — python + docker CLI; no toolchain, ever
+#
+# The two ADD-ON images (muster-<project>, muster-hub) are deliberately absent: they are ten lines of
+# `FROM <base>` + your build-setup.sh, so only you can build them and nobody else can use them.
+#
+# WHY TAGS, NOT BRANCHES, ARE WHAT MATTERS HERE. common-setup.sh resolves the LATEST node, claude and
+# tuicr at build time, so a commit does not identify an artifact — two builds of the same source
+# produce different images. The version tag is therefore the only thing that pins a tested
+# combination, which is the main reason to publish at all. A moving `latest` is published beside it
+# for convenience; do not deploy from it.
+name: images
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:        # for a rebuild when a base OS or a pinned CLI needs picking up
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # A broken muster must never reach an image; the suite is the gate.
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  images:
+    needs: tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: muster
+            dockerfile: Dockerfile
+          - name: muster-hub-base
+            dockerfile: hub/Dockerfile.base
+          - name: muster-broker
+            dockerfile: box-broker/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          # The build context is the repository root for ALL of them — the Dockerfiles COPY shared
+          # files (common-setup.sh, entrypoint.sh, muster-box.sh) that live there, so a per-image
+          # context would break them.
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The version knobs are build-args on purpose: this is where "latest" gets frozen into a
+          # release. Bump them in one place — see docs/adr/0001-image-builds.md.
+          build-args: |
+            NODE_VERSION=${{ vars.NODE_VERSION || 'v26.2.0' }}
+            NPM_VERSION=${{ vars.NPM_VERSION || '11.13.0' }}
+            PINCHTAB_VERSION=${{ vars.PINCHTAB_VERSION || '0.13.2' }}
+            TUICR_VERSION=${{ vars.TUICR_VERSION || '0.19.1' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

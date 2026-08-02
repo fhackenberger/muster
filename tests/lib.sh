@@ -43,18 +43,18 @@ fail() {                                 # fail <message> [detail…]
 
 # Run cbx, capturing stdout+stderr into $OUT and the status into $RC. Never fails the shell.
 cbx() {
-	OUT="$(bash "$CBX_BIN" "$@" </dev/null 2>&1)"; RC=$?
+	OUT="$(bash "$MUSTER_BIN" "$@" </dev/null 2>&1)"; RC=$?
 	return 0
 }
 
 # Same, but with a PTY and keystrokes fed in with human-ish delays. cbx's prompts read from /dev/tty
 # and drop pending input first (tty_flush), so a plain pipe would have its answers eaten before the
 # prompt is even drawn — the delay is what makes the input land after each prompt.
-cbx_tty() {
+muster_tty() {
 	local keys="$1"; shift
 	local args; printf -v args ' %q' "$@"
 	OUT="$( { IFS='|'; for k in $keys; do sleep 0.25; printf '%s\n' "$k"; done; sleep 0.4; } \
-		| script -qec "bash $CBX_BIN$args" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
+		| script -qec "bash $MUSTER_BIN$args" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
 	return 0
 }
 
@@ -97,7 +97,7 @@ fixture() {
 	export BOXES_DIR="$FIX/boxes" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging"
 	export HUB_SERVICES_DIR="$FIX/services"
 	export BROKER_URL="http://127.0.0.1:$STUB_PORT" BROKER_TOKEN=test
-	export CBX_COLOR=never CBX_REVIEW_TUI=- GOLDEN_PREP_CMD=true
+	export MUSTER_COLOR=never MUSTER_REVIEW_TUI=- GOLDEN_PREP_CMD=true
 	export HUB_GIT_URL="$FIX/repo"
 	: > "$STUB_LOG"
 }
@@ -147,6 +147,64 @@ handoff() {
 
 # Register a box with the stub broker, so `cbx ls`/`kill`/`say` behave as if it were running.
 box_up() { curl -s -X POST -H "X-Broker-Token: test" "$BROKER_URL/box/$1" >/dev/null; }
+
+# ---------------------------------------------------------------- the laptop aliases
+#
+# muster.bash_aliases builds COMMAND STRINGS and hands them to ssh; almost every bug it can have is a
+# quoting or a PTY bug in one of those strings. So the harness is a stub `ssh` that records its argv
+# and answers the one query the aliases actually parse (cbxtun's container-IP lookup). Nothing needs
+# a server, and what a test asserts on is the exact command that WOULD have been run.
+
+alias_fixture() {
+	mkdir -p "$FIX/bin"
+	SSH_LOG="$FIX/ssh.log"; : > "$SSH_LOG"
+	cat > "$FIX/bin/ssh" <<'EOF'
+#!/bin/bash
+printf 'ssh %s\n' "$*" >> "$MUSTER_SSH_LOG"
+# cbxtun resolves container IPs with `ssh <server> bash -s <proj> <target…>` and a heredoc on stdin.
+# Answer in its format ("<target> <ip>") so the rest of the function runs for real.
+prev=""; targets=(); proj=""
+for a in "$@"; do
+	if [ "$prev" = "-s" ]; then proj="$a"; prev=x; continue; fi
+	[ "$a" = "-s" ] && prev=-s
+	[ -n "$proj" ] && [ "$a" != "$proj" ] && targets+=("$a")
+done
+if [ -n "$proj" ]; then
+	cat >/dev/null                       # swallow the heredoc
+	n=1; for t in "${targets[@]}"; do printf '%s 10.0.0.%s\n' "$t" "$n"; n=$((n + 1)); done
+	exit 0
+fi
+# Deliberately does NOT read stdin otherwise: the real ssh would, but a stub that blocks on an
+# inherited terminal hangs the whole suite. A writer upstream (cbximport, cbxcp) just gets EPIPE.
+exit 0
+EOF
+	cat > "$FIX/bin/mosh" <<'EOF'
+#!/bin/bash
+printf 'mosh %s\n' "$*" >> "$MUSTER_SSH_LOG"
+EOF
+	chmod +x "$FIX/bin/ssh" "$FIX/bin/mosh"
+}
+
+# al '<shell code>' — run code with the aliases sourced against a fake stack.
+# $OUT = stdout+stderr, $SSHLOG = every ssh/mosh invocation it made, $RC = status.
+# TTY=1 al '…' runs it under a real pseudo-terminal, which is how the `-t`/`-T` decisions are tested.
+al() {
+	: > "$SSH_LOG"
+	local pre="source '$ROOT/muster.bash_aliases';"
+	[ -z "${AL_PROJECT_FILE:-}" ] || pre="$pre source '$ROOT/muster.bash_aliases.project.example';"
+	local env="PATH=$FIX/bin:$PATH MUSTER_SSH_LOG=$SSH_LOG MUSTER_SERVER=${AL_SERVER:-root@test.example} MUSTER_PROJECT=${AL_PROJECT:-proj}"
+	if [ -n "${TTY:-}" ] && command -v script >/dev/null; then
+		OUT="$(script -qec "env $env bash -c \"$pre $1\"" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
+	else
+		OUT="$(env $env bash -c "$pre $1" </dev/null 2>&1)"; RC=$?
+	fi
+	SSHLOG="$(cat "$SSH_LOG")"
+	return 0
+}
+
+# Assertions against the recorded ssh invocations.
+ssh_has()   { case "$SSHLOG" in *"$1"*) ;; *) fail "no ssh invocation contained: $1" "log: $SSHLOG" ;; esac; }
+ssh_hasnt() { case "$SSHLOG" in *"$1"*) fail "an ssh invocation should NOT contain: $1" "log: $SSHLOG" ;; esac; }
 
 # What the stub was asked. `stub_saw POST /box/x/say` -> 0 if such a request was recorded.
 stub_saw() { grep -q "\"method\": \"$1\", \"path\": \"$2\"" "$STUB_LOG"; }

@@ -29,6 +29,12 @@
       - "--exclude=.*.swp"
       # Generated on the HOST from `mounts` (see below) — never ship a developer's local copy.
       - "--exclude=compose.override.yml"
+      # Repository furniture, not stack files: CI definitions, the ADRs, the migration tooling and the
+      # test suite are read on a developer's machine and have no business on a server.
+      - "--exclude=.github"
+      - "--exclude=docs"
+      - "--exclude=tools"
+      - "--exclude=tests"
   tags: [containers-claude-box-files]
 
 # Take care of setting special permissions: boxes + hub run as uid 1000. data/ itself plus every

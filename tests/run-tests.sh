@@ -1,11 +1,11 @@
 #!/bin/bash
-# run-tests.sh — the claude-box test suite.
+# run-tests.sh — the muster test suite.
 #
 #     ./tests/run-tests.sh              # everything
 #     ./tests/run-tests.sh minto        # only tests whose name matches
 #     KEEP=1 ./tests/run-tests.sh       # keep the scratch fixtures for poking at
 #
-# WHAT IS ACTUALLY UNDER TEST: `hub/cbx` (all of it), `box-bin/cbx-box-init`, and `broker.py`'s
+# WHAT IS ACTUALLY UNDER TEST: `hub/muster` (all of it), `box-bin/muster-box-init`, and `broker.py`'s
 # pure-python helpers. Nothing here needs docker, a network, or the real stack — the broker is
 # replaced by tests/stub-broker.py (same HTTP contract, records what it was asked) and every git
 # operation runs against a scratch repo with a bare "origin" beside it.
@@ -22,8 +22,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 # Overridable so you can point the suite at a modified copy — which is also how the suite itself is
 # checked for teeth: mutate a copy, confirm the right test goes red.
-CBX_BIN="${CBX_BIN:-$ROOT/hub/cbx}"
-BOX_INIT="$ROOT/box-bin/cbx-box-init"
+MUSTER_BIN="${MUSTER_BIN:-$ROOT/hub/muster}"
+BOX_INIT="$ROOT/box-bin/muster-box-init"
 BROKER_PY="$ROOT/box-broker/broker.py"
 FILTER="${1:-}"
 
@@ -62,13 +62,13 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 	sleep 0.2
 done
 
-echo "cbx test suite — $CBX_BIN"
+echo "cbx test suite — $MUSTER_BIN"
 echo
 
 # =====================================================================  basics
 
 test_syntax() {
-	for f in "$CBX_BIN" "$BOX_INIT" "$ROOT/gen-hub-mounts.sh" "$ROOT/entrypoint.sh" \
+	for f in "$MUSTER_BIN" "$BOX_INIT" "$ROOT/gen-hub-mounts.sh" "$ROOT/entrypoint.sh" \
 	         "$ROOT/hub/entrypoint.sh" "$ROOT/box-bin/handoff"; do
 		[ -f "$f" ] || continue
 		OUT="$(bash -n "$f" 2>&1)"; RC=$?
@@ -82,27 +82,27 @@ test_syntax() {
 # stopped covering the usage list as commands were added — `cbx push` had fallen off the end.
 test_help_covers_every_command() {
 	local dispatch documented missing
-	dispatch="$(awk '/^cmd="\$\{1:-\}"/,0' "$CBX_BIN" \
+	dispatch="$(awk '/^cmd="\$\{1:-\}"/,0' "$MUSTER_BIN" \
 		| sed -n 's/^[[:space:]]*\([a-z|]*\))[[:space:]].*/\1/p' | tr '|' '\n' | grep . | sort -u)"
 	cbx --help
-	documented="$(printf '%s\n' "$OUT" | sed -n 's/^ *cbx \([a-z]*\).*/\1/p' | sort -u)"
+	documented="$(printf '%s\n' "$OUT" | sed -n 's/^ *muster \([a-z]*\).*/\1/p' | sort -u)"
 	# Aliases and `golden` subcommands are documented on their parent's line, not their own.
 	missing="$(comm -23 <(printf '%s\n' "$dispatch") <(printf '%s\n' "$documented") \
 		| grep -vx 'seal\|snapshot\|reap\|ls\|st\|queue\|services')"
 	eq "$missing" "" "these subcommands are not in cbx --help"
-	has "cbx push"
-	has "cbx pull"
-	has "cbx minto"
-	has "cbx export"
+	has "muster push"
+	has "muster pull"
+	has "muster minto"
+	has "muster export"
 }
 
 test_unknown_command_prints_usage() {
 	cbx bogus-subcommand
 	notok
-	has "cbx svcs"
+	has "muster svcs"
 }
 
-# The source tree must stay PROJECT-AGNOSTIC: claude-box is published on its own, so a project name,
+# The source tree must stay PROJECT-AGNOSTIC: muster is published on its own, so a project name,
 # a private registry or a real credential leaking into a tracked file is a release bug, not a style
 # nit. This is the cheap, mechanical half of that check (the rest is the secret scan in
 # tools/split-out.sh, which reads history rather than the tip).
@@ -116,11 +116,17 @@ test_no_project_defaults() {
 	exists "$ROOT/.env.example"
 	exists "$ROOT/service-env.example"
 	exists "$ROOT/compose.project.yml.example"
-	exists "$ROOT/cbx.bash_aliases.project.example"
-	# The build toolchain is the PROJECT's, so claude-box ships only an example of one. (The real
+	exists "$ROOT/muster.bash_aliases.project.example"
+	# The build toolchain is the PROJECT's, so muster ships only an example of one. (The real
 	# build-setup.sh beside it is not asserted either way: the consuming repo tracks its own, and
-	# claude-box itself must never ship one — which the split's expected-file list enforces.)
+	# muster itself must never ship one — which the split's expected-file list enforces.)
 	exists "$ROOT/build-setup.sh.example"
+	# A public repository needs these; forgetting one is the sort of thing nobody notices until the
+	# repo is already out there.
+	for f in LICENSE README.md SECURITY.md CONTRIBUTING.md CHANGELOG.md .github/workflows/tests.yml; do
+		exists "$ROOT/$f"
+	done
+	OUT="$(head -3 "$ROOT/LICENSE" 2>/dev/null)"; has "Apache License"
 	# ...and the real ones must NOT be in the source tree.
 	absent "$ROOT/service-env"
 	# compose.yml is the STACK only. The project's own services live in compose.project.yml, so none
@@ -135,22 +141,47 @@ test_no_project_defaults() {
 	# business in a public repo just because they made a convenient sample.
 	#
 	# No hard-coded private registry, and no project/org/host NAME in anything that ships. The bare
-	# names matter, not just the compound ones: an `ARG SETUP_SCRIPT=examples/infostars/build-setup.sh`
-	# default once survived a version of this check that only looked for infostarsFrontend/infostarsWeb.
-	OUT="$(grep -rniE -e 'dockerregistry\.acoveo\.com' -e 'infostars|acoveo|hetzner' "$ROOT/compose.yml" \
-		"$ROOT/.env.example" "$ROOT/claude-box.sh" "$ROOT/hub/cbx" "$ROOT/cbx.bash_aliases" \
+	# names matter, not just the compound ones: an `ARG SETUP_SCRIPT=examples/myapp/build-setup.sh`
+	# default once survived a version of this check that only looked for myappFrontend/myappWeb.
+	OUT="$(grep -rniE -e 'dockerregistry\.acoveo\.com' -e 'acoveo' "$ROOT/compose.yml" \
+		"$ROOT/.env.example" "$ROOT/muster-box.sh" "$ROOT/hub/muster" "$ROOT/muster.bash_aliases" \
 		"$ROOT/Dockerfile" "$ROOT/hub/Dockerfile.base" "$ROOT/Dockerfile.addon" \
 		"$ROOT/common-setup.sh" "$ROOT/build-setup.sh.example" \
 		"$ROOT/service-env.example" "$ROOT/compose.project.yml.example" \
-		"$ROOT/cbx.bash_aliases.project.example" "$ROOT/hub-services.example" \
-		"$ROOT/.gitignore" 2>/dev/null)"
+		"$ROOT/muster.bash_aliases.project.example" "$ROOT/hub-services.example" \
+		"$ROOT/.gitignore" "$ROOT/README.md" "$ROOT/SECURITY.md" "$ROOT/CONTRIBUTING.md" \
+		"$ROOT/CHANGELOG.md" "$ROOT/README-remote.md" "$ROOT/docs" "$ROOT/.github" 2>/dev/null)"
 	[ -z "$OUT" ] || fail "project/registry specifics leaked into a generic file"
-	# GOLDEN_PREP_CMD defaults to a no-op: claude-box knows nothing about anyone's build. Asserted on
+	# GOLDEN_PREP_CMD defaults to a no-op: muster knows nothing about anyone's build. Asserted on
 	# the assignment itself rather than by sourcing cbx, which would run the whole script.
-	OUT="$(grep -n '^GOLDEN_PREP_CMD=' "$CBX_BIN")"
+	OUT="$(grep -n '^GOLDEN_PREP_CMD=' "$MUSTER_BIN")"
 	eq "$(printf '%s' "$OUT" | sed 's/^[0-9]*://')" 'GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-}"' \
-		"hub/cbx must default GOLDEN_PREP_CMD to empty"
+		"hub/muster must default GOLDEN_PREP_CMD to empty"
 	OUT=""
+}
+
+# The box add-on is buildable but must NEVER be part of a deployment: a profiled service is excluded
+# from up/down/pull/ps/build unless the profile is switched on. If that profile is ever dropped, a
+# `docker compose up -d` on a server would try to BUILD it (and start a stray container), which is
+# exactly the surprise the profile exists to prevent.
+test_build_only_service_is_profiled() {
+	OUT="$(python3 - "$ROOT/compose.yml" <<'PYEOF' 2>&1
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+svc = d["services"]
+assert "box-image" in svc, "the box add-on build service is gone"
+assert svc["box-image"].get("profiles") == ["build"], \
+    f"box-image must be profiled 'build', got {svc['box-image'].get('profiles')!r}"
+active = [n for n, v in svc.items() if not v.get("profiles")]
+assert sorted(active) == ["box-broker", "hub"], f"unprofiled services changed: {sorted(active)}"
+# It must build the same add-on Dockerfile as the hub, onto the BOX base.
+b = svc["box-image"]["build"]
+assert b["dockerfile"] == "Dockerfile.addon", b["dockerfile"]
+assert "BOX_BASE_IMAGE" in b["args"]["BASE_IMAGE"], b["args"]["BASE_IMAGE"]
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
 }
 
 # =====================================================================  queue / status
@@ -169,7 +200,7 @@ test_queue_lists_a_handoff() {
 	has "work1"
 	has "work from work1"
 	cbx status --no-fetch
-	has "cbx review work1"
+	has "muster review work1"
 }
 
 test_queue_flags_conflicts_with_dev() {
@@ -191,7 +222,7 @@ test_status_reports_behind_origin() {
 	git_ fetch -q origin
 	cbx status
 	has "behind"
-	has "cbx pull"
+	has "muster pull"
 }
 
 # =====================================================================  review
@@ -261,7 +292,7 @@ test_review_of_merged_branch_says_so() {
 	cbx review work1
 	ok
 	has "nothing on top of dev"
-	has "cbx merge work1"
+	has "muster merge work1"
 }
 
 test_review_without_notes_ref_has_no_git_warning() {
@@ -331,7 +362,7 @@ test_merge_refuses_stale_dev() {
 	cbx merge work1
 	notok
 	has "refusing to merge onto a stale dev"
-	has "cbx pull"
+	has "muster pull"
 	ne "$(at refs/agents/work1)" "" "nothing should have been retired"
 }
 
@@ -371,7 +402,7 @@ subj="$(grep -v '^#' "$1" | sed -e '/./,$!d' | head -1)"
 printf 'REWORDED: %s\n\nA proper body.\n' "$subj" > "$1"
 EOF
 	chmod +x "$TMP/ed.sh"
-	EDITOR="$TMP/ed.sh" cbx_tty "a|m" merge work1 --reword
+	EDITOR="$TMP/ed.sh" muster_tty "a|m" merge work1 --reword
 	ok
 	has "reworded 3 commit(s)"
 	has "dev is now"
@@ -395,7 +426,7 @@ test_merge_reword_keeps_edits_when_you_quit() {
 printf 'my own wording\n' > "$1"
 EOF
 	chmod +x "$TMP/ed2.sh"
-	EDITOR="$TMP/ed2.sh" cbx_tty "1|q" merge work1 --reword
+	EDITOR="$TMP/ed2.sh" muster_tty "1|q" merge work1 --reword
 	has "Your edited messages are kept"
 	eq "$(at dev)" "$before" "quitting must not merge anything"
 	local kept; kept="$(cat "$FIX"/repo/.git/cbx/reword/work1/* 2>/dev/null)"
@@ -474,7 +505,7 @@ test_pull_fast_forward() {
 
 test_export_produces_an_mbox() {
 	handoff work1 2 >/dev/null
-	OUT="$(bash "$CBX_BIN" export work1 2>/dev/null)"; RC=$?
+	OUT="$(bash "$MUSTER_BIN" export work1 2>/dev/null)"; RC=$?
 	ok
 	has "From "
 	has "Subject:"
@@ -485,7 +516,7 @@ test_import_replaces_the_branch() {
 	local sha patch
 	sha="$(commit_on dev - "my own version" f1.txt "hand written")"
 	patch="$(git_ format-patch --stdout dev.."$sha")"
-	OUT="$(printf '%s' "$patch" | bash "$CBX_BIN" import work1 2>&1)"; RC=$?
+	OUT="$(printf '%s' "$patch" | bash "$MUSTER_BIN" import work1 2>&1)"; RC=$?
 	ok
 	has "now points at your commit"
 	exists "$FIX/repo/.git/cbx/work1.reviewed"
@@ -591,6 +622,152 @@ EOF
 	cbx down dummy; ok
 	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
 	unset TMUX_SESSION
+}
+
+# =====================================================================  laptop aliases
+#
+# These build command STRINGS for ssh; the bugs they can have are quoting and PTY bugs. See
+# alias_fixture()/al() in lib.sh — a stub ssh records what would have been run.
+
+test_aliases_forward_to_the_hub() {
+	alias_fixture
+	al 'cbx ls'
+	ssh_has "ssh -t root@test.example docker exec -it"
+	ssh_has "label=com.docker.compose.service=hub"
+	ssh_has "cbx ls"
+}
+
+# `cbx logs` and the live `cbx q` are long-lived and interactive, so they take the mosh-able
+# transport; everything else is one-shot and must stay on ssh or its output would be wiped.
+test_aliases_transport_split() {
+	alias_fixture
+	al 'cbx q --text'; ssh_has "ssh -t"; ssh_hasnt "mosh"
+	al 'MUSTER_TRANSPORT=mosh cbx q';       ssh_has "mosh"
+	al 'MUSTER_TRANSPORT=mosh cbx logs backend'; ssh_has "mosh"
+	al 'MUSTER_TRANSPORT=mosh cbx ls';     ssh_hasnt "mosh"   # one-shot: ssh even under mosh
+}
+
+test_aliases_quote_hostile_arguments() {
+	alias_fixture
+	al 'cbx fix work1 -m "a b; rm -rf /"'
+	ssh_has 'a\ b\;\ rm\ -rf\ /'
+}
+
+test_aliases_box_and_hub_attach() {
+	alias_fixture
+	al 'cbxbox work1'; ssh_has "docker exec -it -u dev"; ssh_has "box-proj-work1 tmux attach -t main"
+	al 'cbxhub';       ssh_has "tmux new-session -A -s cbxhub -c /home/dev/repo"
+}
+
+# The patch/binary paths must never allocate a PTY on either hop — it would translate newlines and
+# corrupt the payload. This is the one property shared by cbxexec, cbxcp, cbxexport and cbximport.
+test_aliases_pipes_never_allocate_a_pty() {
+	alias_fixture
+	al 'cbxexec work1 echo hi'
+	ssh_has "ssh -T"; ssh_has "docker exec -i box-proj-work1"; ssh_hasnt "docker exec -it"
+	# the command travels base64-encoded, so quotes/$/backticks survive two shell re-parses
+	ssh_has "base64 -d"
+	al 'cbxexport work1 --show'
+	ssh_has "ssh -T"; ssh_hasnt "-it"
+	al 'cbxcp work1:/home/dev/x.log .' >/dev/null 2>&1
+	ssh_has "ssh -T"; ssh_has "tar -C '/home/dev' -cf - 'x.log'"
+}
+
+test_aliases_exec_runs_in_the_hub_too() {
+	alias_fixture
+	al 'cbxexec hub "muster q --text"'
+	ssh_has "label=com.docker.compose.service=hub"; ssh_has "docker exec -i "
+}
+
+test_aliases_tunnel_specs() {
+	alias_fixture
+	al 'cbxtun work1:4200 hub:8080'
+	# One resolution round-trip, then -L per spec against the resolved container IPs.
+	ssh_has "bash -s proj"
+	ssh_has "ssh -N -L 127.0.0.1:4200:10.0.0."
+	ssh_has "-L 127.0.0.1:8080:10.0.0."
+	al 'cbxtun 9000'                    # bare PORT means the hub
+	ssh_has "-L 127.0.0.1:9000:10.0.0."
+	al 'cbxtun 4300:work1:4200'         # LOCAL:TARGET:PORT
+	ssh_has "-L 127.0.0.1:4300:10.0.0."
+}
+
+test_aliases_refuse_without_a_server() {
+	alias_fixture
+	AL_SERVER="root@your-server" al 'cbx ls'      # the shipped placeholder
+	has "still the placeholder"
+	eq "$SSHLOG" "" "nothing may be sent when the server is unconfigured"
+	AL_PROJECT="myproject" al 'cbxexec work1 echo hi'
+	has "MUSTER_PROJECT"
+	eq "$SSHLOG" "" "nothing may be sent when the project is unconfigured"
+}
+
+test_aliases_cbxcp_argument_checking() {
+	alias_fixture
+	al 'cbxcp ./a ./b'; notok; has "neither side names a box"
+	al 'cbxcp work1:/a hub:/b'; notok; has "both sides are remote"
+	al 'cbxcp'; notok; has "usage:"
+	eq "$SSHLOG" ""
+}
+
+# The project helpers are generated from the same plumbing, so they get the same PTY treatment.
+test_aliases_project_helpers() {
+	alias_fixture
+	AL_PROJECT_FILE=1 al 'cbxpsql mydb'
+	ssh_has "ssh -T"; ssh_has "docker exec -i -u postgres"; ssh_has "psql mydb"
+	AL_PROJECT_FILE=1 al 'MUSTER_DB_USER=app cbxpsql mydb -tA'
+	ssh_has "psql -U app -tA mydb"
+	AL_PROJECT_FILE=1 al 'cbxpsql'; notok; has "usage: cbxpsql"
+}
+
+# THE reason the factory exists: two stacks, one shell, no re-sourcing and no cross-talk.
+test_aliases_two_stacks_side_by_side() {
+	alias_fixture
+	al 'muster_stack is root@one.example projone
+	    muster_stack lab root@two.example projtwo
+	    is ls; lab ls'
+	ssh_has "root@one.example"
+	ssh_has "root@two.example"
+	ssh_has "label=com.docker.compose.project=projone"
+	ssh_has "label=com.docker.compose.project=projtwo"
+	# …and each family is complete, not just the bare command
+	al 'muster_stack is root@one.example projone; isbox work1; ishub; isexec work1 echo hi'
+	ssh_has "box-projone-work1 tmux attach"
+	ssh_has "tmux new-session -A -s cbxhub"
+	ssh_has "docker exec -i box-projone-work1"
+	ssh_hasnt "root@test.example"          # the back-compat stack must not leak into the new one
+}
+
+# Project helpers are generated per stack from the same factory, so each points at its own server.
+test_aliases_project_helpers_are_per_stack() {
+	alias_fixture
+	al 'muster_stack is root@one.example projone
+	    source "'"$ROOT"'/muster.bash_aliases.project.example" is
+	    ispsql mydb'
+	ssh_has "root@one.example"
+	ssh_has "label=com.docker.compose.service=db"
+	ssh_has "psql mydb"
+	# the usage string names what you typed, not the file it came from
+	al 'muster_stack is root@one.example projone
+	    source "'"$ROOT"'/muster.bash_aliases.project.example" is
+	    ispsql'
+	has "usage: ispsql"
+	hasnt "usage: cbxpsql"
+}
+
+test_aliases_reject_a_bad_prefix() {
+	alias_fixture
+	al 'muster_stack "9bad" root@x proj'; notok; has "bad prefix"
+	al 'muster_stack "a;rm -rf /" root@x proj'; notok; has "bad prefix"
+	al 'muster_stack ok root@x'; notok; has "usage: muster_stack"
+	eq "$SSHLOG" ""
+}
+
+test_aliases_interactive_gets_a_pty() {
+	command -v script >/dev/null || { skip "no 'script' for a pseudo-terminal"; return 0; }
+	alias_fixture
+	AL_PROJECT_FILE=1 TTY=1 al 'cbxpsql mydb'
+	ssh_has "ssh -t"; ssh_has "docker exec -it -u postgres"
 }
 
 # =====================================================================  minto
@@ -809,7 +986,7 @@ minto_agent_resolves() {
 	git_ worktree remove --force "$wt"
 }
 
-# =====================================================================  cbx-box-init
+# =====================================================================  muster-box-init
 
 # The box's side of a minto spawn: it must land on the TARGET branch with dev merged and conflicted,
 # before claude ever starts — the whole point of doing it in the init command rather than a prompt.
@@ -818,8 +995,8 @@ test_box_init_minto_sets_up_the_conflict() {
 	local box="$FIX/box"
 	git clone -q "$FIX/repo" "$box" 2>/dev/null
 	git -C "$box" config user.email box@test; git -C "$box" config user.name box
-	OUT="$(cd "$box" && CBX_BOX=minto-staging CBX_HUB_GIT_URL="$FIX/repo" CBX_DEV_BRANCH=dev \
-		CBX_BASE_BRANCH=staging CBX_MERGE_BRANCH=dev bash "$BOX_INIT" 2>&1)"; RC=$?
+	OUT="$(cd "$box" && MUSTER_BOX=minto-staging MUSTER_HUB_GIT_URL="$FIX/repo" MUSTER_DEV_BRANCH=dev \
+		MUSTER_BASE_BRANCH=staging MUSTER_MERGE_BRANCH=dev bash "$BOX_INIT" 2>&1)"; RC=$?
 	ok
 	has "fresh, based on staging"
 	has "WITH CONFLICTS"
@@ -829,8 +1006,8 @@ test_box_init_minto_sets_up_the_conflict() {
 	OUT="$(cat "$box/b.txt")"; has "|||||||"      # zdiff3: the common base is in the hunk
 	# A RECREATE mid-conflict must not blow up (`git checkout <current-branch>` fails on an unmerged
 	# index, and this script runs under `set -e`).
-	OUT="$(cd "$box" && CBX_BOX=minto-staging CBX_HUB_GIT_URL="$FIX/repo" CBX_DEV_BRANCH=dev \
-		CBX_BASE_BRANCH=staging CBX_MERGE_BRANCH=dev bash "$BOX_INIT" 2>&1)"; RC=$?
+	OUT="$(cd "$box" && MUSTER_BOX=minto-staging MUSTER_HUB_GIT_URL="$FIX/repo" MUSTER_DEV_BRANCH=dev \
+		MUSTER_BASE_BRANCH=staging MUSTER_MERGE_BRANCH=dev bash "$BOX_INIT" 2>&1)"; RC=$?
 	ok
 	has "a merge is still IN PROGRESS"
 }
@@ -839,7 +1016,7 @@ test_box_init_ordinary_box() {
 	local box="$FIX/box"
 	git clone -q "$FIX/repo" "$box" 2>/dev/null
 	git -C "$box" config user.email box@test; git -C "$box" config user.name box
-	OUT="$(cd "$box" && CBX_BOX=work1 CBX_HUB_GIT_URL="$FIX/repo" CBX_DEV_BRANCH=dev \
+	OUT="$(cd "$box" && MUSTER_BOX=work1 MUSTER_HUB_GIT_URL="$FIX/repo" MUSTER_DEV_BRANCH=dev \
 		bash "$BOX_INIT" 2>&1)"; RC=$?
 	ok
 	has "fresh, based on dev"
@@ -914,6 +1091,7 @@ run "config: no project defaults in the source tree" test_no_project_defaults
 run "help: every command is documented"            test_help_covers_every_command
 run "help: an unknown command prints usage"        test_unknown_command_prints_usage
 
+run "compose: the box build service is profiled"    test_build_only_service_is_profiled
 run "status: empty stack"                          test_status_empty
 run "queue: lists a handoff"                       test_queue_lists_a_handoff
 run "queue: flags conflicts with dev"              test_queue_flags_conflicts_with_dev
@@ -960,6 +1138,21 @@ run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_w
 
 run "svcs: lists the manifests"                    test_svcs_lists_manifests
 run "svcs: up and down a service"                  test_service_up_down
+
+run "aliases: forward to the hub"                   test_aliases_forward_to_the_hub
+run "aliases: ssh vs mosh transport split"         test_aliases_transport_split
+run "aliases: hostile arguments are quoted"        test_aliases_quote_hostile_arguments
+run "aliases: attach to a box / the hub"           test_aliases_box_and_hub_attach
+run "aliases: pipes never allocate a PTY"          test_aliases_pipes_never_allocate_a_pty
+run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the_hub_too
+run "aliases: tunnel specs"                        test_aliases_tunnel_specs
+run "aliases: refuse an unconfigured stack"        test_aliases_refuse_without_a_server
+run "aliases: cbxcp argument checking"             test_aliases_cbxcp_argument_checking
+run "aliases: project helpers"                     test_aliases_project_helpers
+run "aliases: two stacks side by side"             test_aliases_two_stacks_side_by_side
+run "aliases: project helpers are per stack"       test_aliases_project_helpers_are_per_stack
+run "aliases: a bad prefix is rejected"            test_aliases_reject_a_bad_prefix
+run "aliases: interactive gets a PTY"              test_aliases_interactive_gets_a_pty
 
 run "minto: refuses dev itself"                    test_minto_refuses_dev_itself
 run "minto: fast-forward"                          test_minto_fast_forward

@@ -5,21 +5,21 @@ set -e
 #
 #     cp build-setup.sh.example build-setup.sh
 #
-# claude-box has no opinion about your toolchain, so it ships this example and expects the real file
+# muster has no opinion about your toolchain, so it ships this example and expects the real file
 # beside it — the same arrangement as service-env / mounts / port-forwards, and `build-setup.sh` is
 # gitignored for the same reason. It is the BUILD-time counterpart of common-setup.sh, which installs
 # the shared RUNTIME into the base images: keeping your toolchain out of those is what lets them stay
 # lean and reusable across projects.
 #
 # WHO RUNS IT: Dockerfile.addon, which layers your toolchain onto either base image —
-#     claude-box           + this  ->  claude-box-<project>   (what the broker spawns for every box)
-#     claude-box-hub-base  + this  ->  claude-box-hub         (the hub)
+#     muster           + this  ->  muster-<project>   (what the broker spawns for every box)
+#     muster-hub-base  + this  ->  muster-hub         (the hub)
 # so whatever you install here is what an agent — and `cbx up <service>` on the hub — actually has.
 # Point it somewhere else with `--build-arg SETUP_SCRIPT=path/in/the/build/context`.
 #
 # THE CONTRACT
 #   * Runs as root, in a Debian-based image, with `sh` (not bash) and `set -e`.
-#   * The build context is the claude-box directory, so any path you COPY must live in here.
+#   * The build context is the muster directory, so any path you COPY must live in here.
 #   * curl and jq are already present (common-setup.sh put them in the base image).
 #   * Install under /opt and put binaries on PATH BOTH ways: a /etc/profile.d drop-in for login
 #     shells (the hub's tmux services and the boxes' `bash -lc` use those) and a symlink into

@@ -1,5 +1,5 @@
 #!/bin/sh
-# cbx-activity — record what this box's claude is doing, for the hub to read.
+# muster-activity — record what this box's claude is doing, for the hub to read.
 #
 # Wired as a Claude Code hook (the broker adds it to the shared ~/.claude/settings.json):
 #   UserPromptSubmit -> busy      a prompt was submitted; the agent is working

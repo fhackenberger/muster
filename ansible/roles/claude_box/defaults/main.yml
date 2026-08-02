@@ -2,7 +2,7 @@
 # Defaults for the claude_box role — the PROJECT-AGNOSTIC half of deploying a claude-box stack.
 # Everything here is overridable by the caller; the role hard-codes nothing project-specific, so
 # it can be lifted into the standalone claude-box repository unchanged (see
-# docker-compose/claude-box/tools/split-out.sh).
+# docker-compose/muster/tools/split-out.sh).
 
 # Where the stack lives on the remote. `.env`, `mounts`, `service-env`, `data/*` and `git-identity/`
 # are all relative to this.
@@ -11,7 +11,7 @@ claude_box_dir: /virtual_machines/claude-box-docker
 # The claude-box source tree that is rsynced to claude_box_dir. ABSOLUTE on purpose: `synchronize`
 # resolves a relative src against the ROLE's files/ directory first, which would silently pick the
 # wrong tree (or nothing) once this role lives in another repository.
-claude_box_source: "{{ playbook_dir }}/docker-compose/claude-box/"
+claude_box_source: "{{ playbook_dir }}/docker-compose/muster/"
 
 # The uid the hub and every box run as. Not a name: there is no matching account on the host, the
 # containers simply run with this numeric id, so the bind-mounted data dirs must be owned by it.

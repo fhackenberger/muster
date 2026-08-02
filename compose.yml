@@ -1,7 +1,7 @@
-# Per-project remote claude-box stack. Copy this directory once per project (each gets its own
+# Per-project remote muster stack. Copy this directory once per project (each gets its own
 # .env, mounts, and ./data), then `./gen-hub-mounts.sh && docker compose up -d`.
 #
-# THIS FILE IS THE STACK, NOT YOUR PROJECT. It defines only the two containers claude-box itself is
+# THIS FILE IS THE STACK, NOT YOUR PROJECT. It defines only the two containers muster itself is
 # made of — the hub and the box-broker. Anything your project needs beside them (a database, a
 # message broker, a cache, seed data) belongs in `compose.project.yml`: copy
 # compose.project.yml.example and merge it via COMPOSE_FILE in .env, e.g.
@@ -10,7 +10,7 @@
 # compose.override.yml, which is where gen-hub-mounts.sh renders the hub's half of the `mounts`
 # table — omit it and the hub silently loses every project mount.
 #
-# Image defaults here are REGISTRY-NEUTRAL plain tags (claude-box-hub:stable, …), i.e. whatever the
+# Image defaults here are REGISTRY-NEUTRAL plain tags (muster-hub:stable, …), i.e. whatever the
 # local docker daemon has — which is what you want when the images are built on the same host (the
 # Jenkinsfile tags them exactly like this). To run on a different host, point HUB_IMAGE /
 # BOX_BROKER_IMAGE / BOX_IMAGE / HUB_BASE_IMAGE at registry-qualified names in .env and set
@@ -18,7 +18,7 @@
 # box-broker from this directory instead, set COMPOSE_PULL_POLICY=build.
 #
 # Model: the hub owns the checkout and runs the dev services on demand (cbx up backend|frontend|
-# pinchtab). Agent boxes are SEPARATE claude-box containers spawned by the box-broker (the only
+# pinchtab). Agent boxes are SEPARATE muster containers spawned by the box-broker (the only
 # holder of the docker socket); they mount only what the `mounts` table grants and reach the hub
 # by name.
 
@@ -29,14 +29,14 @@ networks:
     name: cbx-${PROJECT_NAME}
 
 services:
-  # The ONLY container with the docker socket. "claude-box.sh as a service": validates the request
+  # The ONLY container with the docker socket. "muster-box.sh as a service": validates the request
   # (the hub passes a box NAME; the mounts come from the root-owned `mounts` table) then runs the
-  # modified claude-box.sh.
+  # modified muster-box.sh.
   box-broker:
     # Whatever the local daemon has by default (COMPOSE_PULL_POLICY=missing). Point
     # BOX_BROKER_IMAGE at a registry-qualified name to pull it from elsewhere, or set
     # COMPOSE_PULL_POLICY=build to (re)build locally from this dir.
-    image: ${BOX_BROKER_IMAGE:-claude-box-broker:stable}
+    image: ${BOX_BROKER_IMAGE:-muster-broker:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       context: .
@@ -44,7 +44,7 @@ services:
     environment:
       BROKER_TOKEN: ${BROKER_TOKEN}
       PROJECT_NAME: ${PROJECT_NAME}
-      BOX_IMAGE: ${BOX_IMAGE:-claude-box:stable}
+      BOX_IMAGE: ${BOX_IMAGE:-muster:stable}
       BOX_NETWORK: cbx-${PROJECT_NAME}
       # The prepared "golden" checkouts every box overlays (data/golden/current), and the staging dir
       # the hub prepares a new one in before the broker seals it into place. PROJECT_ROOT confines
@@ -57,6 +57,10 @@ services:
       # the hub only works in a box if it is mounted back at the path it was prepared at.
       CHECKOUT_DST: /home/dev/repo
       DEV_BRANCH: ${DEV_BRANCH:-dev}
+      # The stack's own name for the CLI. The hub symlinks `cbx` to it (see hub/entrypoint.sh) so
+      # the command is spelled the same here as it is on your laptop, where `muster_stack <prefix> …`
+      # generates the matching family. Empty or 'cbx' = no symlink, nothing changes.
+      MUSTER_PREFIX: ${MUSTER_PREFIX:-}
       HUB_GIT_URL: ${HUB_GIT_URL:-git://hub/repo}
       CLAUDE_HOME: ${STACK_DIR}/data/claude
       BOXROOT: ${STACK_DIR}/data/boxes
@@ -86,18 +90,20 @@ services:
   # on demand, hosts YOUR commit workflow. Does NOT run claude.
   hub:
     # Same policy as box-broker.
-    image: ${HUB_IMAGE:-claude-box-hub:stable}
+    image: ${HUB_IMAGE:-muster-hub:stable}
     pull_policy: ${COMPOSE_PULL_POLICY:-missing}
     build:
       # The hub image = the shared Dockerfile.addon (your project's toolchain, installed by the script
-      # SETUP_SCRIPT names) layered onto claude-box-hub-base (hub/Dockerfile.base). Same add-on file the
+      # SETUP_SCRIPT names) layered onto muster-hub-base (hub/Dockerfile.base). Same add-on file the
       # box uses; FINAL_USER=1000 keeps the hub running as its uid-1000 'dev' user. Override
       # HUB_BASE_IMAGE to build against a locally-built or registry-qualified base, and SETUP_SCRIPT (in
       # compose.project.yml) to install your own toolchain — see Dockerfile.addon.
       context: .
       dockerfile: Dockerfile.addon
       args:
-        BASE_IMAGE: ${HUB_BASE_IMAGE:-claude-box-hub-base:stable}
+        BASE_IMAGE: ${HUB_BASE_IMAGE:-muster-hub-base:stable}
+        SETUP_SCRIPT: ${SETUP_SCRIPT:-build-setup.sh}
+        GRADLE_VERSION: ${GRADLE_VERSION:-}
         FINAL_USER: "1000"
     hostname: ${PROJECT_NAME}-hub
     init: true
@@ -117,7 +123,7 @@ services:
       GOLDEN_STAGING: /work/golden-staging
       # Run by `cbx golden snapshot --prep` IN THE HUB'S REPO (not in a copy), so what it installs is
       # frozen at the path the boxes use it from — put your project's install/warm steps here.
-      # Empty by default — claude-box knows nothing about your build. Set GOLDEN_PREP_CMD in .env
+      # Empty by default — muster knows nothing about your build. Set GOLDEN_PREP_CMD in .env
       # (e.g. `npm ci && gradle classes`) to give `cbx golden snapshot --prep` something to run.
       GOLDEN_PREP_CMD: ${GOLDEN_PREP_CMD:-}
       BROKER_URL: http://box-broker:8099
@@ -164,3 +170,33 @@ services:
       # accident. What stays here is the stack's own plumbing above: the repo, the goldens, box state,
       # the manifests, the shared claude/pinchtab/git identity.
     restart: unless-stopped
+
+  # ------------------------------------------------------------------ build-only
+  #
+  # THE BOX ADD-ON IMAGE. Not a service — nothing ever starts it. It exists because the box image is
+  # the one image compose otherwise cannot build: the broker spawns boxes itself and only receives
+  # BOX_IMAGE as an environment value, so `docker compose build` used to produce a hub carrying your
+  # toolchain and leave the boxes without it. You found out when an agent's first build failed.
+  #
+  #     docker compose --profile build build          # hub + broker + THIS
+  #
+  # `profiles:` is what keeps it out of everything else: a profiled service is invisible to
+  # `up`, `down`, `pull`, `ps` and plain `build` unless the profile is switched on. So a deployment
+  # that pulls prebuilt images (ours) never touches it, and no `depends_on` can drag it in.
+  #
+  # It builds the SAME Dockerfile.addon as the hub, just onto the box base instead of the hub base —
+  # that is the whole difference between the two add-on images, and why one file serves both.
+  box-image:
+    profiles: [build]
+    image: ${BOX_IMAGE:-muster:stable}
+    build:
+      context: .
+      dockerfile: Dockerfile.addon
+      args:
+        BASE_IMAGE: ${BOX_BASE_IMAGE:-muster:stable}
+        SETUP_SCRIPT: ${SETUP_SCRIPT:-build-setup.sh}
+        GRADLE_VERSION: ${GRADLE_VERSION:-}
+    # Belt and braces: if some future `--profile build up` ever selects it, it must exit immediately
+    # rather than sit there as a second, confusing agent container.
+    command: ["true"]
+    restart: "no"

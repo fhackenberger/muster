@@ -9,7 +9,7 @@
 # 127.0.0.1:(HUB_BASE_PORT + N) -> box:BOX_PORT, and passes the box these env vars:
 #   PORT_FORWARDS=NAME[,NAME...]
 #   PORT_FORWARD_<NAME>_FROM=<BOX_PORT>     PORT_FORWARD_<NAME>_TO_HUB=<HUB_BASE_PORT + N>
-# The project's own scripts read those to wire e.g. CLAUDEBOX_DEV_URL (pinchtab) and the frontend's
+# The project's own scripts read those to wire e.g. MUSTER_DEV_URL (pinchtab) and the frontend's
 # backend URL to the matching hub ports, and to bind those services to 0.0.0.0 in the box.
 #
 # The number of concurrent boxes with forwards is bounded by PORT_FORWARD_SLOTS (.env, default 16);

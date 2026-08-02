@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# cbx-box-init — put this box on its own agent branch. Runs in the box's tmux window just before
-# claude starts (claude-box.sh wires it via CLAUDEBOX_INIT_CMD; the broker sets that for every
+# muster-box-init — put this box on its own agent branch. Runs in the box's tmux window just before
+# claude starts (muster-box.sh wires it via MUSTER_INIT_CMD; the broker sets that for every
 # server-mode box). Laptop boxes never run it.
 #
 # The checkout is an overlay of the shared golden tree, so it already contains a real .git with the
@@ -15,26 +15,26 @@ set -euo pipefail
 # branch and commits untouched, and only re-fetches.
 #
 # A MINTO box is the one variation: `cbx minto <target>` hit a conflict and asked for an agent to
-# resolve it, so the broker also passes CBX_BASE_BRANCH (branch from <target>, not dev) and
-# CBX_MERGE_BRANCH (leave dev merged into it, conflicts and all). That happens HERE rather than as a
+# resolve it, so the broker also passes MUSTER_BASE_BRANCH (branch from <target>, not dev) and
+# MUSTER_MERGE_BRANCH (leave dev merged into it, conflicts and all). That happens HERE rather than as a
 # prompt to the agent on purpose: a prompt is advisory and asynchronous, so "the agent never ran the
 # setup" would be a failure you could only discover by attaching to the box's tmux session.
 #
-# Env (from the broker):  CBX_BOX  CBX_HUB_GIT_URL  CBX_DEV_BRANCH  CBX_BASE_BRANCH  CBX_MERGE_BRANCH
+# Env (from the broker):  MUSTER_BOX  MUSTER_HUB_GIT_URL  MUSTER_DEV_BRANCH  MUSTER_BASE_BRANCH  MUSTER_MERGE_BRANCH
 
-: "${CBX_BOX:?cbx-box-init: CBX_BOX not set}"
-HUB_URL="${CBX_HUB_GIT_URL:-git://hub/repo}"
-DEV="${CBX_DEV_BRANCH:-dev}"
-BASE="${CBX_BASE_BRANCH:-$DEV}"
-MERGE="${CBX_MERGE_BRANCH:-}"
-BRANCH="agent/${CBX_BOX}"
+: "${MUSTER_BOX:?muster-box-init: MUSTER_BOX not set}"
+HUB_URL="${MUSTER_HUB_GIT_URL:-git://hub/repo}"
+DEV="${MUSTER_DEV_BRANCH:-dev}"
+BASE="${MUSTER_BASE_BRANCH:-$DEV}"
+MERGE="${MUSTER_MERGE_BRANCH:-}"
+BRANCH="agent/${MUSTER_BOX}"
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 # Identity. Every commit is attributable to the box that made it; the hub's own identity (and the
 # credentials that can reach GitHub) stay on the hub — a box can only ever push to this hub repo.
-git config user.name  "agent-${CBX_BOX}"
-git config user.email "agent-${CBX_BOX}@claude-box.local"
+git config user.name  "agent-${MUSTER_BOX}"
+git config user.email "agent-${MUSTER_BOX}@muster.local"
 
 # One remote, 'hub'. The golden's clone remote is a hub-only path, so drop it to avoid confusion —
 # `git fetch`/`git push` with no remote then resolve to the hub, which is the only thing reachable.
@@ -55,7 +55,7 @@ git config --add         remote.hub.fetch '+refs/agents/*:refs/remotes/hub-agent
 git config --add         remote.hub.fetch '+refs/notes/*:refs/notes/*'
 
 if ! git fetch --prune hub 2>&1; then
-	echo "cbx-box-init: could not reach the hub at $HUB_URL — working offline on the golden's history." >&2
+	echo "muster-box-init: could not reach the hub at $HUB_URL — working offline on the golden's history." >&2
 	exit 0
 fi
 
@@ -71,21 +71,21 @@ if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
 	# would abort this script and the box would come up unconfigured.
 	if [ "$(git symbolic-ref --short -q HEAD || true)" = "$BRANCH" ]; then
 		if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
-			echo "cbx-box-init: on ${BRANCH} (resumed — a merge is still IN PROGRESS here):"
+			echo "muster-box-init: on ${BRANCH} (resumed — a merge is still IN PROGRESS here):"
 			git --no-pager diff --name-only --diff-filter=U | sed 's/^/  /'
 		else
-			echo "cbx-box-init: on ${BRANCH} (resumed local work)"
+			echo "muster-box-init: on ${BRANCH} (resumed local work)"
 		fi
 	else
 		git checkout -q "$BRANCH"
-		echo "cbx-box-init: on ${BRANCH} (resumed local work)"
+		echo "muster-box-init: on ${BRANCH} (resumed local work)"
 	fi
-elif git show-ref --verify --quiet "refs/remotes/hub-agents/${CBX_BOX}"; then
-	git checkout -q -B "$BRANCH" "refs/remotes/hub-agents/${CBX_BOX}"
-	echo "cbx-box-init: on ${BRANCH} (restored from the hub)"
+elif git show-ref --verify --quiet "refs/remotes/hub-agents/${MUSTER_BOX}"; then
+	git checkout -q -B "$BRANCH" "refs/remotes/hub-agents/${MUSTER_BOX}"
+	echo "muster-box-init: on ${BRANCH} (restored from the hub)"
 else
 	git checkout -q -B "$BRANCH" "refs/remotes/hub/${BASE}"
-	echo "cbx-box-init: on ${BRANCH} (fresh, based on ${BASE})"
+	echo "muster-box-init: on ${BRANCH} (fresh, based on ${BASE})"
 	# A minto box: leave the merge IN PROGRESS and conflicted. That is the deliverable — the agent is
 	# meant to open onto the conflict, not to be told to go and create it.
 	if [ -n "$MERGE" ]; then
@@ -93,12 +93,12 @@ else
 		# tells the agent which side CHANGED a line and which merely kept it. Local to this checkout.
 		git config merge.conflictstyle zdiff3
 		if git merge --no-commit --no-ff "refs/remotes/hub/${MERGE}" >/dev/null 2>&1; then
-			echo "cbx-box-init: ${MERGE} merged into ${BASE} cleanly — nothing to resolve, just commit it"
+			echo "muster-box-init: ${MERGE} merged into ${BASE} cleanly — nothing to resolve, just commit it"
 		else
-			echo "cbx-box-init: ${MERGE} merged into ${BASE} WITH CONFLICTS — that is expected, resolve them:"
+			echo "muster-box-init: ${MERGE} merged into ${BASE} WITH CONFLICTS — that is expected, resolve them:"
 			git --no-pager diff --name-only --diff-filter=U | sed 's/^/  /'
 		fi
 	fi
 fi
 
-echo "cbx-box-init: 'mydiff' shows your work, 'handoff \"summary\"' sends it to the hub for review."
+echo "muster-box-init: 'mydiff' shows your work, 'handoff \"summary\"' sends it to the hub for review."

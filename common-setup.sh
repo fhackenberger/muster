@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# common-setup.sh — the tooling SHARED by the claude-box image (Dockerfile) and the hub base image
+# common-setup.sh — the tooling SHARED by the muster image (Dockerfile) and the hub base image
 # (hub/Dockerfile.base): common base utils, Node + npm via fnm, and the pinchtab binary. Both
 # Dockerfiles COPY this and RUN it, so the install logic + version handling live in ONE place
 # instead of being duplicated. Version pins arrive as environment variables (passed from build
@@ -9,7 +9,7 @@ set -e
 # Dockerfile's ENV.
 #
 # It installs ONLY what BOTH images need. Image-specific packages stay in their own Dockerfile:
-#   claude-box: xclip/xsel/sudo (clipboard proxy) + the claude binary + the clip user & shims
+#   muster: xclip/xsel/sudo (clipboard proxy) + the claude binary + the clip user & shims
 #   hub base:   openssh-client, the Chrome runtime libs, xauth/xvfb, git-ssh, cbx
 : "${NODE_VERSION:?common-setup: NODE_VERSION not set (pass --build-arg NODE_VERSION=...)}"
 : "${NPM_VERSION:?common-setup: NPM_VERSION not set (pass --build-arg NPM_VERSION=...)}"

@@ -1,43 +1,43 @@
 #!/bin/bash
 set -euo pipefail
 
-# cbx — hub-side control CLI. Three jobs:
+# muster — hub-side control CLI. Three jobs:
 #   * start/stop the on-demand dev services in the hub's tmux (declared in hub-services/, e.g. backend)
 #   * spawn/kill/list agent boxes via the box-broker (the hub itself never touches the docker socket)
 #   * THE REVIEW QUEUE: each agent works on its own branch (agent/<box>) in an overlay of a shared
 #     prepared "golden" checkout and pushes to refs/agents/<box> here; you review and merge into dev.
 #
 # Usage:
-#   cbx svcs | services                     # list dev services (declared in hub-services/) + state
-#   cbx up   <service>                      # start a service in its tmux window
-#   cbx down <service>                      # stop it
-#   cbx logs <service>|gitd                 # attach that service window (Ctrl-b d to detach)
-#   cbx autostart                           # start every service whose manifest sets autostart=true
-#   cbx box  [name]                         # spawn an agent box (own branch, overlay checkout)
-#   cbx kill <name>                         # remove an agent box (its upper layer is kept)
-#   cbx recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
-#   cbx ls                                  # list services + boxes (broker)
-#   cbx forwards [box]                      # re-establish the hub-loopback socat forwards
+#   $SELF svcs | services                     # list dev services (declared in hub-services/) + state
+#   $SELF up   <service>                      # start a service in its tmux window
+#   $SELF down <service>                      # stop it
+#   $SELF logs <service>|gitd                 # attach that service window (Ctrl-b d to detach)
+#   $SELF autostart                           # start every service whose manifest sets autostart=true
+#   $SELF box  [name]                         # spawn an agent box (own branch, overlay checkout)
+#   $SELF kill <name>                         # remove an agent box (its upper layer is kept)
+#   $SELF recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
+#   $SELF ls                                  # list services + boxes (broker)
+#   $SELF forwards [box]                      # re-establish the hub-loopback socat forwards
 #
-#   cbx status | st                         # what can be merged / rebased / pushed, with commands
-#   cbx q | queue [-n SECS] [--no-bell]     # LIVE dashboard: queue + status in one repainted screen,
+#   $SELF status | st                         # what can be merged / rebased / pushed, with commands
+#   $SELF q | queue [-n SECS] [--no-bell]     # LIVE dashboard: queue + status in one repainted screen,
 #                                           #   and your terminal BELLS when an agent stops working
 #                                           #   or a new handoff lands. 'q'/Ctrl-C quits, Enter refreshes
-#   cbx q  --text                           # the queue table once, as plain text (for pipes/scripts)
-#                                           #   colour: CBX_COLOR=always|never|auto (auto = 'cbx status'
+#   $SELF q  --text                           # the queue table once, as plain text (for pipes/scripts)
+#                                           #   colour: MUSTER_COLOR=always|never|auto (auto = '$SELF status'
 #                                           #   colours a terminal only; the live dashboard always does)
-#   cbx review <box> [--full] [--net]       # open the review TUI (tuicr) on the agent's branch: leave
+#   $SELF review <box> [--full] [--net]       # open the review TUI (tuicr) on the agent's branch: leave
 #                                           #   line comments, quit, CONFIRM, and they are sent to the
-#                                           #   box — no retyping them into `cbx fix`. Nothing is sent
+#                                           #   box — no retyping them into `$SELF fix`. Nothing is sent
 #                                           #   until you answer 's' at the prompt.
 #              [--tui] [--plain]            #   --plain = the old delta/less pager (also used when no
 #                                           #   TUI is installed, for --net, and for a RE-review, whose
 #                                           #   range-diff a TUI cannot show); --tui forces the TUI.
 #                                           #   --full = whole branch, --net = one combined diff.
-#                                           #   CBX_REVIEW_TUI picks a different TUI (empty = never one)
-#   cbx fix    <box> -m "..."               # send review feedback into that box's claude session
-#   cbx prereview <box>                     # ask the agent to self-review its diff before you look
-#   cbx merge  <box> [--squash] [--edit]    # merge the agent branch into dev
+#                                           #   MUSTER_REVIEW_TUI picks a different TUI (empty = never one)
+#   $SELF fix    <box> -m "..."               # send review feedback into that box's claude session
+#   $SELF prereview <box>                     # ask the agent to self-review its diff before you look
+#   $SELF merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
 #                                           #   (--edit on a 1-commit branch: no merge commit)
 #             [--reword|-r]                 #   KEEP every commit and rewrite each MESSAGE, in a little
@@ -49,12 +49,12 @@ set -euo pipefail
 #             [--landed]                    #   the merge CONFLICTED and you finished it by hand: retire
 #                                           #   the branch + tell the box, without merging again. Only
 #                                           #   needed when your fix was a squash/hand-written commit —
-#                                           #   if the agent's commits ended up in dev, plain `cbx merge`
+#                                           #   if the agent's commits ended up in dev, plain `$SELF merge`
 #                                           #   detects it and closes out by itself.
-#   cbx drop   <box>                        # discard an agent branch (tells the box)
-#   cbx rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
+#   $SELF drop   <box>                        # discard an agent branch (tells the box)
+#   $SELF rebase <box>|all [--force]          # move agents onto the current dev (light; no recreate)
 #
-#   cbx minto <branch>                      # merge dev INTO another branch (staging, a release branch).
+#   $SELF minto <branch>                      # merge dev INTO another branch (staging, a release branch).
 #                                           #   A fast-forward, or a merge computed in the OBJECT STORE:
 #                                           #   the hub's own checkout never moves either way. On a
 #                                           #   CONFLICT it asks what the branch is for, then offers:
@@ -68,28 +68,34 @@ set -euo pipefail
 #             --abort                       #   drop whatever minto has open for that branch
 #             --pull                        #   fast-forward the branch to origin first
 #
-#   cbx export <box>                        # the agent's work, SQUASHED, as one mbox patch on STDOUT
-#                                           #   (laptop: `cbxexport <box>` pipes it into a local git am)
-#   cbx import <box>                        # read a patch on STDIN, REPLACE the agent's branch with it,
-#                                           #   and tell the box to note it — not act (laptop: cbximport)
+#   $SELF export <box>                        # the agent's work, SQUASHED, as one mbox patch on STDOUT
+#                                           #   (laptop: `<prefix>export <box>` pipes it into a local git am)
+#   $SELF import <box>                        # read a patch on STDIN, REPLACE the agent's branch with it,
+#                                           #   and tell the box to note it — not act (laptop: <prefix>import)
 #
 # Commands that TYPE into an agent's session (fix / prereview / rebase) refuse while that agent is
-# working — `cbx ls` and `cbx status` show busy | waiting | idle per box. Add --force to interrupt.
-#   cbx pull [--rebase]                     # bring dev up to date with origin (merge by default)
-#   cbx push [-y]                           # push dev to the real origin (shows a --stat preview and
+# working — `$SELF ls` and `$SELF status` show busy | waiting | idle per box. Add --force to interrupt.
+#   $SELF pull [--rebase]                     # bring dev up to date with origin (merge by default)
+#   $SELF push [-y]                           # push dev to the real origin (shows a --stat preview and
 #                                           #   asks first; -y skips the question)
 #
-#   cbx golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
-#   cbx golden seal <id>                    # finish a staged golden you fixed up by hand
-#   cbx golden ls | reap                    # list snapshots / delete unreferenced ones
+#   $SELF golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
+#   $SELF golden seal <id>                    # finish a staged golden you fixed up by hand
+#   $SELF golden ls | reap                    # list snapshots / delete unreferenced ones
 #
 # What the hub and the boxes MOUNT is project set-up, not a runtime knob: it lives in the stack's
 # root-owned `mounts` table (one row per path, a mode for each side), edited on the host and applied
-# with `./gen-hub-mounts.sh && docker compose up -d hub && cbx recreate all`. See mounts.example.
+# with `./gen-hub-mounts.sh && docker compose up -d hub && $SELF recreate all`. See mounts.example.
 #
 # The repo lives at the SAME absolute path here and inside every box (/home/dev/repo), because
 # installed dependencies bake absolute paths in — npm into node_modules/.bin shebangs, gradle into
 # the project-local .gradle cache. So whatever you set up here works unchanged in an agent's box.
+
+# What this run was invoked AS. The hub symlinks /usr/local/bin/$MUSTER_PREFIX to this binary (see
+# hub/entrypoint.sh), so the same code answers to `muster`, to your stack's prefix, and to whatever a
+# second stack chose. Every hint below is printed with $SELF so a copied command names the binary you
+# actually have, not the one this file happens to be called.
+SELF="${0##*/}"
 
 REPO="${CHECKOUT:-/home/dev/repo}"
 DEV="${DEV_BRANCH:-dev}"
@@ -100,58 +106,58 @@ TMUX_SESSION="${TMUX_SESSION:-services}"
 BROKER_URL="${BROKER_URL:-http://box-broker:8099}"
 BROKER_TOKEN="${BROKER_TOKEN:-}"
 
-# The interactive review TUI `cbx review` opens on an agent's branch. Default: tuicr (tuicr.dev),
+# The interactive review TUI `$SELF review` opens on an agent's branch. Default: tuicr (tuicr.dev),
 # installed into this image by common-setup.sh — scroll the diff, leave line/range comments, quit, and
-# cbx offers to send them to the box (see review_tui / review_send).
+# muster offers to send them to the box (see review_tui / review_send).
 #
-#   CBX_REVIEW_TUI unset      -> tuicr if it is on PATH, else the plain delta/less pager
-#   CBX_REVIEW_TUI=           -> never a TUI; always the pager (same as passing --plain every time)
-#   CBX_REVIEW_TUI='cmd …'    -> that command instead. The commit range is substituted for a {range}
+#   MUSTER_REVIEW_TUI unset      -> tuicr if it is on PATH, else the plain delta/less pager
+#   MUSTER_REVIEW_TUI=           -> never a TUI; always the pager (same as passing --plain every time)
+#   MUSTER_REVIEW_TUI='cmd …'    -> that command instead. The commit range is substituted for a {range}
 #                                placeholder, or appended when there is none:
-#                                  CBX_REVIEW_TUI='hunk'                -> hunk dev..refs/agents/work1
-#                                  CBX_REVIEW_TUI='delta --paging=always {range}'
+#                                  MUSTER_REVIEW_TUI='hunk'                -> hunk dev..refs/agents/work1
+#                                  MUSTER_REVIEW_TUI='delta --paging=always {range}'
 #                                Only tuicr's comments can be harvested and sent to the box — any other
-#                                command is a viewer, and cbx just falls back to `cbx fix -m` after it.
+#                                command is a viewer, and muster just falls back to `$SELF fix -m` after it.
 # `-` is accepted as a synonym for empty, since an empty value is easy to lose through a wrapper.
 # The placeholder is held in its own variable and NEVER written inline in a ${…}: the '}' of
-# '{range}' would close the parameter expansion early, so `${CBX_REVIEW_TUI-tuicr -r {range}}` silently
+# '{range}' would close the parameter expansion early, so `${MUSTER_REVIEW_TUI-tuicr -r {range}}` silently
 # means "…-tuicr -r {range" followed by a literal '}' — which appends a stray brace to whatever the
 # user set (and only looks right when the variable is unset).
 REVIEW_TUI_PLACEHOLDER='{range}'
 # --no-update-check: tuicr phones GitHub for a newer release at startup. Here the version is pinned by
 # the image (common-setup.sh), so an update notice would only be a slower start and advice you cannot act on.
 REVIEW_TUI_DEFAULT="tuicr --no-update-check -r $REVIEW_TUI_PLACEHOLDER"
-REVIEW_TUI="${CBX_REVIEW_TUI-$REVIEW_TUI_DEFAULT}"
+REVIEW_TUI="${MUSTER_REVIEW_TUI-$REVIEW_TUI_DEFAULT}"
 # `if`, not `[ … ] && …`: under `set -e` a bare test that FAILS becomes the script's exit status, so
-# the common case (a value that isn't '-') would kill cbx right here. Same reason for the guards below.
+# the common case (a value that isn't '-') would kill muster right here. Same reason for the guards below.
 if [ "$REVIEW_TUI" = "-" ]; then REVIEW_TUI=""; fi
 
-# Your project's "make this tree ready to build" command. `cbx golden snapshot --prep` runs it IN THE
+# Your project's "make this tree ready to build" command. `$SELF golden snapshot --prep` runs it IN THE
 # REPO (not in a copy), so it's an optional convenience around the setup you'd otherwise do by hand —
 # and whatever it installs is captured at the path it will actually be used from. Empty by default:
-# claude-box knows nothing about your build — set GOLDEN_PREP_CMD in the stack's .env.
+# muster knows nothing about your build — set GOLDEN_PREP_CMD in the stack's .env.
 GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-}"
 
 # Dev services are declared as MANIFESTS — one file per service in this directory (bind-mounted from
 # the stack's hub-services/, so a service can be added or edited by a file sync, no image rebuild).
 # See svc_load() for the format. Nothing here parses the command: it is handed VERBATIM to `bash -lc`
-# in a tmux window at `cbx up` time, INSIDE the container, so relative paths resolve against the repo
+# in a tmux window at `$SELF up` time, INSIDE the container, so relative paths resolve against the repo
 # and shell substitutions ($(…), $VAR) are evaluated then — which is how the backend's aspectj
 # `-javaagent:$(find …)` gets a path nobody knows until after the build.
 HUB_SERVICES_DIR="${HUB_SERVICES_DIR:-/work/hub-services}"
 
-die() { echo "cbx: $*" >&2; exit 1; }
+die() { echo "$SELF: $*" >&2; exit 1; }
 git_() { git -C "$REPO" "$@"; }
 
 # ---- agent activity -------------------------------------------------------------------------
-# Each box's claude writes "<state> <epoch>" to $HOME/.cbx-state via the cbx-activity hooks (the
+# Each box's claude writes "<state> <epoch>" to $HOME/.cbx-state via the muster-activity hooks (the
 # broker registers them in the shared ~/.claude/settings.json). That file is the box's home anchor,
 # mounted here read-only — so this is a plain file read, no broker round-trip.
 BOXES="${BOXES_DIR:-/work/boxes}"
 # A 'busy' older than this is reported as 'stale': the hooks stopped firing (claude was killed, the
 # box was recreated, hooks aren't installed). Treated as NOT busy, so a stale file can never wedge
 # the workflow — the failure mode of this feature is "no protection", never "can't work".
-ACTIVITY_STALE="${CBX_ACTIVITY_STALE:-900}"
+ACTIVITY_STALE="${MUSTER_ACTIVITY_STALE:-900}"
 
 # Prints "<state> <age-seconds>"; state is busy | waiting | idle | stale | unknown.
 box_activity() {
@@ -170,20 +176,20 @@ guard_busy() {
 	local box="$1" force="${2:-}" st age
 	read -r st age <<< "$(box_activity "$box")"
 	if [ "$st" = busy ] && [ "$force" != --force ]; then
-		echo "cbx: $box is BUSY (working for ${age}s) — not interrupting it." >&2
-		echo "cbx: your text would land in its input mid-task. Wait for idle ('cbx status'), or --force." >&2
+		echo "$SELF: $box is BUSY (working for ${age}s) — not interrupting it." >&2
+		echo "$SELF: your text would land in its input mid-task. Wait for idle ('$SELF status'), or --force." >&2
 		return 1
 	fi
 	return 0
 }
 # ---- terminal presentation ------------------------------------------------------------------
-# Colour is decided ONCE, by colors_init, from $CBX_COLOR (auto|always|never) — never by a `[ -t 1 ]`
-# test at print time. `cbx q` renders a whole frame inside "$(status_overview)", where stdout is a
+# Colour is decided ONCE, by colors_init, from $MUSTER_COLOR (auto|always|never) — never by a `[ -t 1 ]`
+# test at print time. `$SELF q` renders a whole frame inside "$(status_overview)", where stdout is a
 # pipe, so a print-time auto-detect would silently strip every attribute from the live dashboard.
 C_RESET=; C_B=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_MAG=; C_CYA=
 
 colors_init() {
-	local mode="${1:-${CBX_COLOR:-auto}}"
+	local mode="${1:-${MUSTER_COLOR:-auto}}"
 	case "$mode" in
 		never|off|0) mode=off ;;
 		always|on|1) mode=on ;;
@@ -213,10 +219,10 @@ hdr() {
 # would shorten every padded cell by the length of its attribute string and skew the whole table.
 cell() { printf '%s%-*s%s' "$1" "$2" "$3" "$C_RESET"; }
 
-# How wide we may draw. $CBX_COLS is set by the watch loop (where stdout IS a terminal); everywhere
+# How wide we may draw. $MUSTER_COLS is set by the watch loop (where stdout IS a terminal); everywhere
 # else we ask tput and fall back to a sane 100 rather than wrapping a table nobody can read.
 term_cols() {
-	local c="${CBX_COLS:-}"
+	local c="${MUSTER_COLS:-}"
 	[ -n "$c" ] || c="$(tput cols 2>/dev/null || true)"
 	case "$c" in ''|*[!0-9]*) c=100 ;; esac
 	[ "$c" -ge 60 ] || c=100
@@ -267,7 +273,7 @@ have_delta() { command -v delta >/dev/null 2>&1; }
 
 # One pager for a whole review (commits + notes + diff), so nothing gets painted over. delta renders
 # the diff hunks and passes other lines through, which is why the log can share the stream. Falls
-# back to less, and to cat when the output isn't a terminal (piping `cbx review` somewhere).
+# back to less, and to cat when the output isn't a terminal (piping `$SELF review` somewhere).
 review_pager() {
 	if [ ! -t 1 ]; then cat
 	elif have_delta; then delta --paging=always
@@ -282,12 +288,12 @@ review_pager() {
 #   command      (required) the shell run in a tmux window via `bash -lc`. Everything after the first
 #                '=' is taken VERBATIM — quotes, &&, and $(…) all survive to the launch shell, so the
 #                dynamic aspectj path keeps working. Unlike service-env, $VAR is SAFE here (this file
-#                is read only by cbx; compose/the broker never interpolate it).
+#                is read only by muster; compose/the broker never interpolate it).
 #   workdir      (optional) cwd for the command; default is the repo ($REPO). $VAR is expanded.
-#   writes_repo  (optional) true = the service writes into the repo, so `cbx golden snapshot` refuses
+#   writes_repo  (optional) true = the service writes into the repo, so `$SELF golden snapshot` refuses
 #                to run while it is up (a torn snapshot otherwise). Was the hard-coded backend/frontend.
-#   autostart    (optional) true = started automatically at hub boot (`cbx autostart`, from entrypoint).
-#   description  (optional) shown by `cbx svcs`.
+#   autostart    (optional) true = started automatically at hub boot (`$SELF autostart`, from entrypoint).
+#   description  (optional) shown by `$SELF svcs`.
 
 # Parse one manifest into SVC_* globals. Returns 1 (no such manifest) / 2 (no command) / 0 (ok).
 svc_load() {
@@ -331,23 +337,23 @@ svc_running() { tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep 
 
 svc_up() {
 	local svc="$1" cmd
-	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc ('cbx svcs' lists them)"
+	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc ('$SELF svcs' lists them)"
 	if svc_running "$svc"; then
-		echo "cbx: $svc already running (cbx logs $svc to view)"; return 0
+		echo "$SELF: $svc already running ($SELF logs $svc to view)"; return 0
 	fi
 	cmd="$SVC_COMMAND"
 	# workdir overrides the window's default cwd; unquoted so $REPO/$VAR expand in the launch shell.
 	[ -n "$SVC_WORKDIR" ] && cmd="cd $SVC_WORKDIR && $cmd"
 	# keep the window alive after the command exits so failures stay readable
 	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$REPO" \
-		"bash -lc $(printf '%q' "$cmd; echo; echo '[cbx] $svc exited — press enter to close'; read _")"
-	echo "cbx: started $svc (cbx logs $svc to view)"
+		"bash -lc $(printf '%q' "$cmd; echo; echo '[muster] $svc exited — press enter to close'; read _")"
+	echo "$SELF: started $svc ($SELF logs $svc to view)"
 }
 
 svc_down() {
 	local svc="$1"
-	tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null && echo "cbx: stopped $svc" \
-		|| echo "cbx: $svc not running"
+	tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null && echo "$SELF: stopped $svc" \
+		|| echo "$SELF: $svc not running"
 }
 
 svc_logs() {
@@ -376,11 +382,11 @@ svc_autostart() {
 	for svc in $(svc_names); do
 		svc_load "$svc" || continue
 		svc_truthy "$SVC_AUTOSTART" || continue
-		echo "cbx: autostart $svc" >&2
-		svc_up "$svc" || echo "cbx: autostart of $svc failed (continuing)" >&2
+		echo "$SELF: autostart $svc" >&2
+		svc_up "$svc" || echo "$SELF: autostart of $svc failed (continuing)" >&2
 		n=$((n + 1))
 	done
-	[ "$n" -gt 0 ] || echo "cbx: no services marked autostart in $HUB_SERVICES_DIR" >&2
+	[ "$n" -gt 0 ] || echo "$SELF: no services marked autostart in $HUB_SERVICES_DIR" >&2
 }
 
 # ------------------------------------------------------------------ broker
@@ -401,7 +407,7 @@ box_new() {
 	resp="$(broker POST "/box/$name")" || die "spawning box '$name' failed: $resp"
 	container="$(printf '%s' "$resp" | jqr '.container // empty')"
 	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-	echo "cbx: box '$name' up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty'))."
+	echo "$SELF: box '$name' up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty'))."
 	echo "  docker exec -it -u dev $container tmux attach -t main      # Ctrl-b d to detach"
 }
 
@@ -409,7 +415,7 @@ box_kill() {
 	[ $# -ge 1 ] || die "kill needs a box name"
 	local resp
 	resp="$(broker DELETE "/box/$1")" || die "killing box '$1' failed: $resp"
-	echo "cbx: killed box '$1' (its upper layer is kept — 'cbx box $1' reattaches to it)"
+	echo "$SELF: killed box '$1' (its upper layer is kept — '$SELF box $1' reattaches to it)"
 }
 
 box_recreate() {
@@ -418,12 +424,12 @@ box_recreate() {
 	shift
 	[ "${1:-}" = --fresh ] && q="?fresh=1"
 	if [ "$target" = all ]; then
-		echo "cbx: pulling newest image + recreating all boxes (each resumes its own session)..."
+		echo "$SELF: pulling newest image + recreating all boxes (each resumes its own session)..."
 		resp="$(broker POST "/recreate${q}")" || die "recreate all failed: $resp"
-		echo "cbx: recreated: $(printf '%s' "$resp" | jqr '.recreated | join(", ")')"
+		echo "$SELF: recreated: $(printf '%s' "$resp" | jqr '.recreated | join(", ")')"
 	else
 		resp="$(broker POST "/recreate/${target}${q}")" || die "recreate '$target' failed: $resp"
-		echo "cbx: box '$target' recreated as '$(printf '%s' "$resp" | jqr '.container // empty')'."
+		echo "$SELF: box '$target' recreated as '$(printf '%s' "$resp" | jqr '.container // empty')'."
 	fi
 }
 
@@ -433,7 +439,7 @@ forwards_refresh() {
 	# does this on boot; run it by hand if a box's dev server went unreachable without being restarted.
 	local resp
 	resp="$(broker POST "/forwards${1:+/$1}")" || die "refreshing forwards failed: $resp"
-	echo "cbx: re-established forwards for: $(printf '%s' "$resp" | jqr '.forwards | join(", ") // "(none running)"')"
+	echo "$SELF: re-established forwards for: $(printf '%s' "$resp" | jqr '.forwards | join(", ") // "(none running)"')"
 }
 
 box_ls() {
@@ -458,7 +464,7 @@ say_to_box() {
 	# box as a note, not a failure — and a `die` here would abort them AFTER they'd done their work.
 	local box="$1" msg="$2" resp
 	resp="$(broker POST "/box/$box/say" --data-raw "$msg" 2>&1)" || {
-		echo "cbx: could not reach box '$box': $resp" >&2
+		echo "$SELF: could not reach box '$box': $resp" >&2
 		return 1
 	}
 }
@@ -472,7 +478,7 @@ paste_to_box() {
 	# --data-raw is still text and @-free but we want the bytes and newlines untouched.
 	local box="$1" msg="$2" resp
 	resp="$(broker POST "/box/$box/paste" --data-binary @- <<<"$msg" 2>&1)" || {
-		echo "cbx: could not reach box '$box': $resp" >&2
+		echo "$SELF: could not reach box '$box': $resp" >&2
 		return 1
 	}
 }
@@ -534,19 +540,19 @@ rebase_only() {
 
 # merged | new | reviewed | rebased | re-review
 # Measured against the box's BASE, which is $DEV for an ordinary box and the target branch for one
-# spawned by `cbx minto` — a merge box's branch sits on top of the target and would otherwise read as
+# spawned by `$SELF minto` — a merge box's branch sits on top of the target and would otherwise read as
 # "hundreds of commits ahead of dev, conflicts with everything".
 box_status() {
 	# `base`, NOT a local shadowing $DEV: bash locals are dynamically scoped, so a `local DEV` here
-	# would still be unset while base_of (which reads $DEV) runs, and `set -u` would kill cbx.
+	# would still be unset while base_of (which reads $DEV) runs, and `set -u` would kill muster.
 	local box="$1" sha prev base
 	base="$(base_of "$box")"
 	sha="$(git_ rev-parse "refs/agents/$box")"
 	prev="$(reviewed_ref "$box")"
 	# Nothing on top of the base = this branch is already contained in it: it was merged, and only the
-	# ref and the review state were left behind (a conflicted `cbx merge` that you finished by hand
+	# ref and the review state were left behind (a conflicted `$SELF merge` that you finished by hand
 	# does exactly that). Say so FIRST — otherwise the box sits in the queue as 'new' or 're-review'
-	# forever, `cbx review` has an empty range to show, and there is no obvious way out.
+	# forever, `$SELF review` has an empty range to show, and there is no obvious way out.
 	if [ "$(git_ rev-list --count "$base..refs/agents/$box" 2>/dev/null || echo 1)" = 0 ]; then
 		echo merged
 	elif [ -z "$prev" ]; then echo new
@@ -599,7 +605,7 @@ status_overview() {
 	# anything actionable is collected into the "next" list at the bottom in the order you'd do it
 	# (pull before merge before push, so agent work never lands on a stale base).
 	#
-	# `cbx q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
+	# `$SELF q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
 	# is the origin fetch, which `--no-fetch` skips (the watch loop throttles it to $WATCH_FETCH).
 	local behind ahead box sha st bhd ahd age note conf dconf act other list running gprov gsha todo=()
 	local cols nw=3 sumw rows=() row bname bstatus bgolden bstate bage detail
@@ -636,9 +642,9 @@ status_overview() {
 		"$C_B" "$DEV" "$C_RESET" "$C_YEL" "$(git_ rev-parse --short "$DEV")" "$C_RESET" \
 		"$([ "$behind" = 0 ] && printf '%s' "$C_DIM" || printf '%s' "$C_B$C_RED")" "$behind" "$C_RESET" \
 		"$([ "$ahead" = 0 ] && printf '%s' "$C_DIM" || printf '%s' "$C_GRN")" "$ahead" "$C_RESET"
-	[ "$behind" != 0 ] && todo+=("cbx pull                # take $behind commit(s) from origin first")
+	[ "$behind" != 0 ] && todo+=("$SELF pull                # take $behind commit(s) from origin first")
 
-	# Open `cbx minto` worktrees. These have no box and no agent ref, so nothing else on this screen
+	# Open `$SELF minto` worktrees. These have no box and no agent ref, so nothing else on this screen
 	# would show them — and an unfinished merge sitting in .git/cbx/wt is exactly the thing you forget.
 	local wtd wtb
 	for wtd in "$MINTO_WT"/*; do
@@ -646,11 +652,11 @@ status_overview() {
 		wtb="$(git -C "$wtd" symbolic-ref --short -q HEAD 2>/dev/null || basename "$wtd")"
 		printf '  %s%s%s — %sunfinished merge of %s%s, in %s\n' \
 			"$C_B" "$wtb" "$C_RESET" "$C_YEL" "$DEV" "$C_RESET" "$wtd"
-		todo+=("cbx minto $wtb --landed   # finish the merge you started (or --abort)")
+		todo+=("$SELF minto $wtb --landed   # finish the merge you started (or --abort)")
 	done
 
 	# The queue lives INSIDE the overview (rather than beside it) so one screen answers both "who is
-	# waiting on me" and "what do I do about it" — `cbx q --text` still prints the bare table.
+	# waiting on me" and "what do I do about it" — `$SELF q --text` still prints the bare table.
 	hdr queue
 	# 2 indent + name + status(9) + ahead(5) + behind(6) + last(13), each with a space after it.
 	sumw=$(( cols - nw - 39 ))
@@ -684,8 +690,8 @@ status_overview() {
 				"$C_MAG" "$(trunc "$sumw" "[minto -> $mtgt] ${note:-—}")" "$C_RESET"
 			# No conflict scan: a merge box collides with $DEV and with every other box by construction.
 			case "$st" in
-				new|re-review) todo+=("cbx review $box            # the conflict resolution for $mtgt") ;;
-				*)             todo+=("cbx minto $mtgt --land $box   # land the resolved merge") ;;
+				new|re-review) todo+=("$SELF review $box            # the conflict resolution for $mtgt") ;;
+				*)             todo+=("$SELF minto $mtgt --land $box   # land the resolved merge") ;;
 			esac
 			continue
 		fi
@@ -711,10 +717,10 @@ status_overview() {
 				"$nw" "" "$C_B$C_RED" "$other" "$C_RESET" "$(trunc "$((cols - nw - 22 - ${#other}))" "$conf")"
 		done
 		case "$st" in
-			merged)        act="cbx merge $box            # already in $DEV — retires the branch, tells the box" ;;
-			new|re-review) act="cbx review $box" ;;
-			rebased)       act="cbx merge $box            # rebased only, nothing new to read" ;;
-			reviewed)      act="cbx merge $box" ;;
+			merged)        act="$SELF merge $box            # already in $DEV — retires the branch, tells the box" ;;
+			new|re-review) act="$SELF review $box" ;;
+			rebased)       act="$SELF merge $box            # rebased only, nothing new to read" ;;
+			reviewed)      act="$SELF merge $box" ;;
 			*)             act="" ;;
 		esac
 		# 'merged' outranks the conflict check below: there is nothing left to rebase or review, and
@@ -723,17 +729,17 @@ status_overview() {
 		# ORDER MATTERS HERE — this list is read as "do the top one next".
 		#
 		# A branch that CONFLICTS with $DEV has to rebase before anything else: the rebase rewrites the
-		# very lines you would be reading, so a review done first is read twice, and `cbx merge` would
+		# very lines you would be reading, so a review done first is read twice, and `$SELF merge` would
 		# stop halfway through with conflicts in the hub's worktree. So the rebase replaces the
 		# review/merge suggestion rather than trailing it — reviewing is not the next step, it is the
 		# step after. Merely being BEHIND is different: the patches still apply, so the review stands
-		# and the rebase is the follow-up (cheap, and `cbx merge` does it for you anyway).
+		# and the rebase is the follow-up (cheap, and `$SELF merge` does it for you anyway).
 		if [ -n "$dconf" ]; then
-			todo+=("cbx rebase $box           # CONFLICTS with $DEV — rebase before reviewing/merging")
+			todo+=("$SELF rebase $box           # CONFLICTS with $DEV — rebase before reviewing/merging")
 		else
 			if [ -n "$act" ]; then todo+=("$act"); fi
 			if [ "$bhd" != 0 ] && [ "$bhd" != '?' ]; then
-				todo+=("cbx rebase $box           # $bhd commit(s) behind $DEV")
+				todo+=("$SELF rebase $box           # $bhd commit(s) behind $DEV")
 			fi
 		fi
 	done
@@ -742,7 +748,7 @@ status_overview() {
 	if [ -z "$running" ]; then
 		printf '  %s(broker unreachable)%s\n' "$C_RED" "$C_RESET"
 	elif [ "${#rows[@]}" -eq 0 ]; then
-		printf '  %s(no boxes running — cbx box <name> to start one)%s\n' "$C_DIM" "$C_RESET"
+		printf '  %s(no boxes running — $SELF box <name> to start one)%s\n' "$C_DIM" "$C_RESET"
 	fi
 	for row in ${rows[@]+"${rows[@]}"}; do
 		bname="${row%%$'\t'*}"; bstatus="${row#*$'\t'}"
@@ -764,7 +770,7 @@ status_overview() {
 	gprov="$(cat "$GOLDEN/current/.git/cbx-golden" 2>/dev/null || true)"
 	if [ -z "$gprov" ]; then
 		printf '  %s(none yet)%s\n' "$C_DIM" "$C_RESET"
-		todo+=("cbx golden snapshot     # no base for boxes to overlay")
+		todo+=("$SELF golden snapshot     # no base for boxes to overlay")
 	else
 		printf '  %s%s%s\n' "$C_DIM" "$gprov" "$C_RESET"
 		# Field 3 of "g-<id> from <sha> (<branch>) at <date>" — a hint only, so it is never fatal.
@@ -777,11 +783,11 @@ status_overview() {
 
 	hdr next
 	if [ "${#todo[@]}" -eq 0 ]; then
-		[ "$ahead" != 0 ] && todo_line "cbx push                # $ahead commit(s) to origin" \
+		[ "$ahead" != 0 ] && todo_line "$SELF push                # $ahead commit(s) to origin" \
 			|| printf '  %s(nothing to do)%s\n' "$C_DIM" "$C_RESET"
 	else
 		for row in "${todo[@]}"; do todo_line "$row"; done
-		[ "$ahead" != 0 ] && [ "$behind" = 0 ] && todo_line "cbx push                # $ahead commit(s) to origin"
+		[ "$ahead" != 0 ] && [ "$behind" = 0 ] && todo_line "$SELF push                # $ahead commit(s) to origin"
 	fi
 	return 0
 }
@@ -799,7 +805,7 @@ todo_line() {
 		"${why:+ $C_DIM$why$C_RESET}"
 }
 
-# ------------------------------------------------------------------ live watch (`cbx q`)
+# ------------------------------------------------------------------ live watch (`$SELF q`)
 #
 # Repaints status_overview on an interval and RINGS THE TERMINAL BELL on the two things worth
 # looking up from what you were doing:
@@ -811,8 +817,8 @@ todo_line() {
 # Everything here is polled, never pushed: the box activity file and the agent refs are both local
 # reads on the hub, so a short interval is cheap. The ONE network call in a frame is the origin fetch
 # in status_overview, which is throttled to $WATCH_FETCH (the rest of the frames pass --no-fetch).
-WATCH_INTERVAL="${CBX_WATCH_INTERVAL:-5}"
-WATCH_FETCH="${CBX_WATCH_FETCH:-60}"
+WATCH_INTERVAL="${MUSTER_WATCH_INTERVAL:-5}"
+WATCH_FETCH="${MUSTER_WATCH_FETCH:-60}"
 WATCH_EVENTS=()
 WATCH_RING=0
 
@@ -863,7 +869,7 @@ watch_queue() {
 		esac
 		shift
 	done
-	case "$interval" in ''|*[!0-9]*) die "q: -n wants whole seconds (e.g. cbx q -n 10)" ;; esac
+	case "$interval" in ''|*[!0-9]*) die "q: -n wants whole seconds (e.g. $SELF q -n 10)" ;; esac
 	[ "$interval" -ge 1 ] || die "q: -n must be at least 1 second"
 	# Nothing to watch when the output is a pipe or a file — repainting would just append frames
 	# forever. Options are still parsed above, so a typo is an error either way.
@@ -871,14 +877,14 @@ watch_queue() {
 	# We KNOW stdout is a terminal here, and the frame is rendered through a command substitution
 	# where nothing downstream could work that out — so decide colour and width once, up here, and
 	# let status_overview inherit both.
-	colors_init "${CBX_COLOR:-always}"
+	colors_init "${MUSTER_COLOR:-always}"
 
 	while :; do
 		# Re-read every frame: the window can be resized between repaints, and a stale width would
 		# either wrap the table or leave a ragged right margin until the next restart.
-		CBX_COLS="$(tput cols 2>/dev/null || echo 100)"
-		case "$CBX_COLS" in ''|*[!0-9]*) CBX_COLS=100 ;; esac
-		[ "$CBX_COLS" -ge 60 ] || CBX_COLS=100
+		MUSTER_COLS="$(tput cols 2>/dev/null || echo 100)"
+		case "$MUSTER_COLS" in ''|*[!0-9]*) MUSTER_COLS=100 ;; esac
+		[ "$MUSTER_COLS" -ge 60 ] || MUSTER_COLS=100
 		now_act=(); now_ref=()
 		while read -r box st;  do [ -n "$box" ] && now_act["$box"]="$st"; done < <(activity_snapshot)
 		while read -r box sha; do [ -n "$box" ] && now_ref["$box"]="$sha"; done < <(ref_snapshot)
@@ -890,9 +896,9 @@ watch_queue() {
 				st="${now_act[$box]}"; prev="${act[$box]-}"
 				if [ "$prev" = busy ] && [ "$st" != busy ]; then
 					if [ "$st" = waiting ]; then
-						watch_event "$C_B$C_MAG" "$box stopped working and is ASKING YOU something  (cbxbox $box)"
+						watch_event "$C_B$C_MAG" "$box stopped working and is ASKING YOU something  (<prefix>box $box)"
 					else
-						watch_event "$C_YEL" "$box stopped working — now $st  (cbx q / cbxbox $box)"
+						watch_event "$C_YEL" "$box stopped working — now $st  ($SELF q / cbxbox $box)"
 					fi
 				elif [ "$prev" != waiting ] && [ -n "$prev" ] && [ "$st" = waiting ]; then
 					watch_event "$C_B$C_MAG" "$box wants your input  (cbxbox $box)"
@@ -900,9 +906,9 @@ watch_queue() {
 			done
 			for box in "${!now_ref[@]}"; do
 				if [ -z "${ref[$box]-}" ]; then
-					watch_event "$C_B$C_GRN" "$box HANDED OFF — review request  (cbx review $box)"
+					watch_event "$C_B$C_GRN" "$box HANDED OFF — review request  ($SELF review $box)"
 				elif [ "${ref[$box]}" != "${now_ref[$box]}" ]; then
-					watch_event "$C_GRN" "$box pushed again — re-review  (cbx review $box)"
+					watch_event "$C_GRN" "$box pushed again — re-review  ($SELF review $box)"
 				fi
 			done
 		fi
@@ -920,12 +926,12 @@ watch_queue() {
 		[ "$bell" = 1 ] || hint="$hint · bell OFF"
 		clock="$(date +%H:%M:%S)"
 		# Title bar: name + hints on the left, clock hard against the right margin. The pad is computed
-		# from the PLAIN text (15 = " cbx q · live " plus the space before the hint), never from the
+		# from the PLAIN text (15 = " $SELF q · live " plus the space before the hint), never from the
 		# printed string — that one carries attribute bytes that occupy no columns.
-		pad=$(( CBX_COLS - ${#hint} - ${#clock} - 15 ))
+		pad=$(( MUSTER_COLS - ${#hint} - ${#clock} - 15 ))
 		[ "$pad" -ge 1 ] || pad=1
 		printf '\033[H\033[2J'
-		printf '%s cbx q · live %s %s%s%s%*s%s%s%s\n\n' \
+		printf '%s $SELF q · live %s %s%s%s%*s%s%s%s\n\n' \
 			"$C_B$C_CYA" "$C_RESET" "$C_DIM" "$hint" "$C_RESET" "$pad" "" "$C_B" "$clock" "$C_RESET"
 		printf '%s\n' "$frame"
 		if [ "${#WATCH_EVENTS[@]}" -gt 0 ]; then
@@ -943,7 +949,7 @@ watch_queue() {
 		# the interval. Timeout returns non-zero — harmless here, `if` disarms errexit.
 		if [ -t 0 ]; then
 			if read -rsn1 -t "$interval" key; then
-				case "$key" in q|Q) echo; echo "cbx: stopped watching."; return 0 ;; esac
+				case "$key" in q|Q) echo; echo "$SELF: stopped watching."; return 0 ;; esac
 			fi
 		else
 			sleep "$interval"
@@ -953,9 +959,9 @@ watch_queue() {
 
 # ---- the review TUI (tuicr) ------------------------------------------------------------------
 #
-# `cbx review` opens $REVIEW_TUI on the agent's branch instead of paging a diff at you. With tuicr
+# `$SELF review` opens $REVIEW_TUI on the agent's branch instead of paging a diff at you. With tuicr
 # (the default) the loop closes: you leave line/range comments in the TUI, quit, and cbx reads the
-# comments back out and offers to send them to the box — no retyping them into `cbx fix -m`.
+# comments back out and offers to send them to the box — no retyping them into `$SELF fix -m`.
 #
 # The handover is tuicr's PERSISTED SESSION, not its `y`/--stdout clipboard export: the export is a
 # key you have to remember to press, and --stdout writes into the same stream the TUI paints on
@@ -966,7 +972,7 @@ watch_queue() {
 # afterwards, and delete the session once it has been sent.
 
 have_tui() { [ -n "$REVIEW_TUI" ] && command -v "${REVIEW_TUI%% *}" >/dev/null 2>&1; }
-# Only tuicr's comments can be harvested; any other CBX_REVIEW_TUI is treated as a viewer.
+# Only tuicr's comments can be harvested; any other MUSTER_REVIEW_TUI is treated as a viewer.
 tui_is_tuicr() { [ "$(basename "${REVIEW_TUI%% *}")" = tuicr ]; }
 
 # Run the TUI on <range>, leaving TUI_SESSION set to tuicr's session slug (empty for anything else).
@@ -983,7 +989,7 @@ run_review_tui() {
 	( cd "$REPO" && eval "$cmd" ) 2>"$errf" || rc=$?
 	TUI_SESSION="$(sed -n 's/^tuicr-session: //p' "$errf" | tail -1)"
 	if [ "$rc" -ne 0 ]; then
-		echo "cbx: the review TUI ('$cmd') failed:" >&2
+		echo "$SELF: the review TUI ('$cmd') failed:" >&2
 		sed 's/^/  /' "$errf" >&2
 	fi
 	rm -f "$errf"
@@ -1048,7 +1054,7 @@ tty_flush() {
 # THE CONFIRM STEP, and the ONLY place a TUI review becomes real. Quitting the TUI decides nothing:
 # not whether the comments are sent, and not whether the review is recorded at all. That matters
 # because "I opened it, looked at the first hunk and backed out" has to be indistinguishable from
-# never having run `cbx review` — otherwise the box silently leaves the 'new' queue and you lose the
+# never having run `$SELF review` — otherwise the box silently leaves the 'new' queue and you lose the
 # one signal that says nobody has read this yet.
 review_finish() {
 	local box="$1" sha="$2" slug="$3" md ids tmp ans
@@ -1057,12 +1063,12 @@ review_finish() {
 	if [ -z "$md" ]; then
 		# Nothing written. Still a decision: reviewed-and-happy, or "I did not really look".
 		tty_flush
-		printf 'cbx: no comments. [m]ark %s reviewed  [l]eave it unreviewed ? ' "$box"
+		printf '$SELF: no comments. [m]ark %s reviewed  [l]eave it unreviewed ? ' "$box"
 		read -r ans </dev/tty || ans=l
 		case "$ans" in
-			l|L) echo "cbx: left alone — $box is still '$(box_status "$box")'." ;;
+			l|L) echo "$SELF: left alone — $box is still '$(box_status "$box")'." ;;
 			*)   mark_reviewed "$box" "$sha"
-			     echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx merge $box | cbx fix $box -m '...' | cbx drop $box" ;;
+			     echo "$SELF: reviewed up to $(git_ rev-parse --short "$sha"). Next: $SELF merge $box | $SELF fix $box -m '...' | $SELF drop $box" ;;
 		esac
 		return 0
 	fi
@@ -1077,18 +1083,18 @@ review_finish() {
 		# NB an EOF/read failure lands on 'd' — the option that changes nothing.
 		case "$ans" in
 			s|S|"")
-				guard_busy "$box" || { echo "cbx: not sent — the review is still saved, re-run 'cbx review $box'."; return 1; }
+				guard_busy "$box" || { echo "$SELF: not sent — the review is still saved, re-run '$SELF review $box'."; return 1; }
 				paste_to_box "$box" "Review feedback on your handoff:
 
 $md
 
 Please address each point on your branch, then run: handoff" \
-					|| { echo "cbx: feedback NOT delivered — is the box running? (cbx ls)" >&2
-					     echo "cbx: the review is still saved; re-run 'cbx review $box' to retry." >&2; return 1; }
+					|| { echo "$SELF: feedback NOT delivered — is the box running? ($SELF ls)" >&2
+					     echo "$SELF: the review is still saved; re-run '$SELF review $box' to retry." >&2; return 1; }
 				# Sent = consumed, recorded HERE rather than by touching tuicr's store (see review_harvest).
 				if [ -n "$ids" ]; then printf '%s\n' "$ids" >> "$STATE/$box.sent"; fi
 				mark_reviewed "$box" "$sha"
-				echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
+				echo "$SELF: sent to $box. It will push again when done ('$SELF q' shows re-review)."
 				return 0
 				;;
 			e|E)
@@ -1098,18 +1104,18 @@ Please address each point on your branch, then run: handoff" \
 				# with anything else on stdin renders to a dead terminal and hangs.
 				"${EDITOR:-vim}" "$tmp" </dev/tty >/dev/tty 2>&1 || true
 				md="$(cat "$tmp")"; rm -f "$tmp"
-				[ -n "${md//[[:space:]]/}" ] || { echo "cbx: emptied — nothing to send."; return 0; }
+				[ -n "${md//[[:space:]]/}" ] || { echo "$SELF: emptied — nothing to send."; return 0; }
 				;;
 			d|D)
 				# Deliberately records NOTHING: no feedback to the box and no .reviewed, so the queue
-				# looks exactly as it did before you ran `cbx review`. The comments stay in tuicr, so
+				# looks exactly as it did before you ran `$SELF review`. The comments stay in tuicr, so
 				# re-running it picks the same review back up.
-				echo "cbx: nothing sent, nothing recorded — $box is still '$(box_status "$box")'."
-				echo "     Your comments stay in tuicr; 'cbx review $box' picks them up again."
+				echo "$SELF: nothing sent, nothing recorded — $box is still '$(box_status "$box")'."
+				echo "     Your comments stay in tuicr; '$SELF review $box' picks them up again."
 				echo "     To throw them away: tuicr review list --repo $REPO   (then delete that session's file)"
 				return 0
 				;;
-			*) echo "cbx: answer s (send), e (edit) or d (discard)." ;;
+			*) echo "$SELF: answer s (send), e (edit) or d (discard)." ;;
 		esac
 	done
 }
@@ -1142,7 +1148,7 @@ review() {
 	local mtgt; mtgt="$(minto_target "$box")"
 	if [ -n "$mtgt" ]; then
 		if [ -n "$prev" ] && [ "$prev" != "$sha" ]; then
-			echo "cbx: $box re-resolved since your last look ($(git_ rev-parse --short "$prev") -> $(git_ rev-parse --short "$sha"))."
+			echo "$SELF: $box re-resolved since your last look ($(git_ rev-parse --short "$prev") -> $(git_ rev-parse --short "$sha"))."
 			echo
 		fi
 		{
@@ -1165,26 +1171,26 @@ review() {
 		} | review_pager
 		mark_reviewed "$box" "$sha"
 		echo
-		echo "cbx: reviewed $(git_ rev-parse --short "$sha")."
-		echo "cbx: land it     — cbx minto $mtgt --land $box"
-		echo "cbx: or fix it   — cbx fix $box -m 'take the ... side in <file>, because ...'"
-		echo "cbx: or drop it  — cbx minto $mtgt --abort"
+		echo "$SELF: reviewed $(git_ rev-parse --short "$sha")."
+		echo "$SELF: land it     — $SELF minto $mtgt --land $box"
+		echo "$SELF: or fix it   — $SELF fix $box -m 'take the ... side in <file>, because ...'"
+		echo "$SELF: or drop it  — $SELF minto $mtgt --abort"
 		return 0
 	fi
 	# Nothing on top of $DEV: the work is already in, so there is no diff to show. Without this you get
 	# an empty range-diff ("1: abc123 < -: ---------") and no hint that the way out is a merge that
 	# only does bookkeeping.
 	if [ "$(git_ rev-list --count "$DEV..$ref")" = 0 ]; then
-		echo "cbx: $box has nothing on top of $DEV — its work is already merged."
-		echo "cbx: nothing to review. Retire the branch and tell the box with: cbx merge $box"
+		echo "$SELF: $box has nothing on top of $DEV — its work is already merged."
+		echo "$SELF: nothing to review. Retire the branch and tell the box with: $SELF merge $box"
 		return 0
 	fi
 	# A rebase rewrites every sha, so the branch looks changed even when the agent added nothing. Say
 	# so up front — otherwise the range-diff below (one '=' line per carried-over commit) reads like
 	# new work you have to re-read.
 	if [ -n "$prev" ] && [ "$prev" != "$sha" ] && rebase_only "$box"; then
-		echo "cbx: $box was only REBASED onto a newer $DEV since your last review — same patches, new shas."
-		echo "cbx: nothing new to read; 'cbx merge $box' when ready (--full to see the branch anyway)."
+		echo "$SELF: $box was only REBASED onto a newer $DEV since your last review — same patches, new shas."
+		echo "$SELF: nothing new to read; '$SELF merge $box' when ready (--full to see the branch anyway)."
 		echo
 	fi
 
@@ -1210,14 +1216,14 @@ review() {
 	fi
 	if [ -n "$plain" ]; then use_tui=""
 	elif ! have_tui; then
-		if [ -n "$tui" ]; then die "review: no review TUI on PATH (CBX_REVIEW_TUI='$REVIEW_TUI')"; fi
+		if [ -n "$tui" ]; then die "review: no review TUI on PATH (MUSTER_REVIEW_TUI='$REVIEW_TUI')"; fi
 		use_tui=""
 	elif [ -n "$tui" ]; then use_tui=1
 	elif [ -n "$net" ]; then use_tui=""      # --net names a pager rendering (one combined diff)
 	elif [ -n "$incremental" ]; then
 		use_tui=""
-		echo "cbx: $box AMENDED what you already reviewed — showing the range-diff (pager)."
-		echo "cbx: '--tui' opens ${REVIEW_TUI%% *} on the whole branch instead."
+		echo "$SELF: $box AMENDED what you already reviewed — showing the range-diff (pager)."
+		echo "$SELF: '--tui' opens ${REVIEW_TUI%% *} on the whole branch instead."
 		echo
 	else use_tui=1
 	fi
@@ -1236,14 +1242,14 @@ review() {
 		# range, so its comments anchor to the new work instead of the whole branch again.
 		if [ -n "$added" ]; then
 			base="$prev"
-			echo "cbx: $box added $(git_ rev-list --count "$prev..$ref") commit(s) since your last review — showing just those ('--full' for the branch)."
+			echo "$SELF: $box added $(git_ rev-list --count "$prev..$ref") commit(s) since your last review — showing just those ('--full' for the branch)."
 			echo
 		fi
 		run_review_tui "$base..$ref" || rc=$?
 		# Interrupted (Ctrl-C, SIGHUP, the terminal going away) is NOT a broken TUI: you bailed out.
 		# Fall through to neither the pager nor the confirm step, and leave the queue untouched.
 		if [ "$rc" -ge 128 ]; then
-			echo "cbx: review interrupted — nothing sent, nothing recorded ($box is still '$(box_status "$box")')."
+			echo "$SELF: review interrupted — nothing sent, nothing recorded ($box is still '$(box_status "$box")')."
 			return 0
 		fi
 		if [ "$rc" -eq 0 ]; then
@@ -1254,11 +1260,11 @@ review() {
 			else
 				# A viewer with no comments to harvest: nothing to confirm, so record it like the pager.
 				mark_reviewed "$box" "$sha"
-				echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
+				echo "$SELF: reviewed up to $(git_ rev-parse --short "$sha"). Next: $SELF fix $box -m '...' | $SELF merge $box | $SELF drop $box"
 			fi
 			return 0
 		fi
-		echo "cbx: falling back to the plain pager." >&2
+		echo "$SELF: falling back to the plain pager." >&2
 		echo >&2
 	fi
 
@@ -1307,7 +1313,7 @@ review() {
 	# TUI path asks first — that is where "I opened it and backed out" is a thing that happens.
 	mark_reviewed "$box" "$sha"
 	echo
-	echo "cbx: reviewed up to $(git_ rev-parse --short "$sha"). Next: cbx fix $box -m '...' | cbx merge $box | cbx drop $box"
+	echo "$SELF: reviewed up to $(git_ rev-parse --short "$sha"). Next: $SELF fix $box -m '...' | $SELF merge $box | $SELF drop $box"
 }
 
 fix() {
@@ -1319,11 +1325,11 @@ fix() {
 	done
 	set -- "${args[@]+"${args[@]}"}"
 	[ "${1:-}" = -m ] && { shift; msg="$*"; } || msg="$*"
-	[ -n "$msg" ] || die "fix needs a message: cbx fix $box -m 'what to change'"
+	[ -n "$msg" ] || die "fix needs a message: $SELF fix $box -m 'what to change'"
 	guard_busy "$box" "$force" || exit 1
 	say_to_box "$box" "Review feedback on your handoff: ${msg}. Please fix it on your branch, then run: handoff" \
-		|| die "feedback NOT delivered — is the box running? (cbx ls)"
-	echo "cbx: sent to $box. It will push again when done ('cbx q' shows re-review)."
+		|| die "feedback NOT delivered — is the box running? ($SELF ls)"
+	echo "$SELF: sent to $box. It will push again when done ('$SELF q' shows re-review)."
 }
 
 prereview() {
@@ -1332,7 +1338,7 @@ prereview() {
 	# Cheap capacity multiplier: the agent re-reads its OWN diff critically before you spend a round on
 	# it. This is self-review, not an independent reviewer — see README-remote.md for the difference.
 	say_to_box "$1" "Before I review this: run 'mydiff' and read your own change critically against the project's conventions in CLAUDE.md — dead code, missing tests, unhandled errors, anything you would flag in someone else's PR. Fix what you find, then run: handoff"
-	echo "cbx: asked $1 to self-review and re-hand off."
+	echo "$SELF: asked $1 to self-review and re-hand off."
 }
 
 # Everything that has to happen once an agent's work is IN $DEV: retire the ref, clear the review
@@ -1340,7 +1346,7 @@ prereview() {
 #
 # This is a separate function because the CONFLICT path leaves merge() through `die`. You then resolve
 # in the hub's repo and commit — the work has landed, but the ref and the '.reviewed' state are still
-# sitting there, so `cbx q` goes on offering `cbx merge <box>` forever and the merge itself now says
+# sitting there, so `$SELF q` goes on offering `$SELF merge <box>` forever and the merge itself now says
 # "nothing was merged" every time. That dead end is what this closes.
 merge_finish() {
 	local box="$1" ref="refs/agents/$box" mstate mage after_rebase resume_note fbehind fahead
@@ -1349,7 +1355,7 @@ merge_finish() {
 	# --reword messages: they are keyed to commits that have now landed.
 	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
 	rm -rf "$(reword_dir "$box")"
-	echo "cbx: dropped refs/agents/$box (merged)"
+	echo "$SELF: dropped refs/agents/$box (merged)"
 	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
 	# of work starts from what you just landed.
 	#
@@ -1367,21 +1373,21 @@ merge_finish() {
 		resume_note="and then wait for instructions"
 	fi
 	if say_to_box "$box" "Your work was merged into ${DEV}. Run exactly: git fetch hub && git rebase hub/${DEV} — that only replays the commits you have already made onto the merged ${DEV}. It is NOT a request for new changes, and nothing in the merge needs fixing. ${after_rebase}"; then
-		echo "cbx: asked $box to rebase onto $DEV $resume_note"
+		echo "$SELF: asked $box to rebase onto $DEV $resume_note"
 	else
-		echo "cbx: (box $box not reachable — rebase it later with 'cbx rebase $box')"
+		echo "$SELF: (box $box not reachable — rebase it later with '$SELF rebase $box')"
 	fi
 	# Not a blanket "NOT pushed yet": when you finished the merge by hand you may well have pushed
 	# already, and being told to push again is how you end up wondering which of the two is true.
 	read -r fbehind fahead <<< "$(divergence)"
 	if [ "$fahead" != 0 ]; then
-		echo "cbx: $fahead commit(s) on $DEV are not on origin yet. Run: cbx push"
+		echo "$SELF: $fahead commit(s) on $DEV are not on origin yet. Run: $SELF push"
 	else
-		echo "cbx: origin already has $DEV — nothing left to push."
+		echo "$SELF: origin already has $DEV — nothing left to push."
 	fi
 }
 
-# ------------------------------------------------------------------ reword (`cbx merge --reword`)
+# ------------------------------------------------------------------ reword (`$SELF merge --reword`)
 #
 # Agents write serviceable commit messages, not the ones you want in the history of $DEV. `--squash
 # --edit` collapses the branch into one commit you can word yourself, but that throws the structure
@@ -1414,8 +1420,8 @@ reword_tui() {
 	# chain with commit-tree, which would silently flatten it and drop one side's history. Rare (agents
 	# work on their own branch), but it would be data loss disguised as a reword.
 	if [ -n "$(git_ rev-list --merges "$base..$ref")" ]; then
-		echo "cbx: $box's branch contains a merge commit — --reword can only rewrite a linear chain." >&2
-		die "use 'cbx merge $box --squash --edit' instead, or reword it by hand in a worktree"
+		echo "$SELF: $box's branch contains a merge commit — --reword can only rewrite a linear chain." >&2
+		die "use '$SELF merge $box --squash --edit' instead, or reword it by hand in a worktree"
 	fi
 	while read -r c; do commits+=("$c"); done < <(git_ rev-list --reverse "$base..$ref")
 	n="${#commits[@]}"
@@ -1451,18 +1457,18 @@ reword_tui() {
 			a|A)
 				for c in "${commits[@]}"; do reword_open "$box" "$c"; done ;;
 			d*|D*)
-				if [ -z "$arg" ]; then echo "cbx: which one? e.g. 'd2'"; continue; fi
+				if [ -z "$arg" ]; then echo "$SELF: which one? e.g. 'd2'"; continue; fi
 				reword_show "$box" "$arg" "${commits[@]}" ;;
 			r*|R*)
-				if [ -z "$arg" ]; then echo "cbx: which one? e.g. 'r2'"; continue; fi
+				if [ -z "$arg" ]; then echo "$SELF: which one? e.g. 'r2'"; continue; fi
 				reword_revert "$box" "$arg" "${commits[@]}" ;;
 			m|M|"")
 				REWORD_TIP="$(reword_apply "$box" "$base" "${commits[@]}")"
 				return 0 ;;
 			q|Q)
-				echo "cbx: not merged. Your edited messages are kept — 'cbx merge $box --reword' picks them up."
+				echo "$SELF: not merged. Your edited messages are kept — '$SELF merge $box --reword' picks them up."
 				return 1 ;;
-			*) echo "cbx: answer a number (edit that one), a (all), d<n>, r<n>, m (merge) or q (quit)." ;;
+			*) echo "$SELF: answer a number (edit that one), a (all), d<n>, r<n>, m (merge) or q (quit)." ;;
 		esac
 	done
 }
@@ -1490,7 +1496,7 @@ reword_open() {
 	rm -f "$tmp"
 	if [ -z "${body//[[:space:]]/}" ]; then
 		rm -f "$dir/$c"
-		echo "cbx: left $(git_ rev-parse --short "$c") with the agent's original message."
+		echo "$SELF: left $(git_ rev-parse --short "$c") with the agent's original message."
 	else
 		printf '%s\n' "$body" > "$dir/$c"
 	fi
@@ -1509,24 +1515,24 @@ reword_pick() {
 
 reword_one() {
 	local box="$1" sel="$2"; shift 2
-	local c; c="$(reword_pick "$sel" "$@")" || { echo "cbx: no commit $sel (1-$#)."; return 0; }
+	local c; c="$(reword_pick "$sel" "$@")" || { echo "$SELF: no commit $sel (1-$#)."; return 0; }
 	reword_open "$box" "$c"
 }
 
 reword_show() {
 	local box="$1" sel="$2"; shift 2
-	local c; c="$(reword_pick "$sel" "$@")" || { echo "cbx: no commit $sel (1-$#)."; return 0; }
+	local c; c="$(reword_pick "$sel" "$@")" || { echo "$SELF: no commit $sel (1-$#)."; return 0; }
 	git_ show --color=always "$c" | review_pager
 }
 
 reword_revert() {
 	local box="$1" sel="$2"; shift 2
-	local c; c="$(reword_pick "$sel" "$@")" || { echo "cbx: no commit $sel (1-$#)."; return 0; }
+	local c; c="$(reword_pick "$sel" "$@")" || { echo "$SELF: no commit $sel (1-$#)."; return 0; }
 	rm -f "$(reword_dir "$box")/$c"
-	echo "cbx: $(git_ rev-parse --short "$c") is back to the agent's own message."
+	echo "$SELF: $(git_ rev-parse --short "$c") is back to the agent's own message."
 }
 
-# Replay the chain with the new messages. Object-store only (commit-tree), like `cbx minto`: each new
+# Replay the chain with the new messages. Object-store only (commit-tree), like `$SELF minto`: each new
 # commit keeps its original TREE — so the code that lands is byte-for-byte what you reviewed — and its
 # original AUTHOR and author date. Only the message and the parent change. Prints the new tip.
 reword_apply() {
@@ -1565,11 +1571,11 @@ merge() {
 	# destructive mistake available in this workflow. Refuse, and name the command that is meant.
 	local mtgt; mtgt="$(minto_target "$box")"
 	if [ -n "$mtgt" ]; then
-		echo "cbx: '$box' is resolving a merge of $DEV INTO $mtgt — it does not belong in $DEV." >&2
-		echo "cbx: merging it here would pull all of $mtgt's history into $DEV." >&2
-		echo "cbx: review it — cbx review $box" >&2
-		echo "cbx: land it   — cbx minto $mtgt --land $box" >&2
-		echo "cbx: drop it   — cbx minto $mtgt --abort" >&2
+		echo "$SELF: '$box' is resolving a merge of $DEV INTO $mtgt — it does not belong in $DEV." >&2
+		echo "$SELF: merging it here would pull all of $mtgt's history into $DEV." >&2
+		echo "$SELF: review it — $SELF review $box" >&2
+		echo "$SELF: land it   — $SELF minto $mtgt --land $box" >&2
+		echo "$SELF: drop it   — $SELF minto $mtgt --abort" >&2
 		die "refusing to merge a minto box into $DEV"
 	fi
 
@@ -1579,10 +1585,10 @@ merge() {
 	# index conflicted without ever writing MERGE_HEAD, so checking for that file alone misses half
 	# the cases.
 	if [ -n "$(git_ ls-files -u | head -1)" ]; then
-		echo "cbx: $REPO still has UNRESOLVED conflicts from an earlier merge:" >&2
+		echo "$SELF: $REPO still has UNRESOLVED conflicts from an earlier merge:" >&2
 		git_ diff --name-only --diff-filter=U | sed 's/^/    /' >&2
-		echo "cbx: finish it   — resolve them, 'git add' + 'git commit', then: cbx merge $box${squash:+ --landed}" >&2
-		echo "cbx: or drop it  — git -C $REPO merge --abort   (then 'cbx merge $box' from scratch)" >&2
+		echo "$SELF: finish it   — resolve them, 'git add' + 'git commit', then: $SELF merge $box${squash:+ --landed}" >&2
+		echo "$SELF: or drop it  — git -C $REPO merge --abort   (then '$SELF merge $box' from scratch)" >&2
 		die "refusing to merge on top of an unfinished merge"
 	fi
 
@@ -1590,8 +1596,8 @@ merge() {
 	# Close the books instead of running a merge that can only say "nothing was merged". Checked
 	# BEFORE the stale-origin refusal below, so a moved origin can't trap you in this state.
 	if git_ merge-base --is-ancestor "$ref" "$DEV" 2>/dev/null; then
-		echo "cbx: refs/agents/$box is already contained in $DEV — nothing to merge."
-		echo "cbx: closing it out (this is the state a conflicted merge leaves behind once you commit the fix)."
+		echo "$SELF: refs/agents/$box is already contained in $DEV — nothing to merge."
+		echo "$SELF: closing it out (this is the state a conflicted merge leaves behind once you commit the fix)."
 		merge_finish "$box"
 		return 0
 	fi
@@ -1599,8 +1605,8 @@ merge() {
 	# hand-written commit, so the content landed while the agent's commits are not ancestors of $DEV.
 	# Nothing can prove that from the graph, so it is an explicit assertion by you.
 	if [ -n "$landed" ]; then
-		echo "cbx: --landed: taking your word that $box's work is already in $DEV, and closing it out."
-		echo "cbx: (its commits are NOT ancestors of $DEV — expected after a squash or a hand-written fix.)"
+		echo "$SELF: --landed: taking your word that $box's work is already in $DEV, and closing it out."
+		echo "$SELF: (its commits are NOT ancestors of $DEV — expected after a squash or a hand-written fix.)"
 		merge_finish "$box"
 		return 0
 	fi
@@ -1608,31 +1614,31 @@ merge() {
 	# dirty tree is not an error here. Just show it and let git decide: it refuses precisely when the
 	# merge would overwrite a file you've modified, which is the only case that actually matters.
 	if [ -n "$(git_ status --porcelain)" ]; then
-		echo "cbx: note — local changes in $REPO (kept; the merge aborts only if it would overwrite one):" >&2
+		echo "$SELF: note — local changes in $REPO (kept; the merge aborts only if it would overwrite one):" >&2
 		git_ status --short | sed 's/^/  /' >&2
 	fi
 	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
 
 	# Don't land agent work on a stale base. If origin moved (you pushed from the laptop, a colleague
-	# pushed), merging here produces a merge commit on an old tip and `cbx push` is then rejected —
+	# pushed), merging here produces a merge commit on an old tip and `$SELF push` is then rejected —
 	# leaving you to untangle it after the fact. Check BEFORE touching anything, and say what to do.
 	local before after behind ahead
-	echo "cbx: checking $DEV against origin"
-	git_ fetch -q origin "$DEV" 2>/dev/null || echo "cbx: (could not reach origin — merging against the local $DEV)" >&2
+	echo "$SELF: checking $DEV against origin"
+	git_ fetch -q origin "$DEV" 2>/dev/null || echo "$SELF: (could not reach origin — merging against the local $DEV)" >&2
 	read -r behind ahead <<< "$(divergence)"
 	if [ "$behind" != 0 ]; then
-		echo "cbx: origin/$DEV has $behind commit(s) that $DEV doesn't." >&2
-		echo "cbx: merging now would put this agent's work on a stale base and 'cbx push' would be rejected." >&2
-		echo "cbx: do this first:" >&2
-		echo "    cbx pull              # merge origin into $DEV (or: cbx pull --rebase)" >&2
-		echo "    cbx rebase $box       # let the agent re-base its branch on the updated $DEV" >&2
-		echo "    cbx review $box       # re-check what it looks like on the new base, then merge" >&2
+		echo "$SELF: origin/$DEV has $behind commit(s) that $DEV doesn't." >&2
+		echo "$SELF: merging now would put this agent's work on a stale base and '$SELF push' would be rejected." >&2
+		echo "$SELF: do this first:" >&2
+		echo "    $SELF pull              # merge origin into $DEV (or: $SELF pull --rebase)" >&2
+		echo "    $SELF rebase $box       # let the agent re-base its branch on the updated $DEV" >&2
+		echo "    $SELF review $box       # re-check what it looks like on the new base, then merge" >&2
 		die "refusing to merge onto a stale $DEV"
 	fi
 
 	local ncommits
 	ncommits="$(git_ rev-list --count "$DEV..$ref")"
-	echo "cbx: merging refs/agents/$box ($ncommits commit(s)) into $DEV"
+	echo "$SELF: merging refs/agents/$box ($ncommits commit(s)) into $DEV"
 
 	# --reword: rewrite the messages FIRST, then merge the rewritten chain. `mref` is what gets merged;
 	# `$ref` stays the agent's ref for the bookkeeping in merge_finish. The rewrite is object-store only
@@ -1644,7 +1650,7 @@ merge() {
 		reword_tui "$box" "$ref" || return 1
 		mref="$REWORD_TIP"
 		[ -n "$mref" ] || die "reword produced nothing — $DEV is unchanged"
-		echo "cbx: reworded $ncommits commit(s) -> $(git_ rev-parse --short "$mref") (same trees, same authors)"
+		echo "$SELF: reworded $ncommits commit(s) -> $(git_ rev-parse --short "$mref") (same trees, same authors)"
 	fi
 	# `--edit` on a single commit means "let me fix up that commit's message" — a merge commit wrapping
 	# one commit is pure noise there, and having to remember `--squash` for it is a papercut. So take
@@ -1655,7 +1661,7 @@ merge() {
 	# SQUASH_MSG and hand you your own message wrapped in "Squashed commit of the following:" and
 	# indented four spaces — something to clean up before you could start editing.
 	if [ -n "$edit" ] && [ "$ncommits" = 1 ]; then
-		[ -z "$squash" ] && echo "cbx: one commit — landing it directly (no merge commit); its message is what you'll edit"
+		[ -z "$squash" ] && echo "$SELF: one commit — landing it directly (no merge commit); its message is what you'll edit"
 		squash=1 single=1
 	fi
 	git_ checkout -q "$DEV"
@@ -1667,7 +1673,7 @@ merge() {
 	local -a ed=()
 	[ -n "$edit" ] && ed=(env GIT_EDITOR="${EDITOR:-${VISUAL:-vim}}")
 	if [ -n "$squash" ]; then
-		git_ merge --squash "$ref" || die "merge conflicts — resolve them in $REPO and commit, then run: cbx merge '$box' --landed   (to retire the branch and tell the box)"
+		git_ merge --squash "$ref" || die "merge conflicts — resolve them in $REPO and commit, then run: $SELF merge '$box' --landed   (to retire the branch and tell the box)"
 		if [ -n "$edit" ]; then
 			if [ -n "$single" ]; then
 				# One commit: SQUASH_MSG's "Squashed commit of the following:" preamble is noise, so
@@ -1684,7 +1690,7 @@ merge() {
 				# message appears VERBATIM and unindented, separated by a '#' banner giving position
 				# and sha. git strips '#' lines on save (--cleanup=strip), so leaving the buffer as-is
 				# yields the messages one blank line apart, and the banners never reach the commit.
-				local msgf="$REPO/.git/CBX_SQUASH_MSG" c i=0
+				local msgf="$REPO/.git/MUSTER_SQUASH_MSG" c i=0
 				: > "$msgf"
 				while read -r c; do
 					i=$((i + 1))
@@ -1708,12 +1714,12 @@ merge() {
 		# $mref, not $ref: with --reword this is the rewritten chain (same trees, new messages).
 		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$mref" \
 			-m "$msg" -m "Cbx-Box: $box" \
-			|| die "merge conflicts — resolve them in $REPO and 'git commit', then run: cbx merge '$box'   (to retire the branch and tell the box)"
+			|| die "merge conflicts — resolve them in $REPO and 'git commit', then run: $SELF merge '$box'   (to retire the branch and tell the box)"
 	fi
 	after="$(git_ rev-parse HEAD)"
 	[ "$before" != "$after" ] || die "nothing was merged — $DEV is unchanged (already up to date?)"
 
-	echo "cbx: $DEV is now $(git_ rev-parse --short HEAD)"
+	echo "$SELF: $DEV is now $(git_ rev-parse --short HEAD)"
 	git_ --no-pager log --oneline -1 | sed 's/^/  /'
 	git_ --no-pager diff --shortstat "$before" "$after" | sed 's/^/  /'
 	merge_finish "$box"
@@ -1725,16 +1731,16 @@ drop() {
 	git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
 	# .sent goes with it: the branch this box will push next is a new review from scratch.
 	# .mergeinto too — without it a dropped minto box would keep being measured against a target it is
-	# no longer resolving, and `cbx merge` would go on refusing it.
+	# no longer resolving, and `$SELF merge` would go on refusing it.
 	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.mergeinto"
 	rm -rf "$(reword_dir "$box")"
 	say_to_box "$box" "I dropped your handoff — that approach is not going in. Do not re-push it; wait for new instructions." 2>/dev/null || true
-	echo "cbx: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
+	echo "$SELF: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
 }
 
 # ------------------------------------------------------------------ minto (merge $DEV INTO a branch)
 #
-# The other direction from `cbx merge`: agent work flows INTO $DEV, and $DEV flows OUT into the
+# The other direction from `$SELF merge`: agent work flows INTO $DEV, and $DEV flows OUT into the
 # long-lived branches (staging, a release branch). Two rules shape the whole thing:
 #
 #   * THE HUB'S CHECKOUT NEVER MOVES. It stays on $DEV, dirty with your local setup work — that tree is
@@ -1750,10 +1756,10 @@ INTENT_DIR="$STATE/branch-intent"
 # the intent cache and the worktree directory.
 branch_slug() { printf '%s' "${1//\//__}"; }
 
-# The job record for a box spawned by `cbx minto`: four lines — target, the target sha when it was
+# The job record for a box spawned by `$SELF minto`: four lines — target, the target sha when it was
 # spawned, the $DEV sha when it was spawned, the intent. Its EXISTENCE is what tells the rest of cbx
 # that this box's branch is not meant for $DEV: the queue, the review and `mark_reviewed` measure it
-# against the target instead, and `cbx merge` refuses it outright.
+# against the target instead, and `$SELF merge` refuses it outright.
 minto_field() { sed -n "${2}p" "$STATE/$1.mergeinto" 2>/dev/null || true; }
 minto_target() { minto_field "$1" 1; }
 # The branch an agent branch is measured against: its minto target, or $DEV for an ordinary box. Used
@@ -1792,7 +1798,7 @@ minto_intent() {
 	cached="$(head -1 "$f" 2>/dev/null || true)"
 	if [ ! -t 0 ]; then printf '%s' "$cached"; return 0; fi
 	tty_flush
-	printf 'cbx: what is %s FOR? (guides how conflicts get resolved)\n' "$target" >&2
+	printf '$SELF: what is %s FOR? (guides how conflicts get resolved)\n' "$target" >&2
 	printf '  %s> ' "${cached:+[$cached] }" >&2
 	read -r ans </dev/tty || ans=""
 	[ -n "$ans" ] || ans="$cached"
@@ -1804,48 +1810,48 @@ minto_intent() {
 # touched, so every refusal here leaves the repo exactly as it was.
 minto_prepare() {
 	local target="$1" dopull="$2" behind ahead wt head
-	echo "cbx: fetching origin"
-	git_ fetch -q origin 2>/dev/null || echo "cbx: (could not reach origin — working from the local refs)" >&2
+	echo "$SELF: fetching origin"
+	git_ fetch -q origin 2>/dev/null || echo "$SELF: (could not reach origin — working from the local refs)" >&2
 	# The target must exist as a LOCAL branch: the merge needs it here, and a resolving box can only
 	# fetch what the hub's git daemon exports, which is refs/heads/*.
 	if ! git_ rev-parse --verify -q "refs/heads/$target" >/dev/null; then
 		git_ rev-parse --verify -q "refs/remotes/origin/$target" >/dev/null \
 			|| die "no branch '$target' — not here, and not on origin"
 		git_ branch --track "$target" "origin/$target" >/dev/null
-		echo "cbx: created local $target tracking origin/$target"
+		echo "$SELF: created local $target tracking origin/$target"
 	fi
 	head="$(git_ symbolic-ref -q HEAD || true)"
 	[ "$head" != "refs/heads/$target" ] \
 		|| die "$target is the hub's checked-out branch — minto merges INTO a branch you are not sitting on"
 	wt="$MINTO_WT/$(branch_slug "$target")"
 	if [ -e "$wt" ]; then
-		echo "cbx: an unfinished minto worktree is already open on $target:" >&2
+		echo "$SELF: an unfinished minto worktree is already open on $target:" >&2
 		echo "    $wt" >&2
-		echo "cbx: finish it — resolve there, 'git add' + 'git commit', then: cbx minto $target --landed" >&2
-		echo "cbx: or drop it — cbx minto $target --abort" >&2
+		echo "$SELF: finish it — resolve there, 'git add' + 'git commit', then: $SELF minto $target --landed" >&2
+		echo "$SELF: or drop it — $SELF minto $target --abort" >&2
 		die "refusing to start a second merge into $target"
 	fi
 	local other; other="$(minto_box_for "$target")"
 	if [ -n "$other" ]; then
-		echo "cbx: box '$other' is already resolving a merge into $target." >&2
-		echo "cbx: land it    — cbx review $other   then   cbx minto $target --land $other" >&2
-		echo "cbx: or drop it — cbx minto $target --abort" >&2
+		echo "$SELF: box '$other' is already resolving a merge into $target." >&2
+		echo "$SELF: land it    — $SELF review $other   then   $SELF minto $target --land $other" >&2
+		echo "$SELF: or drop it — $SELF minto $target --abort" >&2
 		die "refusing to start a second merge into $target"
 	fi
-	# Don't build on a stale base: a merge onto an old tip is rejected by `cbx push <target>` afterwards,
+	# Don't build on a stale base: a merge onto an old tip is rejected by `$SELF push <target>` afterwards,
 	# leaving you to untangle it once the work is already done.
 	read -r behind ahead <<< "$(divergence "$target")"
 	if [ "$behind" != 0 ]; then
 		if [ -z "$dopull" ]; then
-			echo "cbx: origin/$target has $behind commit(s) $target doesn't." >&2
-			echo "cbx: merging now would put this on a stale base and 'cbx push $target' would be rejected." >&2
-			die "run: cbx minto $target --pull   (fast-forwards $target to origin first)"
+			echo "$SELF: origin/$target has $behind commit(s) $target doesn't." >&2
+			echo "$SELF: merging now would put this on a stale base and '$SELF push $target' would be rejected." >&2
+			die "run: $SELF minto $target --pull   (fast-forwards $target to origin first)"
 		fi
 		# A plain fetch into the branch: fast-forward only, so a genuinely diverged target fails here
 		# rather than being silently rewritten.
 		git_ fetch -q origin "$target:$target" \
 			|| die "$target has diverged from origin/$target — reconcile it by hand first"
-		echo "cbx: fast-forwarded $target to origin/$target"
+		echo "$SELF: fast-forwarded $target to origin/$target"
 	fi
 }
 
@@ -1905,8 +1911,8 @@ minto_spawn() {
 	box="$(printf '%s' "$box" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | cut -c1-31)"
 	mkdir -p "$STATE"
 	printf '%s\n%s\n%s\n%s\n' "$target" "$tsha" "$dsha" "$intent" > "$STATE/$box.mergeinto"
-	echo "cbx: spawning box '$box' on $target, with $DEV merged in and conflicted"
-	# base + merge: the broker hands them to cbx-box-init, which does the checkout AND the merge in the
+	echo "$SELF: spawning box '$box' on $target, with $DEV merged in and conflicted"
+	# base + merge: the broker hands them to muster-box-init, which does the checkout AND the merge in the
 	# box's tmux window BEFORE claude starts. That part must not be a prompt — a prompt is advisory and
 	# asynchronous, and "the agent did not actually run the setup commands" is not a failure you want to
 	# debug through a tmux session.
@@ -1916,14 +1922,14 @@ minto_spawn() {
 	fi
 	container="$(printf '%s' "$resp" | jqr '.container // empty')"
 	if paste_to_box "$box" "$(minto_prompt "$target" "$intent" "$conflicts" "$box")"; then
-		echo "cbx: briefed $box (both branches, both histories, and what $target is for)"
+		echo "$SELF: briefed $box (both branches, both histories, and what $target is for)"
 	else
-		echo "cbx: box is up but the briefing did NOT land — attach and paste it yourself:" >&2
+		echo "$SELF: box is up but the briefing did NOT land — attach and paste it yourself:" >&2
 		echo "    docker exec -it -u dev $container tmux attach -t main" >&2
 	fi
-	echo "cbx: next — cbx q            # watch for the handoff"
-	echo "cbx:        cbx review $box  # the resolution alone (combined diff)"
-	echo "cbx:        cbx minto $target --land $box"
+	echo "$SELF: next — $SELF q            # watch for the handoff"
+	echo "$SELF:        $SELF review $box  # the resolution alone (combined diff)"
+	echo "$SELF:        $SELF minto $target --land $box"
 }
 
 # The by-hand path: a LINKED WORKTREE, so the hub's own checkout stays on $DEV. It lives under
@@ -1939,17 +1945,17 @@ minto_worktree() {
 	# Expected to fail — that is the point. `|| true`: this is where the conflicts are supposed to land.
 	git -C "$wt" merge "$DEV" >/dev/null 2>&1 || true
 	echo
-	echo "cbx: resolve it in    $wt"
-	echo "cbx: (your $DEV checkout at $REPO is untouched)"
+	echo "$SELF: resolve it in    $wt"
+	echo "$SELF: (your $DEV checkout at $REPO is untouched)"
 	echo
 	echo "    cd $wt"
 	echo "    git status                       # the unmerged paths"
 	echo "    git log --merge -p -- <file>     # commits from BOTH sides behind each conflict"
 	echo "    \$EDITOR <file>                   # zdiff3: each hunk shows the common base too"
 	echo "    git add <file> && git commit     # $target moves HERE — a linked worktree owns its branch"
-	echo "    cbx minto $target --landed       # verify, tear the worktree down, tell you what's next"
+	echo "    $SELF minto $target --landed       # verify, tear the worktree down, tell you what's next"
 	echo
-	echo "cbx: changed your mind? cbx minto $target --abort"
+	echo "$SELF: changed your mind? $SELF minto $target --abort"
 }
 
 # Take a resolving box's merge commit and move <target> onto it. Three ancestry checks make it
@@ -1957,7 +1963,7 @@ minto_worktree() {
 # makes it impossible to land it onto a target that moved in the meantime.
 minto_land() {
 	# NB `ref` gets its own statement: within ONE `local`, bash expands every word before assigning any
-	# of them, so "refs/agents/$box" there would read an unset $box and `set -u` would kill cbx.
+	# of them, so "refs/agents/$box" there would read an unset $box and `set -u` would kill muster.
 	local target="$1" box="$2" tsha dsha now n
 	local ref="refs/agents/$box"
 	[ -e "$STATE/$box.mergeinto" ] || die "box '$box' is not resolving a merge (no minto job recorded)"
@@ -1967,29 +1973,29 @@ minto_land() {
 	tsha="$(minto_field "$box" 2)"; dsha="$(minto_field "$box" 3)"
 	now="$(git_ rev-parse "refs/heads/$target")"
 	[ "$now" = "$tsha" ] \
-		|| die "$target moved since the merge started ($(git_ rev-parse --short "$tsha") -> $(git_ rev-parse --short "$now")) — re-run 'cbx minto $target' against the new tip"
+		|| die "$target moved since the merge started ($(git_ rev-parse --short "$tsha") -> $(git_ rev-parse --short "$now")) — re-run '$SELF minto $target' against the new tip"
 	git_ merge-base --is-ancestor "$tsha" "$ref" \
 		|| die "$box's branch does not contain $target — it did not resolve the merge that was asked for"
 	git_ merge-base --is-ancestor "$dsha" "$ref" \
 		|| die "$box's branch does not contain $DEV — it committed a resolution but dropped the merge (rebased or squashed it?)"
 	n="$(minto_own_count "$box" "$target")"
-	[ "$n" = 1 ] || echo "cbx: note — the box added $n commit(s), not just the merge ('cbx review $box --full' shows them)"
-	git_ update-ref -m "cbx minto --land $box" "refs/heads/$target" "$(git_ rev-parse "$ref")" "$tsha"
+	[ "$n" = 1 ] || echo "$SELF: note — the box added $n commit(s), not just the merge ('$SELF review $box --full' shows them)"
+	git_ update-ref -m "$SELF minto --land $box" "refs/heads/$target" "$(git_ rev-parse "$ref")" "$tsha"
 	# No note copying needed: refs/heads/<target> and refs/agents/<box> now name the SAME commit, and a
 	# cbx note is attached to the commit, not to the ref — deleting the ref leaves the summary in place
 	# (`git log --notes=cbx $target`).
 	git_ update-ref -d "$ref" 2>/dev/null || true
 	rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent"
-	echo "cbx: $target is now $(git_ rev-parse --short "$target")"
+	echo "$SELF: $target is now $(git_ rev-parse --short "$target")"
 	git_ --no-pager diff --shortstat "$tsha" "refs/heads/$target" | sed 's/^/  /'
 	# A minto box has exactly one job and it is done. Unlike an agent box there is no ongoing task to
 	# resume, so leaving it running would just be a box you have to remember to kill.
 	if broker DELETE "/box/$box" >/dev/null 2>&1; then
-		echo "cbx: retired box $box"
+		echo "$SELF: retired box $box"
 	else
-		echo "cbx: (box $box could not be removed — 'cbx kill $box' when convenient)"
+		echo "$SELF: (box $box could not be removed — '$SELF kill $box' when convenient)"
 	fi
-	echo "cbx: next — cbx push $target"
+	echo "$SELF: next — $SELF push $target"
 }
 
 # The --here counterpart: the branch already moved (a commit in a linked worktree moves the branch it
@@ -1999,7 +2005,7 @@ minto_landed() {
 	wt="$MINTO_WT/$(branch_slug "$target")"
 	[ -e "$wt" ] || die "no minto worktree open for $target (nothing to finish)"
 	if [ -n "$(git -C "$wt" ls-files -u | head -1)" ]; then
-		echo "cbx: $wt still has UNRESOLVED conflicts:" >&2
+		echo "$SELF: $wt still has UNRESOLVED conflicts:" >&2
 		git -C "$wt" diff --name-only --diff-filter=U | sed 's/^/    /' >&2
 		die "resolve them, 'git add' + 'git commit', then re-run"
 	fi
@@ -2007,11 +2013,11 @@ minto_landed() {
 		&& die "the merge in $wt is resolved but NOT committed — 'git -C $wt commit' first"
 	git_ merge-base --is-ancestor "$DEV" "refs/heads/$target" \
 		|| die "$target does not contain $DEV — was the merge committed? ('git -C $wt log --oneline -3')"
-	echo "cbx: $target is now $(git_ rev-parse --short "$target")"
+	echo "$SELF: $target is now $(git_ rev-parse --short "$target")"
 	git_ --no-pager log --oneline -1 "$target" | sed 's/^/  /'
 	git_ worktree remove --force "$wt" || die "could not remove $wt (remove it by hand, then 'git -C $REPO worktree prune')"
 	git_ worktree prune
-	echo "cbx: worktree removed. Next — cbx push $target"
+	echo "$SELF: worktree removed. Next — $SELF push $target"
 }
 
 # Undo whatever minto has open for a branch. Safe at any point BEFORE the merge lands, which is the
@@ -2023,7 +2029,7 @@ minto_abort() {
 		git -C "$wt" merge --abort 2>/dev/null || true
 		git_ worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
 		git_ worktree prune
-		echo "cbx: removed the minto worktree for $target ($target was never moved)"
+		echo "$SELF: removed the minto worktree for $target ($target was never moved)"
 		n=$((n + 1))
 	fi
 	box="$(minto_box_for "$target")"
@@ -2031,14 +2037,14 @@ minto_abort() {
 		git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
 		rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent"
 		broker DELETE "/box/$box" >/dev/null 2>&1 || true
-		echo "cbx: dropped box $box and its resolution ($target was never moved)"
+		echo "$SELF: dropped box $box and its resolution ($target was never moved)"
 		n=$((n + 1))
 	fi
-	[ "$n" -gt 0 ] || echo "cbx: nothing open for $target — nothing to abort"
+	[ "$n" -gt 0 ] || echo "$SELF: nothing open for $target — nothing to abort"
 }
 
 minto() {
-	[ $# -ge 1 ] || die "minto needs a target branch: cbx minto <branch>"
+	[ $# -ge 1 ] || die "minto needs a target branch: $SELF minto <branch>"
 	local target="$1" intent="" land="" abort="" landed="" dopull="" mode="" a
 	shift
 	while [ $# -gt 0 ]; do
@@ -2057,7 +2063,7 @@ minto() {
 		esac
 		shift
 	done
-	[ "$target" != "$DEV" ] || die "minto: '$target' IS the source branch — cbx minto merges $DEV into something else"
+	[ "$target" != "$DEV" ] || die "minto: '$target' IS the source branch — $SELF minto merges $DEV into something else"
 	mkdir -p "$STATE"
 
 	if [ -n "$abort" ];  then minto_abort  "$target";        return 0; fi
@@ -2071,20 +2077,20 @@ minto() {
 	dsha="$(git_ rev-parse "refs/heads/$DEV")"
 
 	if git_ merge-base --is-ancestor "$dsha" "$tsha"; then
-		echo "cbx: $target already contains every commit on $DEV — nothing to merge."
+		echo "$SELF: $target already contains every commit on $DEV — nothing to merge."
 		return 0
 	fi
 	# Fast-forward: no merge commit is written, so there is nothing to decide — and therefore no reason
 	# to ask what the branch is for.
 	if git_ merge-base --is-ancestor "$tsha" "$dsha"; then
-		echo "cbx: $target is an ancestor of $DEV — fast-forwarding $(git_ rev-list --count "$target..$DEV") commit(s):"
+		echo "$SELF: $target is an ancestor of $DEV — fast-forwarding $(git_ rev-list --count "$target..$DEV") commit(s):"
 		git_ --no-pager log --oneline "$target..$DEV" | sed 's/^/  /'
-		git_ update-ref -m "cbx minto: fast-forward to $DEV" "refs/heads/$target" "$dsha" "$tsha"
-		echo "cbx: $target is now $(git_ rev-parse --short "$target"). Next — cbx push $target"
+		git_ update-ref -m "$SELF minto: fast-forward to $DEV" "refs/heads/$target" "$dsha" "$tsha"
+		echo "$SELF: $target is now $(git_ rev-parse --short "$target"). Next — $SELF push $target"
 		return 0
 	fi
 
-	echo "cbx: merging $DEV into $target — $(git_ rev-list --count "$target..$DEV") commit(s) to bring in, $(git_ rev-list --count "$DEV..$target") only on $target"
+	echo "$SELF: merging $DEV into $target — $(git_ rev-list --count "$target..$DEV") commit(s) to bring in, $(git_ rev-list --count "$DEV..$target") only on $target"
 	# THE MERGE, ATTEMPTED IN THE OBJECT STORE. No index, no worktree, nothing to clean up when it
 	# fails — and the hub's own tree is never a participant, so its local setup changes can neither be
 	# clobbered nor swept into the merge. merge-tree prints the resulting tree oid on line 1, and on
@@ -2094,10 +2100,10 @@ minto() {
 		tree="$(printf '%s' "$out" | head -1)"
 		new="$(git_ commit-tree "$tree" -p "$tsha" -p "$dsha" \
 			-m "Merge $DEV into $target" -m "Cbx-Minto: $DEV")"
-		git_ update-ref -m "cbx minto: merge $DEV" "refs/heads/$target" "$new" "$tsha"
-		echo "cbx: merged cleanly — $target is now $(git_ rev-parse --short "$new")"
+		git_ update-ref -m "$SELF minto: merge $DEV" "refs/heads/$target" "$new" "$tsha"
+		echo "$SELF: merged cleanly — $target is now $(git_ rev-parse --short "$new")"
 		git_ --no-pager diff --shortstat "$tsha" "$new" | sed 's/^/  /'
-		echo "cbx: next — cbx push $target"
+		echo "$SELF: next — $SELF push $target"
 		return 0
 	fi
 	[ "$rc" = 1 ] || die "git merge-tree failed ($rc): $out"
@@ -2114,16 +2120,16 @@ minto() {
 	if [ -z "$mode" ]; then
 		if [ -t 0 ]; then
 			tty_flush
-			printf 'cbx: [b]ox — an agent resolves it  [h]ere — a worktree, you resolve it  [a]bort ? '
+			printf '$SELF: [b]ox — an agent resolves it  [h]ere — a worktree, you resolve it  [a]bort ? '
 			read -r ans </dev/tty || ans=a
 			case "$ans" in
 				b|B|"") mode=box ;;
 				h|H)    mode=here ;;
-				*)      echo "cbx: aborted — $target is unchanged, nothing was written."; return 0 ;;
+				*)      echo "$SELF: aborted — $target is unchanged, nothing was written."; return 0 ;;
 			esac
 		else
 			# Non-interactive: report and change nothing. Guessing either way would be a surprise.
-			echo "cbx: not a terminal — nothing done. Re-run with --box or --here." >&2
+			echo "$SELF: not a terminal — nothing done. Re-run with --box or --here." >&2
 			return 1
 		fi
 	fi
@@ -2140,17 +2146,17 @@ rebase() {
 	[ "${2:-}" = --force ] && force=--force
 	if [ "$1" = all ]; then
 		list="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
-		[ -n "$list" ] || die "no boxes exist — 'cbx ls' to check"
+		[ -n "$list" ] || die "no boxes exist — '$SELF ls' to check"
 	else
 		list="$1"
 	fi
 
-	echo "cbx: $DEV is at $(git_ rev-parse --short "$DEV") ($(git_ log -1 --format=%s "$DEV"))"
+	echo "$SELF: $DEV is at $(git_ rev-parse --short "$DEV") ($(git_ log -1 --format=%s "$DEV"))"
 	for box in $list; do
 		n=$((n + 1))
 		# Skip, don't abort: with 'all' one working agent shouldn't stop the others being told.
 		if ! guard_busy "$box" "$force"; then
-			echo "  $box: skipped (busy) — 'cbx rebase $box --force' to interrupt anyway"
+			echo "  $box: skipped (busy) — '$SELF rebase $box --force' to interrupt anyway"
 			continue
 		fi
 		# How far the agent's PUSHED branch trails the branch it's based on. A box that never handed
@@ -2174,53 +2180,53 @@ rebase() {
 			ok=$((ok + 1))
 			echo "  $box: asked to rebase ($behind)"
 		else
-			echo "  $box: NOT reachable, skipped ($behind) — 'cbx box $box' to start it"
+			echo "  $box: NOT reachable, skipped ($behind) — '$SELF box $box' to start it"
 		fi
 	done
 
-	echo "cbx: delivered to $ok of $n box(es)."
+	echo "$SELF: delivered to $ok of $n box(es)."
 	# The single most confusing thing about this command: nothing has rebased yet.
-	echo "cbx: NOTE this is a prompt typed into each agent's session, not a rebase that already ran."
+	echo "$SELF: NOTE this is a prompt typed into each agent's session, not a rebase that already ran."
 	echo "     Each agent runs 'git fetch hub && git rebase hub/$DEV' when it picks the message up,"
 	echo "     which may be a while if it is mid-task, and it may hit conflicts and ask you about them."
-	echo "     Watch one:  cbxbox <box>      Re-check later:  cbx q"
+	echo "     Watch one:  cbxbox <box>      Re-check later:  $SELF q"
 }
 
 divergence() {
 	# "<behind> <ahead>" of a branch relative to its origin/ counterpart ($DEV unless told otherwise —
-	# `cbx minto` asks about the branch it is merging into). Needs a fetch first to mean anything.
+	# `$SELF minto` asks about the branch it is merging into). Needs a fetch first to mean anything.
 	local b="${1:-$DEV}"
 	git_ rev-list --left-right --count "origin/$b...$b" 2>/dev/null || echo "0 0"
 }
 
 pull() {
 	# Bring the hub's branch up to date with origin. Needed whenever you (or anyone) pushed to the
-	# branch elsewhere: the hub's merges then sit on an older base and `cbx push` is rejected.
+	# branch elsewhere: the hub's merges then sit on an older base and `$SELF push` is rejected.
 	local mode="${1:-}" behind ahead
-	echo "cbx: fetching origin"
+	echo "$SELF: fetching origin"
 	git_ fetch origin || die "fetch failed"
 	read -r behind ahead <<< "$(divergence)"
 	if [ "$behind" = 0 ]; then
-		echo "cbx: $DEV is up to date with origin ($ahead local commit(s) to push)"
+		echo "$SELF: $DEV is up to date with origin ($ahead local commit(s) to push)"
 		return 0
 	fi
-	echo "cbx: origin has $behind commit(s) you don't; you have $ahead it doesn't"
+	echo "$SELF: origin has $behind commit(s) you don't; you have $ahead it doesn't"
 	if [ "$ahead" = 0 ]; then
 		git_ merge --ff-only "origin/$DEV" || die "fast-forward failed — resolve in $REPO"
-		echo "cbx: fast-forwarded to $(git_ rev-parse --short HEAD)"
+		echo "$SELF: fast-forwarded to $(git_ rev-parse --short HEAD)"
 	elif [ "$mode" = --rebase ]; then
 		git_ rebase "origin/$DEV" || die "rebase conflicts — resolve in $REPO, then 'git rebase --continue'"
-		echo "cbx: rebased onto origin/$DEV ($(git_ rev-parse --short HEAD))"
+		echo "$SELF: rebased onto origin/$DEV ($(git_ rev-parse --short HEAD))"
 	else
 		git_ merge "origin/$DEV" -m "Merge origin/$DEV" \
 			|| die "merge conflicts — resolve in $REPO, then 'git commit'"
-		echo "cbx: merged origin/$DEV ($(git_ rev-parse --short HEAD))"
+		echo "$SELF: merged origin/$DEV ($(git_ rev-parse --short HEAD))"
 	fi
-	echo "cbx: agents are now behind — 'cbx rebase all' after you push."
+	echo "$SELF: agents are now behind — '$SELF rebase all' after you push."
 }
 
 push() {
-	# Takes an optional BRANCH (default $DEV) so `cbx minto <target>` has something to hand you at the
+	# Takes an optional BRANCH (default $DEV) so `$SELF minto <target>` has something to hand you at the
 	# end. Everything else — the --stat preview, the confirm, the failure diagnostics — is per-branch by
 	# substitution only; nothing about the push itself is dev-specific.
 	local ahead behind yes="" a reply branch=""
@@ -2234,44 +2240,44 @@ push() {
 	done
 	local DEV="${branch:-$DEV}"          # local: every $DEV below now means "the branch being pushed"
 	git_ rev-parse --verify -q "refs/heads/$DEV" >/dev/null || die "push: no local branch '$DEV'"
-	# The counts are only true against a fresh origin. `cbx merge` fetches before it merges, but a
-	# `cbx push <other-branch>` can arrive with no fetch in between.
-	git_ fetch -q origin "$DEV" 2>/dev/null || echo "cbx: (could not reach origin — counts may be stale)" >&2
+	# The counts are only true against a fresh origin. `$SELF merge` fetches before it merges, but a
+	# `$SELF push <other-branch>` can arrive with no fetch in between.
+	git_ fetch -q origin "$DEV" 2>/dev/null || echo "$SELF: (could not reach origin — counts may be stale)" >&2
 	read -r behind ahead <<< "$(divergence "$DEV")"
 	if [ "$behind" != 0 ]; then
 		if [ -n "$branch" ]; then
-			die "origin has $behind commit(s) $DEV doesn't — run 'cbx minto $DEV --pull' first"
+			die "origin has $behind commit(s) $DEV doesn't — run '$SELF minto $DEV --pull' first"
 		fi
-		die "origin has $behind commit(s) $DEV doesn't — run 'cbx pull' (or 'cbx pull --rebase') first"
+		die "origin has $behind commit(s) $DEV doesn't — run '$SELF pull' (or '$SELF pull --rebase') first"
 	fi
 	# Don't report "pushed" when there was nothing to push — that reads as "my merge went out" when
-	# in fact nothing was ever merged (a silent `cbx merge` failure looks exactly like this).
+	# in fact nothing was ever merged (a silent `$SELF merge` failure looks exactly like this).
 	if [ "$ahead" = 0 ]; then
-		echo "cbx: nothing to push — $DEV already matches origin ($(git_ rev-parse --short "$DEV"))."
-		echo "cbx: expecting an agent's work here? It is merged only after 'cbx merge <box>' succeeds — check 'cbx q'."
+		echo "$SELF: nothing to push — $DEV already matches origin ($(git_ rev-parse --short "$DEV"))."
+		echo "$SELF: expecting an agent's work here? It is merged only after '$SELF merge <box>' succeeds — check '$SELF q'."
 		return 0
 	fi
 	# Show exactly what leaves the hub before it leaves. A push is the one irreversible step in the
 	# loop (agents' work is public from here on), and it is easy to have merged more than you meant —
 	# so the per-commit --stat is the last chance to notice a stray file or a second box's work.
-	echo "cbx: $ahead commit(s) would go to origin/$DEV:"
+	echo "$SELF: $ahead commit(s) would go to origin/$DEV:"
 	# `|| true`: quitting the pager early SIGPIPEs git, and pipefail would otherwise abort the push
 	# right there — pressing 'q' must mean "seen enough", not "cancelled".
 	git_ log --stat --oneline "origin/$DEV..$DEV" | review_pager || true
 	# Only ask when someone is there to answer: piped/cron use keeps the old non-interactive behaviour.
 	if [ -z "$yes" ] && [ -t 0 ] && [ -t 1 ]; then
-		read -r -p "cbx: push these $ahead commit(s) to origin/$DEV? [y/N] " reply
+		read -r -p "$SELF: push these $ahead commit(s) to origin/$DEV? [y/N] " reply
 		case "$reply" in
 			y|Y|yes|YES) ;;
-			*) echo "cbx: not pushed ($DEV is unchanged; nothing was sent)"; return 1 ;;
+			*) echo "$SELF: not pushed ($DEV is unchanged; nothing was sent)"; return 1 ;;
 		esac
 	fi
-	echo "cbx: pushing $DEV ($ahead commit(s) ahead of origin) -> $(git_ remote get-url origin)"
+	echo "$SELF: pushing $DEV ($ahead commit(s) ahead of origin) -> $(git_ remote get-url origin)"
 	if git_ push origin "$DEV"; then
-		echo "cbx: pushed $DEV to origin"
+		echo "$SELF: pushed $DEV to origin"
 	else
 		# The three things that actually go wrong here, in the order they're worth checking.
-		echo "cbx: push FAILED. Usual causes:" >&2
+		echo "$SELF: push FAILED. Usual causes:" >&2
 		echo "  * the deploy key is read-only — GitHub: Settings -> Deploy keys -> 'Allow write access'" >&2
 		echo "  * no key offered ('Permission denied (publickey)') — check the identity dir matches the" >&2
 		echo "    hub user's HOME: ls -l \$HOME/.gitidentity, and that git-identity/gitconfig has no" >&2
@@ -2302,7 +2308,7 @@ golden_seal() {
 	[ $# -ge 1 ] || die "seal needs a staged golden id (see $STAGING)"
 	[ -d "$STAGING/$1" ] || die "no staged golden at $STAGING/$1"
 	broker POST "/golden/seal/$1" >/dev/null || die "sealing $1 failed"
-	echo "cbx: sealed $1 as current"
+	echo "$SELF: sealed $1 as current"
 	broker POST "/recreate?fresh=1" >/dev/null || die "recreate failed"
 	golden_reap
 }
@@ -2310,7 +2316,7 @@ golden_seal() {
 golden_reap() {
 	local resp
 	resp="$(broker POST /golden/reap)" || die "reap failed: $resp"
-	echo "cbx: reaped: $(printf '%s' "$resp" | jqr '.reaped | join(", ") // "(none)"')"
+	echo "$SELF: reaped: $(printf '%s' "$resp" | jqr '.reaped | join(", ") // "(none)"')"
 }
 
 golden_snapshot() {
@@ -2334,12 +2340,12 @@ golden_snapshot() {
 		svc_load "$svc" || continue
 		svc_truthy "$SVC_WRITES_REPO" || continue
 		if svc_running "$svc"; then
-			die "'$svc' is running and writing into $REPO — 'cbx down $svc' first, then snapshot"
+			die "'$svc' is running and writing into $REPO — '$SELF down $svc' first, then snapshot"
 		fi
 	done
 
 	if [ "$prep" = 1 ]; then
-		echo "cbx: preparing the repo (${GOLDEN_PREP_CMD})"
+		echo "$SELF: preparing the repo (${GOLDEN_PREP_CMD})"
 		( cd "$REPO" && bash -lc "$GOLDEN_PREP_CMD" ) || die "prep failed — fix it in $REPO and re-run"
 	fi
 
@@ -2349,9 +2355,9 @@ golden_snapshot() {
 	for box in $boxes; do
 		dirty="$(broker GET "/box/$box/dirty" 2>/dev/null | jqr '.dirty[]?' | head -5)"
 		if [ -n "$dirty" ]; then
-			echo "cbx: box '$box' has uncommitted changes:" >&2
+			echo "$SELF: box '$box' has uncommitted changes:" >&2
 			printf '  %s\n' $dirty >&2
-			die "commit + handoff in that box first (or 'cbx kill $box' to abandon it)"
+			die "commit + handoff in that box first (or '$SELF kill $box' to abandon it)"
 		fi
 	done
 
@@ -2359,7 +2365,7 @@ golden_snapshot() {
 	# deal — it's how your local setup reaches the boxes — but it should never be a surprise, and
 	# modified TRACKED files are the ones an agent can sweep into a commit by accident.
 	if [ -n "$(git_ status --porcelain)" ]; then
-		echo "cbx: baking these local changes into the golden — every box will start with them:"
+		echo "$SELF: baking these local changes into the golden — every box will start with them:"
 		git_ status --short | sed 's/^/  /'
 	fi
 
@@ -2367,7 +2373,7 @@ golden_snapshot() {
 	st="$STAGING/$id"
 	mkdir -p "$STAGING"
 	rm -rf "$st"
-	echo "cbx: snapshotting $REPO -> staging/$id (reflink)"
+	echo "$SELF: snapshotting $REPO -> staging/$id (reflink)"
 	cp --reflink=auto -a "$REPO/." "$st" || die "snapshot copy failed"
 
 	# The boxes reach the hub repo over the cbx network; bake that in so a box's git works immediately.
@@ -2378,7 +2384,7 @@ golden_snapshot() {
 	# file in every agent's `git status`.
 	rm -f  "$st/.git/hooks/update"
 	rm -rf "$st/.git/cbx"
-	# Linked-worktree registrations (a `cbx minto --here` in progress). The worktrees themselves live
+	# Linked-worktree registrations (a `$SELF minto --here` in progress). The worktrees themselves live
 	# under .git/cbx and are gone with the line above, but their admin dirs are separate: left behind,
 	# every box would inherit a `git worktree list` entry pointing at a path that does not exist there,
 	# and git refuses to check out a branch it believes is checked out in one of them.
@@ -2388,13 +2394,13 @@ golden_snapshot() {
 
 	# The hub mounts $GOLDEN read-only on purpose, so the broker performs the move + symlink flip.
 	broker POST "/golden/seal/$id" >/dev/null \
-		|| die "sealing $id failed (staged tree kept — retry with: cbx golden seal $id)"
-	echo "cbx: sealed $id as current"
+		|| die "sealing $id failed (staged tree kept — retry with: $SELF golden seal $id)"
+	echo "$SELF: sealed $id as current"
 
-	echo "cbx: moving every box onto it (fresh upper layers)..."
+	echo "$SELF: moving every box onto it (fresh upper layers)..."
 	broker POST "/recreate?fresh=1" >/dev/null || die "recreate failed"
 	golden_reap
-	echo "cbx: done. Boxes are on $id and back on their pushed branches."
+	echo "$SELF: done. Boxes are on $id and back on their pushed branches."
 }
 
 # ------------------------------------------------------------------ patch bridge (laptop <-> hub)
@@ -2442,7 +2448,7 @@ import_patch() {
 		git -C "$wt" am --abort >/dev/null 2>&1 || true
 		git_ worktree remove --force "$wt" >/dev/null 2>&1 || true
 		rm -f "$pf"
-		die "your patch did not apply onto $DEV — is your laptop checkout based on the same history? (try 'cbx pull' first)"
+		die "your patch did not apply onto $DEV — is your laptop checkout based on the same history? (try '$SELF pull' first)"
 	fi
 	new="$(git -C "$wt" rev-parse HEAD)"
 	git_ worktree remove --force "$wt" >/dev/null 2>&1 || true
@@ -2450,26 +2456,26 @@ import_patch() {
 	[ "$new" != "$(git_ rev-parse "$DEV")" ] || die "the patch added nothing on top of $DEV — refs/agents/$box left unchanged"
 
 	git_ update-ref "$ref" "$new"
-	# It is YOUR vetted commit, so record it as already reviewed — 'cbx status' then offers merge directly.
+	# It is YOUR vetted commit, so record it as already reviewed — '$SELF status' then offers merge directly.
 	mkdir -p "$STATE"
 	printf '%s %s' "$new" "$(git_ rev-parse "$DEV")" > "$STATE/$box.reviewed"
-	echo "cbx: refs/agents/$box now points at your commit $(git_ rev-parse --short "$new") ($(git_ rev-list --count "$DEV..$ref") on top of $DEV)." >&2
-	echo "cbx: next — 'cbx merge $box' to land it on $DEV (or push from your laptop as usual)." >&2
+	echo "$SELF: refs/agents/$box now points at your commit $(git_ rev-parse --short "$new") ($(git_ rev-list --count "$DEV..$ref") on top of $DEV)." >&2
+	echo "$SELF: next — '$SELF merge $box' to land it on $DEV (or push from your laptop as usual)." >&2
 
 	# FYI to the box, exactly like drop/merge: unconditional (the point is to stop it re-pushing its old
 	# version), and it must NOT act. The box fetches refs/agents/* as refs/remotes/hub-agents/*.
 	if say_to_box "$box" "Heads up: I replaced the changes on your branch (agent/$box) with my own commit. Sync your local branch to it with: git fetch hub && git reset --hard hub-agents/$box . This is FYI ONLY — just NOTE that your earlier edits were superseded by my version; do NOT re-apply your previous work or take any action on this. Wait for new instructions."; then
-		echo "cbx: told $box to reset onto your commit and just note it." >&2
+		echo "$SELF: told $box to reset onto your commit and just note it." >&2
 	else
-		echo "cbx: (box $box not reachable — it will pick up your commit next time it fetches: git reset --hard hub-agents/$box)" >&2
+		echo "$SELF: (box $box not reachable — it will pick up your commit next time it fetches: git reset --hard hub-agents/$box)" >&2
 	fi
 }
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
-	up)     [ $# -ge 1 ] || die "up needs a service (cbx svcs to list)"; svc_up "$1" ;;
-	down)   [ $# -ge 1 ] || die "down needs a service (cbx svcs to list)"; svc_down "$1" ;;
-	logs)   [ $# -ge 1 ] || die "logs needs a service (cbx svcs to list)"; svc_logs "$1" ;;
+	up)     [ $# -ge 1 ] || die "up needs a service ($SELF svcs to list)"; svc_up "$1" ;;
+	down)   [ $# -ge 1 ] || die "down needs a service ($SELF svcs to list)"; svc_down "$1" ;;
+	logs)   [ $# -ge 1 ] || die "logs needs a service ($SELF svcs to list)"; svc_logs "$1" ;;
 	svcs|services) svc_list ;;
 	autostart)     svc_autostart ;;
 	box)      box_new "$@" ;;
@@ -2478,14 +2484,14 @@ case "$cmd" in
 	ls)       box_ls ;;
 	forwards) forwards_refresh "${1:-}" ;;
 	# Default is the LIVE dashboard; --text (or a non-terminal stdout, i.e. a pipe) gives the plain
-	# one-shot table, so `cbx q | grep …` and scripts behave as they always did.
+	# one-shot table, so `$SELF q | grep …` and scripts behave as they always did.
 	q|queue)
 		case "${1:-}" in
 			--text|--once|-1) queue ;;
 			*) watch_queue "$@" ;;   # falls back to the one-shot table when stdout is not a terminal
 		esac ;;
-	# Colour auto-detects here: `cbx status | less` or a redirect gets plain text, a terminal gets the
-	# same rendering as the live dashboard. CBX_COLOR=always|never overrides.
+	# Colour auto-detects here: `$SELF status | less` or a redirect gets plain text, a terminal gets the
+	# same rendering as the live dashboard. MUSTER_COLOR=always|never overrides.
 	status|st) colors_init; status_overview ;;
 	review)   review "$@" ;;
 	fix)      fix "$@" ;;
@@ -2509,5 +2515,9 @@ case "$cmd" in
 		esac ;;
 	# The header block IS the help. Printed by pattern rather than by line number (it used to be a
 	# hard-coded '4,52p', which silently started cutting the usage list in half as commands were added).
-	*) awk 'NR < 4 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 1 ;;
+	# The header block IS the help, and it names the command as $SELF so it reads correctly whichever
+	# symlink you invoked. It is printed from COMMENTS, so nothing expands it for us — awk does.
+	*) awk -v self="$SELF" 'NR < 4 { next }
+	          /^#/ { sub(/^# ?/, ""); gsub(/\$SELF/, self); print; next }
+	          { exit }' "$0"; exit 1 ;;
 esac
