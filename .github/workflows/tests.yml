@@ -6,8 +6,7 @@ name: tests
 
 on:
   push:
-    branches: ["**"]
-    tags: ["v*"]
+    branches: ["**"]        # NOT tags: images.yml calls this workflow, so a tag would run it twice
   pull_request:
   workflow_call:            # so images.yml can require a green run rather than duplicating it
 
