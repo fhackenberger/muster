@@ -545,6 +545,21 @@ test_forwards() {
 	stub_saw POST "/forwards" || fail "the broker was not asked"
 }
 
+# Three images from up to three build paths, and nothing forces them to move together. The failures
+# when they don't are silent (an old broker ignores query params a new hub sends), so `status` says so.
+test_version_drift() {
+	MUSTER_VERSION=9.9.9 cbx status --no-fetch
+	ok; has "VERSION DRIFT"; has "the broker is"
+	# The stub reports its own version as the box image's too, so one mismatch is enough to prove the
+	# comparison runs; matching versions must stay silent.
+	local v; v="$(curl -s "$BROKER_URL/version" | jq -r .broker)"
+	MUSTER_VERSION="$v" cbx status --no-fetch
+	ok; hasnt "VERSION DRIFT"
+	# An unstamped image cannot tell, and must not cry wolf.
+	MUSTER_VERSION=unknown cbx status --no-fetch
+	ok; hasnt "VERSION DRIFT"
+}
+
 test_broker_unreachable_is_reported_not_fatal() {
 	BROKER_URL="http://127.0.0.1:1" cbx status --no-fetch
 	ok
@@ -1142,6 +1157,7 @@ run "import: replaces the agent's branch"          test_import_replaces_the_bran
 run "box: spawn / ls / recreate / kill"            test_box_lifecycle
 run "forwards: re-establishes them"                test_forwards
 run "broker: unreachable is reported, not fatal"   test_broker_unreachable_is_reported_not_fatal
+run "version: drift between hub and broker warns"  test_version_drift
 
 run "golden: snapshot, ls, reap"                   test_golden_snapshot_and_reap
 run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_worktrees

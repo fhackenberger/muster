@@ -66,6 +66,9 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self._path()
         record("GET", self.path)
+        if path == "/version":
+            v = os.environ.get("STUB_MUSTER_VERSION", "0.0.0-stub")
+            return self._reply(200, {"broker": v, "box_image": v, "box_image_ref": "stub/box:test"})
         if path == "/box":
             return self._reply(200, {"boxes": [
                 {"box": n, "container": f"box-test-{n}", "status": "Up 3 minutes",

@@ -3,6 +3,14 @@
 # toolchain layers on top via Dockerfile.addon (-> muster-<project>, what the broker spawns).
 FROM debian:trixie-slim
 
+# WHICH MUSTER THIS IS. Baked in so the pieces can check they agree at runtime: the hub, the broker
+# and the boxes are three images from three build paths, and nothing else stops a stack from running
+# a 0.2 broker against a 0.1 hub. The ADD-ON images inherit this ENV from their base, so a
+# project's own toolchain layer carries the version of the muster it was built on — which is exactly
+# the number that has to match. `dev` when built by hand; CI passes the release tag.
+ARG MUSTER_VERSION=dev
+ENV MUSTER_VERSION=${MUSTER_VERSION}
+
 # Minimal deps needed just to install Claude below (ca-certificates + curl). The rest of the shared
 # runtime (git, node/npm, pinchtab, base utils) is installed later by common-setup.sh — see below.
 # Claude is installed EARLY (before common-setup) because its layer is the slow one: keeping it above

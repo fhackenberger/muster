@@ -75,7 +75,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # The version knobs are build-args on purpose: this is where "latest" gets frozen into a
           # release. Bump them in one place — see docs/adr/0001-image-builds.md.
+          #
+          # MUSTER_VERSION is the release itself, baked into every image so the hub, the broker and
+          # the boxes can check at runtime that they came from ONE muster (see version_drift() in
+          # hub/muster). The add-on images a project builds inherit it from their base, so the check
+          # works for them too without anyone passing anything.
           build-args: |
+            MUSTER_VERSION=${{ steps.meta.outputs.version }}
             NODE_VERSION=${{ vars.NODE_VERSION || 'v26.2.0' }}
             NPM_VERSION=${{ vars.NPM_VERSION || '11.13.0' }}
             PINCHTAB_VERSION=${{ vars.PINCHTAB_VERSION || '0.13.2' }}

@@ -100,6 +100,11 @@ BOX_UID = os.environ.get("BOX_UID", "1000")
 BOX_GID = os.environ.get("BOX_GID", "1000")
 MUSTER_SCRIPT = os.environ.get("MUSTER_SCRIPT", "/usr/local/bin/muster-box.sh")
 
+# Which muster this is, baked into the image (see the Dockerfiles). Reported over /version so the hub
+# can tell you when the two have drifted apart — three images, three build paths, and otherwise
+# nothing at all stops a 0.2 broker from driving a 0.1 hub.
+MUSTER_VERSION = os.environ.get("MUSTER_VERSION", "unknown")
+
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 GOLDEN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 # A git branch name, for the ?base=/?merge= spawn parameters (`cbx minto`). These end up in the box's
@@ -118,6 +123,25 @@ _pull_lock = threading.Lock()
 # Serializes golden seal/reap against spawns, so a box can never be created against a golden that is
 # being moved or deleted underneath it.
 _golden_lock = threading.RLock()
+
+
+def box_image_version():
+	"""The muster version baked into the image the broker spawns boxes from, or "unknown".
+
+	Read from the IMAGE rather than assumed, because the box image is the one the broker does not
+	build: it is the project's add-on, layered on some muster base, and which base that was is the
+	thing that has to match. The broker names binaries inside it (muster-box-init, muster-activity)
+	and sets the environment they read, so a mismatch here is boxes that fail to initialise — or, for
+	an older image, silently ignore parameters a newer hub sent."""
+	r = subprocess.run(
+		["docker", "image", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", BOX_IMAGE],
+		capture_output=True, text=True)
+	if r.returncode != 0:
+		return "unknown"                      # not pulled yet; not worth an error
+	for line in r.stdout.splitlines():
+		if line.startswith("MUSTER_VERSION="):
+			return line.split("=", 1)[1].strip() or "unknown"
+	return "unknown"
 
 
 def box_container(name):
@@ -896,6 +920,10 @@ class Handler(BaseHTTPRequestHandler):
 			return
 		path = self._path()
 		try:
+			if path == "/version":
+				return self._reply(200, {"broker": MUSTER_VERSION,
+				                         "box_image": box_image_version(),
+				                         "box_image_ref": BOX_IMAGE})
 			if path == "/box":
 				return self._reply(200, list_boxes())
 			if path == "/golden":

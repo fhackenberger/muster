@@ -97,6 +97,11 @@ set -euo pipefail
 # actually have, not the one this file happens to be called.
 SELF="${0##*/}"
 
+# Which muster this hub image is. Baked in by the Dockerfile; "unknown" for a hand-built image. The
+# broker and the box image carry the same stamp, and version_drift() below compares all three —
+# see `$SELF status`.
+MUSTER_VERSION="${MUSTER_VERSION:-unknown}"
+
 REPO="${CHECKOUT:-/home/dev/repo}"
 DEV="${DEV_BRANCH:-dev}"
 GOLDEN="${GOLDEN_DIR:-/work/golden}"
@@ -406,6 +411,38 @@ broker() {
 }
 
 jqr() { jq -r "$1" 2>/dev/null || true; }
+
+# THE VERSION HANDSHAKE. The hub, the broker and the box image are three images produced by up to
+# three different build paths — muster publishes the first two, a project builds its own box add-on —
+# and nothing in the stack forces them to move together. When they don't, the failures are silent
+# rather than loud: an older broker simply ignores query parameters a newer hub sends (a `minto` box
+# quietly starts on $DEV instead of the target branch), and a broker naming binaries an older box
+# image doesn't have leaves boxes that never initialise.
+#
+# So: say so. Prints one line per disagreement, nothing at all when they match, and treats "unknown"
+# as "cannot tell" rather than as a mismatch — a hand-built image is not a fault.
+version_drift() {
+	local resp broker box ref
+	resp="$(broker GET /version 2>/dev/null)" || return 0     # old broker: no endpoint, nothing to say
+	broker="$(printf '%s' "$resp" | jqr '.broker // empty')"
+	box="$(printf '%s' "$resp" | jqr '.box_image // empty')"
+	ref="$(printf '%s' "$resp" | jqr '.box_image_ref // empty')"
+	[ -n "$broker" ] || return 0
+	local drift=0
+	if [ "$MUSTER_VERSION" != unknown ] && [ "$broker" != unknown ] && [ "$MUSTER_VERSION" != "$broker" ]; then
+		printf '  %sVERSION DRIFT — this hub is muster %s, the broker is %s%s\n' \
+			"$C_B$C_RED" "$MUSTER_VERSION" "$broker" "$C_RESET"
+		drift=1
+	fi
+	if [ "$MUSTER_VERSION" != unknown ] && [ "$box" != unknown ] && [ "$MUSTER_VERSION" != "$box" ]; then
+		printf '  %sVERSION DRIFT — this hub is muster %s, the box image (%s) was built on %s%s\n' \
+			"$C_B$C_RED" "$MUSTER_VERSION" "$ref" "$box" "$C_RESET"
+		drift=1
+	fi
+	[ "$drift" = 0 ] || printf '  %sthe three images must come from one muster version; redeploy the stack%s\n' \
+		"$C_YEL" "$C_RESET"
+	return 0
+}
 
 box_new() {
 	local name="${1:-$(cut -c1-6 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)}"
@@ -751,6 +788,7 @@ status_overview() {
 	done
 
 	hdr boxes
+	version_drift
 	if [ -z "$running" ]; then
 		printf '  %s(broker unreachable)%s\n' "$C_RED" "$C_RESET"
 	elif [ "${#rows[@]}" -eq 0 ]; then

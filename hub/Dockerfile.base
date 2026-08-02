@@ -14,6 +14,14 @@
 #   docker build -f hub/Dockerfile.base -t muster-hub-base .
 FROM debian:trixie-slim
 
+# WHICH MUSTER THIS IS. Baked in so the pieces can check they agree at runtime: the hub, the broker
+# and the boxes are three images from three build paths, and nothing else stops a stack from running
+# a 0.2 broker against a 0.1 hub. The ADD-ON images inherit this ENV from their base, so a
+# project's own toolchain layer carries the version of the muster it was built on — which is exactly
+# the number that has to match. `dev` when built by hand; CI passes the release tag.
+ARG MUSTER_VERSION=dev
+ENV MUSTER_VERSION=${MUSTER_VERSION}
+
 # The hub's uid-1000 user. Home /home/dev matches the boxes' server user, unifying every bind-mount path.
 RUN groupadd -g 1000 dev \
 	&& useradd -m -u 1000 -g 1000 -s /bin/bash dev
