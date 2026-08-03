@@ -702,6 +702,30 @@ EOF
 	has "the backend"
 }
 
+# MUSTER SHIPS SOME SERVICES ITSELF. pinchtab is not an example a consumer has to notice and copy —
+# without a browser an agent verifies against fixtures and reports success — so its manifest lives in
+# the image, and the stack's own hub-services/ overrides one by FILENAME.
+test_svcs_builtin_and_override() {
+	fixture
+	export HUB_SERVICES_BUILTIN="$ROOT/hub/services"
+	cbx svcs
+	ok
+	has "pinchtab"                                   # present with an EMPTY stack hub-services dir
+	has "headless Chrome bridge"
+	# The stack's own file wins, by filename…
+	cat > "$FIX/services/pinchtab" <<-'EOF'
+		description=ours instead
+		command=sleep 600
+	EOF
+	cbx svcs
+	ok
+	has "ours instead"
+	hasnt "headless Chrome bridge"
+	# …and the name is listed ONCE, not once per directory it appears in.
+	eq "$(printf '%s\n' "$OUT" | grep -c 'pinchtab')" "1" "an overridden service must be listed once"
+	unset HUB_SERVICES_BUILTIN
+}
+
 test_service_up_down() {
 	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
 	cat > "$FIX/services/dummy" <<'EOF'
@@ -1528,6 +1552,7 @@ run "golden: snapshot, ls, reap"                   test_golden_snapshot_and_reap
 run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_worktrees
 
 run "svcs: lists the manifests"                    test_svcs_lists_manifests
+run "svcs: built-in manifests + override"          test_svcs_builtin_and_override
 run "svcs: up and down a service"                  test_service_up_down
 
 run "aliases: forward to the hub"                   test_aliases_forward_to_the_hub

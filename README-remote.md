@@ -77,7 +77,8 @@ cp path/to/myapp/docker-claude/mounts.example     mounts
 cp path/to/muster/service-env.example      service-env   # REQUIRED: compose env_file
 cp path/to/muster/compose.project.yml.example compose.project.yml  # YOUR db/cache/queue, if any
 cp path/to/myapp/docker-claude/port-forwards.example port-forwards
-cp -r path/to/myapp/docker-claude/hub-services.example hub-services  # dev-service manifests
+cp -r path/to/myapp/docker-claude/hub-services.example hub-services  # YOUR dev services
+                                                                     # (pinchtab is built in)
 mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
 chown -R 1000:1000 data                                 # boxes + hub run as uid 1000
 $EDITOR .env            # set PROJECT_NAME, STACK_DIR=$(pwd), REPO_URL, tokens, API keys
@@ -119,6 +120,11 @@ name: the browser is on the hub, so that is the address it can resolve.
 Under Ansible the file is templated from
 `templates/docker-compose/claude-box/data/pinchtab/config.json` instead, which exists purely to
 substitute the vault token.
+
+The **service manifest is built into the image** (`hub/services/pinchtab`), so pinchtab exists on a
+stack whose `hub-services/` holds only your own services — it is part of the setup, not an example
+someone has to notice and copy. Override it by putting a file called `pinchtab` in the stack's
+`hub-services/`: the stack's copy wins by filename, which is also how you turn it off.
 
 muster also installs **pinchtab's own Claude skill** into the shared `~/.claude/skills` at hub boot,
 fetched from upstream at image-build time — so an agent uses the CLI's session/snapshot workflow

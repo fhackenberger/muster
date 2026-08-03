@@ -1,0 +1,12 @@
+# SHIPPED BY MUSTER — this manifest lives in the hub image (hub/services/pinchtab), not in your
+# stack's hub-services/. pinchtab is how an agent looks at the page it just changed, and a stack
+# where that is missing is one where agents verify against fixtures and report success.
+#
+# To change it — a different command, or off entirely — put a file called `pinchtab` in the stack's
+# hub-services/ and it wins; overriding is by filename.
+description=pinchtab server (headless Chrome bridge)
+# No writes_repo: pinchtab does not touch the checkout, so it never blocks a golden snapshot.
+# ON at boot. An agent reaches for the browser mid-task, not at a moment when someone is around to
+# start a service for it, and a box that finds pinchtab down concludes the page is broken.
+autostart=true
+command=pinchtab server

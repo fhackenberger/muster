@@ -155,6 +155,12 @@ GOLDEN_PREP_CMD="${GOLDEN_PREP_CMD:-}"
 # and shell substitutions ($(…), $VAR) are evaluated then — which is how the backend's aspectj
 # `-javaagent:$(find …)` gets a path nobody knows until after the build.
 HUB_SERVICES_DIR="${HUB_SERVICES_DIR:-/work/hub-services}"
+# Manifests muster itself SHIPS, in the image (hub/services/*). pinchtab lives here rather than in
+# hub-services.example because it is not an example: the browser is how an agent checks that what it
+# built works, and a stack that silently has no browser is a stack where agents verify against
+# fixtures. A file of the same name in HUB_SERVICES_DIR wins, so a project can still change or
+# disable one.
+HUB_SERVICES_BUILTIN="${HUB_SERVICES_BUILTIN:-/opt/muster/hub-services}"
 
 die() { echo "$SELF: $*" >&2; exit 1; }
 
@@ -303,7 +309,8 @@ review_pager() {
 
 # ------------------------------------------------------------------ services
 #
-# A service is one manifest file in $HUB_SERVICES_DIR; the FILENAME is the service name. Fields are
+# A service is one manifest file in $HUB_SERVICES_DIR (or the built-in set muster ships, which the
+# stack's own dir overrides by filename); the FILENAME is the service name. Fields are
 # `key=value`, one per line, '#' comments and blanks ignored:
 #   command      (required) the shell run in a tmux window via `bash -lc`. Everything after the first
 #                '=' is taken VERBATIM — quotes, &&, and $(…) all survive to the launch shell, so the
@@ -316,9 +323,17 @@ review_pager() {
 #   description  (optional) shown by `$SELF svcs`.
 
 # Parse one manifest into SVC_* globals. Returns 1 (no such manifest) / 2 (no command) / 0 (ok).
+# The stack's manifest for a name, else muster's own. Overriding is by FILENAME, so a project that
+# wants pinchtab started differently — or not at all — writes its own hub-services/pinchtab.
+svc_file() {
+	[ -f "$HUB_SERVICES_DIR/$1" ] && { printf '%s\n' "$HUB_SERVICES_DIR/$1"; return 0; }
+	[ -f "$HUB_SERVICES_BUILTIN/$1" ] && { printf '%s\n' "$HUB_SERVICES_BUILTIN/$1"; return 0; }
+	return 1
+}
+
 svc_load() {
 	local name="$1" file line key val
-	file="$HUB_SERVICES_DIR/$name"
+	file="$(svc_file "$name")" || file=""
 	SVC_COMMAND=""; SVC_WORKDIR=""; SVC_WRITES_REPO=""; SVC_AUTOSTART=""; SVC_DESCRIPTION=""
 	[ -f "$file" ] || return 1
 	while IFS= read -r line || [ -n "$line" ]; do
@@ -344,12 +359,14 @@ svc_truthy() { case "$1" in 1|true|yes|on|TRUE|Yes|On) return 0 ;; *) return 1 ;
 
 # Every manifest name in the dir, sorted. Dotfiles/editor turds are skipped by the glob.
 svc_names() {
-	local f
-	[ -d "$HUB_SERVICES_DIR" ] || return 0
-	for f in "$HUB_SERVICES_DIR"/*; do
-		[ -f "$f" ] || continue
-		printf '%s\n' "${f##*/}"
-	done
+	local f d
+	for d in "$HUB_SERVICES_DIR" "$HUB_SERVICES_BUILTIN"; do
+		[ -d "$d" ] || continue
+		for f in "$d"/*; do
+			[ -f "$f" ] || continue
+			printf '%s\n' "${f##*/}"
+		done
+	done | sort -u          # a name in both dirs is ONE service; svc_file decides which file wins
 	return 0
 }
 
@@ -357,7 +374,7 @@ svc_running() { tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep 
 
 svc_up() {
 	local svc="$1" cmd
-	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc ('$SELF svcs' lists them)"
+	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc or $HUB_SERVICES_BUILTIN/$svc ('$SELF svcs' lists them)"
 	if svc_running "$svc"; then
 		echo "$SELF: $svc already running ($SELF logs $svc to view)"; return 0
 	fi
@@ -389,7 +406,7 @@ svc_logs() {
 # List every defined service with its running state, flags and description.
 svc_list() {
 	local svc any=0 flags
-	echo "== services (from $HUB_SERVICES_DIR) =="
+	echo "== services (from $HUB_SERVICES_DIR, plus muster's own) =="
 	for svc in $(svc_names); do
 		svc_load "$svc" || { printf '  %-12s %-5s (no command — bad manifest)\n' "$svc" "----"; any=1; continue; }
 		any=1
@@ -400,6 +417,7 @@ svc_list() {
 			"${flags:+[$flags] }" "${SVC_DESCRIPTION:-}"
 	done
 	[ "$any" = 1 ] || echo "  (none — drop a manifest in $HUB_SERVICES_DIR; see hub-services.example)"
+	return 0
 }
 
 # Start every service whose manifest sets autostart=true. Called from the hub entrypoint at boot.

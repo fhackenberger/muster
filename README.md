@@ -31,13 +31,15 @@ That last part is what [pinchtab](https://github.com/pinchtab/pinchtab) is here 
 a working setup of it: a browser-control API for agents, driving a real headless Chrome that runs **on
 the hub**. An agent serving a page in its own box can open it, click through a flow, read the console
 and take a screenshot — so "the button now works" is something it checked rather than something it
-inferred from the diff. The Chrome, the `pinchtab` CLI and pinchtab's own Claude skill are already
-in the images; the server starts with the hub, its config and token are seeded on first boot, and
-every box is handed the address and token — so there is nothing to set up and no secret to invent.
-Its allowlist is why each box's dev server is published on the hub's loopback: the browser is *there*,
-and that is the address it can reach. Boxes are told all of this in a note muster keeps in the shared
-claude memory, because an agent that has to deduce it will instead decide the app is down and verify
-against fixtures.
+inferred from the diff.
+
+It is set up, not merely available: Chrome, the `pinchtab` CLI and pinchtab's own Claude skill are in
+the images, its service manifest is built in so the server comes up with the hub, its config and token
+are seeded on first boot, and every box is handed the address and token. Nothing to copy, nothing to
+configure, no secret to invent. Its browser is on the *hub*, which is why each box's dev server is
+published on the hub's loopback — that is the address the browser can reach — and boxes are told so in
+a note muster keeps in the shared claude memory, because an agent left to deduce it will instead
+decide the app is down and verify against fixtures.
 
 ```
 your laptop

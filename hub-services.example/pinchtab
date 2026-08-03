@@ -1,8 +1,0 @@
-# Service manifest — `cbx up pinchtab`. See backend for the full field reference.
-description=pinchtab server (headless Chrome bridge)
-# No writes_repo: pinchtab does not touch the checkout, so it never blocks a golden snapshot.
-# ON BY DEFAULT. An agent reaches for the browser mid-task, not at a moment when someone is around to
-# start a service for it — and a box that finds pinchtab down concludes the page is broken. It costs
-# an idle Chrome bridge; comment this out if your project never looks at a page.
-autostart=true
-command=pinchtab server

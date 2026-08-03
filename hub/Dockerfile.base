@@ -87,9 +87,13 @@ COPY hub/muster-completion.bash /usr/share/bash-completion/completions/muster
 RUN chmod 0644 /usr/share/bash-completion/completions/muster
 
 # The pinchtab server's config, as a SEED. The entrypoint copies it into the stack's ./data/pinchtab
-# on first boot and fills in a token, so `up pinchtab` works on a fresh stack with nothing to write by
+# on first boot and fills in a token, so pinchtab works on a fresh stack with nothing to write by
 # hand. A config already there is never overwritten — this is a default, not a policy.
 COPY pinchtab-config.json.example /opt/muster/pinchtab-config.json
+# Service manifests muster SHIPS. The stack's own hub-services/ overrides one by filename; it does
+# not have to contain one for the browser to exist, which is the point — pinchtab is part of the
+# setup, not an example somebody has to notice and copy.
+COPY hub/services /opt/muster/hub-services
 
 USER 1000
 WORKDIR /home/dev
