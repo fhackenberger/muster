@@ -610,7 +610,10 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   output, exactly as before.
 - **`cbx fix` types into the agent's claude session** (via the broker, `tmux send-keys`). You never
   attach; the agent fixes and re-runs `handoff`, and the box shows up as `re-review` in `cbx q`.
-  It is still there for a one-liner you didn't need the TUI for.
+  It is still there for a one-liner you didn't need the TUI for. Every such message is aimed at the
+  **pane claude runs in**, resolved from its window name — not at the session, which tmux delivers to
+  whichever window is current. Open a second window in a box you attached to, and a session-targeted
+  message lands in *that* shell instead: sent, never received, and no error on either side.
 - **`cbx merge <box> --edit` seeds the editor with what the agent wrote**, never a blank buffer, and
   never git's `SQUASH_MSG` (which wraps every message in `Squashed commit of the following:` and
   indents it four spaces under a `commit`/`Author:`/`Date:` header — a log to read, not a message to

@@ -1475,6 +1475,59 @@ PYEOF
 	ok; has ok
 }
 
+# EVERY message to an agent has to land in CLAUDE's pane. `-t main` names the SESSION, and tmux sends
+# that to whichever window is current — so after you attach to a box and open a second window, or an
+# agent splits one to watch a build, the next fix/rebase/post-merge instruction is typed into that
+# shell. It goes somewhere, it never arrives, and nothing fails: the send succeeded.
+test_broker_box_target() {
+	fixture
+	mkdir -p "$FIX/bin"
+	cat > "$FIX/bin/docker" <<-'EOF'
+		#!/bin/bash
+		printf '%s\n' "$*" >> "$DOCKER_LOG"
+		case "$*" in
+		  *"list-panes -t main:claude"*) [ -n "$NO_NAMED_WINDOW" ] && exit 1; echo "%7"; exit 0 ;;
+		  *"list-panes -t main"*)        echo "%3"; exit 0 ;;
+		esac
+		exit 0
+	EOF
+	chmod +x "$FIX/bin/docker"
+	OUT="$(PATH="$FIX/bin:$PATH" DOCKER_LOG="$FIX/docker.log" python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+b.box_say("work1", "a line")
+b.box_paste("work1", "line one\nline two")
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+	local log; log="$(cat "$FIX/docker.log")"
+	# The pane is looked up by the window NAME muster-box.sh gives claude's window…
+	case "$log" in *"list-panes -t main:claude"*) ;; *) fail "should resolve claude's window by name" "$log" ;; esac
+	# …and every send goes to that PANE ID. A pane id is also immune to base-index, which main:claude.0
+	# would not be.
+	case "$log" in *"send-keys -t %7 -l a line"*) ;; *) fail "send-keys must target the resolved pane" "$log" ;; esac
+	case "$log" in *"paste-buffer -d -p -b cbx -t %7"*) ;; *) fail "paste must target the resolved pane" "$log" ;; esac
+	# NOTHING may be aimed at the bare session any more — that is the bug.
+	case "$log" in *"-t main -l"*|*"-t main Enter"*|*"-t main"$'\n'*) fail "a send still targets the session" "$log" ;; esac
+	# An OLD box, from before that window was named, still gets its message.
+	: > "$FIX/docker.log"
+	OUT="$(PATH="$FIX/bin:$PATH" DOCKER_LOG="$FIX/docker.log" NO_NAMED_WINDOW=1 python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+b.box_say("work1", "a line")
+print("ok")
+PYEOF
+)"; RC=$?
+	ok
+	log="$(cat "$FIX/docker.log")"
+	case "$log" in *"send-keys -t %3 -l a line"*) ;; *) fail "an unnamed window must fall back to the session's pane" "$log" ;; esac
+}
+
 test_broker_box_prompt() {
 	OUT="$(python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import base64, importlib.util, os, sys
@@ -1592,6 +1645,7 @@ run "broker: the branch job survives a recreate"   test_broker_persists_the_bran
 run "broker: query parameters"                     test_broker_query_params
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
+run "broker: messages target claude's pane"        test_broker_box_target
 run "broker: box-env, expanded per box"            test_broker_box_env
 run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
 run "pinchtab: the hub seeds a token"              test_pinchtab_token

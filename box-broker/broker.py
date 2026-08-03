@@ -1104,16 +1104,45 @@ def box_dirty(name):
 	return {"box": name, "reachable": True, "dirty": files}
 
 
+BOX_TMUX_SESSION = "main"
+# muster-box.sh creates the session as `new-session -d -s main -n claude`, so claude's window has a
+# NAME — and a name is the only stable way to find it again.
+BOX_TMUX_WINDOW = "claude"
+
+
+def box_target(container):
+	"""The tmux pane claude is in — resolved, never assumed.
+
+	EVERY MESSAGE USED TO GO TO `-t main`, WHICH IS THE SESSION. tmux resolves a session-only target
+	to whichever window is CURRENT and whichever pane is active in it. So the moment you attach to a
+	box and open a second window — or an agent splits one to watch a build — the next `fix`, `rebase`
+	or post-merge instruction is typed into that shell instead of into claude. It goes somewhere; it
+	simply never arrives, and nothing reports a failure, because the send itself succeeded.
+
+	So ask tmux for the pane id (%N) of claude's named window. A pane id is unambiguous and immune to
+	base-index settings, which `main:claude.0` is not. Falling back through the window name to the
+	bare session keeps boxes started before that window was named working — badly targeted, but no
+	worse than they are now."""
+	for target in (f"{BOX_TMUX_SESSION}:{BOX_TMUX_WINDOW}", BOX_TMUX_SESSION):
+		r = subprocess.run(["docker", "exec", "-u", "dev", container,
+		                    "tmux", "list-panes", "-t", target, "-F", "#{pane_id}"],
+		                   capture_output=True, text=True)
+		if r.returncode == 0 and r.stdout.strip():
+			return r.stdout.split()[0]
+	return BOX_TMUX_SESSION
+
+
 def box_say(name, text):
 	"""Type a line into the box's claude session (tmux send-keys). This is how `cbx fix` delivers
 	review feedback without you attaching. -l sends the text LITERALLY, so tmux never interprets a
 	word like 'Enter' or 'C-c' inside your message as a key."""
 	c = box_container(name)
-	r = subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", "main", "-l", text],
+	t = box_target(c)
+	r = subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", t, "-l", text],
 	                   capture_output=True, text=True)
 	if r.returncode != 0:
 		raise RuntimeError(r.stderr.strip() or "send-keys failed")
-	subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", "main", "Enter"],
+	subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", t, "Enter"],
 	               capture_output=True, text=True)
 	return {"box": name, "sent": text}
 
@@ -1136,17 +1165,20 @@ def box_paste(name, text):
 	which claude does. If some other program is in the window it degrades to a plain paste — i.e. to
 	exactly what /say does today — so this is never worse than the alternative."""
 	c = box_container(name)
+	# Resolved ONCE: the paste and the Enter that submits it must land in the same pane, and a window
+	# switch between the two calls would otherwise split a prompt from its submit.
+	t = box_target(c)
 	r = subprocess.run(["docker", "exec", "-i", "-u", "dev", c,
 	                    "tmux", "load-buffer", "-b", "cbx", "-"],
 	                   input=text.rstrip("\n"), capture_output=True, text=True)
 	if r.returncode != 0:
 		raise RuntimeError(r.stderr.strip() or "load-buffer failed")
 	r = subprocess.run(["docker", "exec", "-u", "dev", c,
-	                    "tmux", "paste-buffer", "-d", "-p", "-b", "cbx", "-t", "main"],
+	                    "tmux", "paste-buffer", "-d", "-p", "-b", "cbx", "-t", t],
 	                   capture_output=True, text=True)
 	if r.returncode != 0:
 		raise RuntimeError(r.stderr.strip() or "paste-buffer failed")
-	subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", "main", "Enter"],
+	subprocess.run(["docker", "exec", "-u", "dev", c, "tmux", "send-keys", "-t", t, "Enter"],
 	               capture_output=True, text=True)
 	return {"box": name, "pasted": len(text)}
 
