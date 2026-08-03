@@ -169,7 +169,14 @@ _muster_run() {
 	local args='' live='' self="${_MUSTER_SELF:-muster}"
 	[ "$#" -gt 0 ] && printf -v args ' %q' "$@"
 	case "${1:-}" in
-		logs) live=1 ;;
+		# `logs <svc>` ATTACHES a tmux window — long-lived and interactive, so it honours the transport.
+		# `logs <svc> --tail|--file` PRINTS and exits, so it must go over ssh like every other one-shot:
+		# on mosh it would be rendered and then wiped, which is the opposite of the point. That matters
+		# most here, because mosh has no scrollback AT ALL — attaching a failed service's window over
+		# mosh gives you a pane you can never scroll back through, whatever tmux binds.
+		logs)
+			live=1
+			case " $* " in *" --tail "*|*" --file "*) live='' ;; esac ;;
 		q|queue) case "${2:-}" in --text|--once|-1) ;; *) live=1 ;; esac ;;
 	esac
 	if [ -n "$live" ]; then

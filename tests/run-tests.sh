@@ -670,6 +670,31 @@ test_golden_snapshot_and_reap() {
 	kill "$pid" 2>/dev/null
 }
 
+# HOW FAR the golden trails dev, not just that it does. Every box overlays that tree, so the number is
+# the gap each new agent starts with and has to rebase across — and "dev has moved" reads identically
+# after one merge and after thirty.
+test_q_shows_golden_drift() {
+	local port pid
+	port=$(( STUB_PORT + 3 ))
+	STUB_LOG="$FIX/stub4.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	BROKER_URL="http://127.0.0.1:$port" cbx golden snapshot >/dev/null 2>&1
+	# `status` renders the same overview the live `q` dashboard does (q --text is the bare table), so
+	# it is what a one-shot test can assert on.
+	# Fresh: no drift line at all.
+	BROKER_URL="http://127.0.0.1:$port" cbx status
+	ok
+	hasnt "commit(s) behind"
+	# Three commits later it says three.
+	local i
+	for i in 1 2 3; do git_ commit -q --allow-empty -m "later $i"; done
+	BROKER_URL="http://127.0.0.1:$port" cbx status
+	ok
+	has "3 commit(s) behind"
+	kill "$pid" 2>/dev/null
+}
+
 # An unfinished `cbx minto --here` lives in .git/cbx/wt. It must not be baked into a golden, and the
 # worktree ADMIN dir must not either — a box inheriting one refuses to check the branch out.
 test_golden_snapshot_strips_worktrees() {
@@ -750,6 +775,37 @@ EOF
 	unset TMUX_SESSION
 }
 
+# A SERVICE THAT FAILS TO START MUST LEAVE ITS OUTPUT SOMEWHERE READABLE. The window says "backend
+# exited" and waits — and by then the error can be unreachable: a laptop tmux around the ssh swallows
+# the scroll keys, and pressing enter closes the window for good. So every service's output is copied
+# to a file as it runs (tmux pipe-pane, which touches neither the process nor its tty), and `logs
+# --tail` prints it into YOUR terminal, where your own scrollback keeps it.
+test_service_output_is_captured() {
+	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
+	cat > "$FIX/services/failer" <<-'EOF'
+		description=fails the way a build does
+		command=echo compiling; echo "BUILD FAILED in 18s" >&2; false
+	EOF
+	export TMUX_SESSION="mustertest-$$"
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
+	cbx up failer; ok
+	# pipe-pane copies asynchronously, so give the file a moment to appear.
+	local f i; f="$FIX/repo/.git/cbx/logs/failer.log"
+	for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$f" ] && break; sleep 0.3; done
+	cbx logs failer --tail 50
+	ok
+	has "BUILD FAILED in 18s"          # the error itself, with nothing to attach to
+	has "exited (status 1)"            # …and why the window is sitting there
+	cbx logs failer --file; ok; has "failer.log"
+	cbx logs failer --tail; ok         # N defaults rather than erroring
+	cbx logs never-started --tail 5; notok; has "no captured output"
+	cbx logs failer --wat; notok; has "unknown option"
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+	unset TMUX_SESSION
+}
+
 # =====================================================================  laptop aliases
 #
 # These build command STRINGS for ssh; the bugs they can have are quoting and PTY bugs. See
@@ -778,6 +834,16 @@ test_aliases_transport_split() {
 	al 'MUSTER_TRANSPORT=mosh cbx q';       ssh_has "mosh"
 	al 'MUSTER_TRANSPORT=mosh cbx logs backend'; ssh_has "mosh"
 	al 'MUSTER_TRANSPORT=mosh cbx ls';     ssh_hasnt "mosh"   # one-shot: ssh even under mosh
+	# `logs <svc>` ATTACHES a window: long-lived and interactive, so it honours the transport. But
+	# `logs --tail/--file` PRINTS and exits — one-shot text must go over ssh or mosh renders it and
+	# wipes it on the way out. It matters more here than anywhere: mosh has no scrollback at all, so a
+	# failed service read through it could never be scrolled back through.
+	MUSTER_TRANSPORT=mosh al 'cbx logs backend'
+	ssh_has "mosh "
+	MUSTER_TRANSPORT=mosh al 'cbx logs backend --tail 200'
+	ssh_has "ssh -t"; ssh_hasnt "mosh "
+	MUSTER_TRANSPORT=mosh al 'cbx logs backend --file'
+	ssh_has "ssh -t"; ssh_hasnt "mosh "
 }
 
 test_aliases_quote_hostile_arguments() {
@@ -1528,6 +1594,62 @@ PYEOF
 	case "$log" in *"send-keys -t %3 -l a line"*) ;; *) fail "an unnamed window must fall back to the session's pane" "$log" ;; esac
 }
 
+# A KILLED BOX MUST GIVE ITS PORT SLOT BACK. Killing keeps the box directory on purpose — the upper
+# layer holds work that was never pushed, plus warm caches, and `box <same name>` reattaches to it —
+# and the slot file lives in that directory. Counting slot FILES therefore counted every box that had
+# ever existed: after the sixteenth, every spawn failed with "out of port-forward slots — kill a box
+# first" while `muster ls` showed two boxes running. Killing another one could never help.
+test_broker_slot_reuse() {
+	fixture
+	mkdir -p "$FIX/bin"
+	cat > "$FIX/bin/docker" <<-'EOF'
+		#!/bin/bash
+		case "$*" in *"ps -a"*) printf '%s\n' $LIVE_BOXES ;; esac
+		exit 0
+	EOF
+	chmod +x "$FIX/bin/docker"
+	local i
+	for i in $(seq 0 15); do mkdir -p "$FIX/boxes/old$i"; echo "$i" > "$FIX/boxes/old$i/slot"; done
+	mkdir -p "$FIX/boxes/alive"; echo 3 > "$FIX/boxes/alive/slot"
+	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" PROJECT_NAME=proj \
+		LIVE_BOXES="box-proj-alive" python3 - "$BROKER_PY" "$FIX/boxes" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+root = sys.argv[2]
+# Sixteen boxes have existed; exactly one still has a container.
+assert sorted(b.live_slots()) == [3], sorted(b.live_slots())
+# So a new box spawns rather than being told the stack is full.
+assert b.alloc_slot(os.path.join(root, "fresh")) == 0, b.alloc_slot(os.path.join(root, "fresh"))
+# A live box keeps the ports you already have open on the hub.
+assert b.alloc_slot(os.path.join(root, "alive")) == 3
+# And a killed box reclaims its own slot when nothing live took it — a recreate keeps its ports too.
+assert b.alloc_slot(os.path.join(root, "old11")) == 11
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+	# When that many boxes really do exist, it still refuses — and says how many, so the message can be
+	# checked against `muster ls` instead of believed.
+	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" PROJECT_NAME=proj \
+		LIVE_BOXES="$(for i in $(seq 0 15); do printf 'box-proj-old%s ' "$i"; done)" \
+		python3 - "$BROKER_PY" "$FIX/boxes" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+try:
+    b.alloc_slot(os.path.join(sys.argv[2], "seventeenth"))
+    raise SystemExit("a seventeenth live box should have been refused")
+except RuntimeError as e:
+    assert "16 of 16" in str(e), e
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 test_broker_box_prompt() {
 	OUT="$(python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import base64, importlib.util, os, sys
@@ -1603,10 +1725,12 @@ run "version: drift between hub and broker warns"  test_version_drift
 
 run "golden: snapshot, ls, reap"                   test_golden_snapshot_and_reap
 run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_worktrees
+run "q: shows how far the golden has drifted"      test_q_shows_golden_drift
 
 run "svcs: lists the manifests"                    test_svcs_lists_manifests
 run "svcs: built-in manifests + override"          test_svcs_builtin_and_override
 run "svcs: up and down a service"                  test_service_up_down
+run "svcs: a failed start leaves readable output"  test_service_output_is_captured
 
 run "aliases: forward to the hub"                   test_aliases_forward_to_the_hub
 run "aliases: ssh vs mosh transport split"         test_aliases_transport_split
@@ -1646,6 +1770,7 @@ run "broker: query parameters"                     test_broker_query_params
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: messages target claude's pane"        test_broker_box_target
+run "broker: a killed box frees its port slot"     test_broker_slot_reuse
 run "broker: box-env, expanded per box"            test_broker_box_env
 run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
 run "pinchtab: the hub seeds a token"              test_pinchtab_token

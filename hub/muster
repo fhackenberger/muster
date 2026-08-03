@@ -12,6 +12,9 @@ set -euo pipefail
 #   $SELF up   <service>                      # start a service in its tmux window
 #   $SELF down <service>                      # stop it
 #   $SELF logs <service>|gitd                 # attach that service window (Ctrl-b d to detach)
+#   $SELF logs <service> --tail [N]         #   …or PRINT the captured output instead of attaching —
+#   $SELF logs <service> --file             #   what you want when it FAILED to start (a pane you
+#                                           #   cannot scroll is no help), or its path
 #   $SELF autostart                           # start every service whose manifest sets autostart=true
 #   $SELF box  [name]                         # spawn an agent box (own branch, overlay checkout)
 #   $SELF kill <name>                         # remove an agent box (its upper layer is kept)
@@ -387,10 +390,19 @@ svc_up() {
 	cmd="$SVC_COMMAND"
 	# workdir overrides the window's default cwd; unquoted so $REPO/$VAR expand in the launch shell.
 	[ -n "$SVC_WORKDIR" ] && cmd="cd $SVC_WORKDIR && $cmd"
-	# keep the window alive after the command exits so failures stay readable
+	local log; log="$(svc_log "$svc")"
+	mkdir -p "${log%/*}"; : > "$log"
+	# Keep the window alive after the command exits so failures stay readable — and SAY the exit
+	# status and where the output is. "backend exited" alone sends you hunting through a pane you may
+	# not be able to scroll: nested tmux eats the scroll keys, and the window is gone once you press
+	# enter. $? is captured on the very next line, before echo overwrites it.
 	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$REPO" \
-		"bash -lc $(printf '%q' "$cmd; echo; echo '[muster] $svc exited — press enter to close'; read _")"
-	echo "$SELF: started $svc ($SELF logs $svc to view)"
+		"bash -lc $(printf '%q' "$cmd; _rc=\$?; echo; echo \"[muster] $svc exited (status \$_rc) — full output: $log\"; echo '[muster] read it from anywhere with: $SELF logs $svc --tail 200'; echo '[muster] scroll here: Shift-PageUp — inside another tmux, press Ctrl-b twice first'; echo '[muster] press enter to close this window'; read _")"
+	# pipe-pane copies everything the pane shows into a FILE, without touching the process: the service
+	# keeps its tty (so gradle/ng keep their colours and progress), and the output survives both the
+	# scrollback and the window itself. -o toggles it on for this pane only.
+	tmux pipe-pane -o -t "${TMUX_SESSION}:${svc}" "cat >> $(printf '%q' "$log")" 2>/dev/null || true
+	echo "$SELF: started $svc ($SELF logs $svc to view, $SELF logs $svc --tail N to read the output)"
 }
 
 svc_down() {
@@ -399,8 +411,29 @@ svc_down() {
 		|| echo "$SELF: $svc not running"
 }
 
+# Where a service's captured output lives. Under $STATE (the repo's .git/cbx) so it is bind-mounted —
+# it survives a hub recreate — and invisible to git, like every other piece of muster state.
+svc_log() { printf '%s/logs/%s.log\n' "$STATE" "$1"; }
+
 svc_logs() {
-	exec tmux attach -t "${TMUX_SESSION}" \; select-window -t "${TMUX_SESSION}:$1"
+	local svc="$1"; shift
+	local n=""
+	case "${1:-}" in
+		--tail) n="${2:-200}" ;;
+		--file) printf '%s\n' "$(svc_log "$svc")"; return 0 ;;
+		'') ;;
+		*) die "logs: unknown option '$1' (want: --tail [N] | --file)" ;;
+	esac
+	# READING beats attaching when something has gone wrong. Attaching gives you a pane you may not be
+	# able to scroll (a laptop tmux around the ssh eats the scroll keys) and that disappears the moment
+	# you dismiss it; --tail prints into YOUR terminal, where your own scrollback keeps it.
+	if [ -n "$n" ]; then
+		local f; f="$(svc_log "$svc")"
+		[ -f "$f" ] || die "no captured output for '$svc' at $f — has it been started since the hub booted?"
+		tail -n "$n" "$f"
+		return 0
+	fi
+	exec tmux attach -t "${TMUX_SESSION}" \; select-window -t "${TMUX_SESSION}:$svc"
 }
 
 # List every defined service with its running state, flags and description.
@@ -683,7 +716,7 @@ status_overview() {
 	#
 	# `$SELF q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
 	# is the origin fetch, which `--no-fetch` skips (the watch loop throttles it to $WATCH_FETCH).
-	local behind ahead box sha st bhd ahd age note conf dconf act other list running gprov gsha todo=()
+	local behind ahead box sha st bhd ahd age note conf dconf act other list running gprov gsha gbehind todo=()
 	local cols nw=3 sumw rows=() row bname bstatus bgolden bstate bage detail
 
 	cols="$(term_cols)"
@@ -733,7 +766,7 @@ status_overview() {
 
 	# The queue lives INSIDE the overview (rather than beside it) so one screen answers both "who is
 	# waiting on me" and "what do I do about it" — `$SELF q --text` still prints the bare table.
-	hdr queue
+	hdr "review queue"
 	# 2 indent + name + status(9) + ahead(5) + behind(6) + last(13), each with a space after it.
 	sumw=$(( cols - nw - 39 ))
 	if [ -z "$list" ]; then
@@ -851,8 +884,20 @@ status_overview() {
 	else
 		printf '  %s%s%s\n' "$C_DIM" "$gprov" "$C_RESET"
 		# Field 3 of "g-<id> from <sha> (<branch>) at <date>" — a hint only, so it is never fatal.
+		#
+		# HOW FAR behind, not just whether: every box overlays this tree, so the number is the size of
+		# the gap each new agent starts with and has to rebase across. "dev has moved" reads the same
+		# after one merge as after thirty, and those are different decisions.
 		gsha="$(printf '%s' "$gprov" | awk '{print $3}')"
-		if [ -n "$gsha" ] && ! git_ merge-base --is-ancestor "$DEV" "$gsha" 2>/dev/null; then
+		gbehind=""
+		[ -n "$gsha" ] && git_ rev-parse -q --verify "${gsha}^{commit}" >/dev/null 2>&1 \
+			&& gbehind="$(git_ rev-list --count "${gsha}..${DEV}" 2>/dev/null || true)"
+		if [ -n "$gbehind" ] && [ "$gbehind" != 0 ]; then
+			printf '  %s(%s commit(s) behind %s — a snapshot would give new boxes a fresher base)%s\n' \
+				"$C_YEL" "$gbehind" "$DEV" "$C_RESET"
+		elif [ -z "$gbehind" ] && [ -n "$gsha" ] && ! git_ merge-base --is-ancestor "$DEV" "$gsha" 2>/dev/null; then
+			# The recorded commit is not in this repo any more (history rewritten, or a golden from
+			# another clone). Say the thing we still know rather than a number we would be inventing.
 			printf '  %s(%s has moved since — a snapshot would give new boxes a fresher base)%s\n' \
 				"$C_YEL" "$DEV" "$C_RESET"
 		fi
@@ -2558,7 +2603,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
 	up)     [ $# -ge 1 ] || die "up needs a service ($SELF svcs to list)"; svc_up "$1" ;;
 	down)   [ $# -ge 1 ] || die "down needs a service ($SELF svcs to list)"; svc_down "$1" ;;
-	logs)   [ $# -ge 1 ] || die "logs needs a service ($SELF svcs to list)"; svc_logs "$1" ;;
+	logs)   [ $# -ge 1 ] || die "logs needs a service ($SELF svcs to list)"; svc_logs "$@" ;;
 	svcs|services) svc_list ;;
 	autostart)     svc_autostart ;;
 	box)      box_new "$@" ;;

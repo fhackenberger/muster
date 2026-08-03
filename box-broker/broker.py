@@ -436,30 +436,57 @@ def expand_box_env(lines, facts):
 	return out
 
 
+def _slot_of(name):
+	try:
+		with open(os.path.join(BOXROOT, name, "slot")) as fh:
+			return int(fh.read().strip())
+	except (OSError, ValueError):
+		return None
+
+
+def live_slots(exclude=None):
+	"""Slots held by boxes that still have a CONTAINER — the only ones actually in use.
+
+	This is the whole fix for "out of port-forward slots" with two boxes running. A killed box keeps
+	its directory on purpose (the upper layer holds work that was never pushed, plus warm caches, and
+	`box <same name>` reattaches to them), and the slot file lives in that directory. Counting files
+	therefore counted every box that had EVER existed: after the sixteenth, spawning failed for good,
+	and `muster ls` showed two boxes while the broker insisted it was full.
+
+	`docker ps -a`: a stopped container still owns its ports as far as we are concerned, and kill_box
+	removes the container — so "the container exists" is exactly the lifetime of a claim."""
+	out = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^box-{PROJECT}-",
+	                      "--format", "{{.Names}}"], capture_output=True, text=True)
+	slots = set()
+	for ln in out.stdout.splitlines():
+		name = _box_name_of(ln.strip())
+		if not name or name == exclude:
+			continue
+		slot = _slot_of(name)
+		if slot is not None:
+			slots.add(slot)
+	return slots
+
+
 def alloc_slot(box_dir):
-	"""Stable per-box slot index (0..PORT_FORWARD_SLOTS-1), persisted so a recreate keeps the same hub
-	ports. Raises when every slot is taken (refuse to spawn — we're out of forward ports)."""
+	"""A port-forward slot (0..PORT_FORWARD_SLOTS-1) for this box.
+
+	Its own previous slot when nothing live holds it — so a recreate keeps the hub ports you had open
+	— otherwise the lowest free one. Raises only when that many boxes really are alive."""
+	name = os.path.basename(box_dir.rstrip("/"))
 	sf = os.path.join(box_dir, "slot")
-	if os.path.exists(sf):
-		try:
-			return int(open(sf).read().strip())
-		except ValueError:
-			pass
-	used = set()
-	if BOXROOT and os.path.isdir(BOXROOT):
-		for d in os.listdir(BOXROOT):
-			f = os.path.join(BOXROOT, d, "slot")
-			if os.path.exists(f):
-				try:
-					used.add(int(open(f).read().strip()))
-				except ValueError:
-					pass
+	taken = live_slots(exclude=name)
+	mine = _slot_of(name)
+	if mine is not None and mine not in taken and mine < PORT_FORWARD_SLOTS:
+		return mine
 	for slot in range(PORT_FORWARD_SLOTS):
-		if slot not in used:
+		if slot not in taken:
+			os.makedirs(box_dir, exist_ok=True)
 			with open(sf, "w") as fh:
 				fh.write(str(slot))
 			return slot
-	raise RuntimeError(f"out of port-forward slots (max {PORT_FORWARD_SLOTS} concurrent boxes) — kill a box first")
+	raise RuntimeError(f"out of port-forward slots: {len(taken)} of {PORT_FORWARD_SLOTS} are held by "
+	                   f"boxes that still exist ('muster ls' shows them, 'muster kill <box>' frees one)")
 
 
 def start_forwarders(name, slot, forwards):

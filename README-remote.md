@@ -446,6 +446,8 @@ cbx up backend        # start one (any service that has a hub-services/<name> ma
 cbx up frontend
 cbx up pinchtab
 cbx logs backend      # attach that service's tmux window to watch logs (Ctrl-b d to detach)
+cbx logs backend --tail 200   # …or just PRINT the output — what you want when it failed to start
+cbx logs backend --file       # the path of the captured log, for grep/less/cbxcp
 cbx box work1         # spawn an agent box (mounts per the `mounts` table)
 cbx ls                # services + boxes
 ```
@@ -500,9 +502,20 @@ cbx logs backend      # attach the backend window and watch it live
 
 - **Detach with `Ctrl-b d`** — this leaves the service running. Do **not** press `Ctrl-c`; that
   would kill the process inside the window.
-- The window is kept alive even after the process exits (it shows `[cbx] <svc> exited …`), so
-  `cbx logs` still works to read the output of a service that crashed on startup — exactly when you
-  need it.
+- The window is kept alive even after the process exits — it shows `[muster] <svc> exited (status N)`
+  and the path of its captured output — so `cbx logs` still works after a service crashed on startup.
+- **When it failed, `--tail` is the one you want.** Everything a service prints is copied to a file as
+  it runs (`tmux pipe-pane`, which touches neither the process nor its tty, so gradle and `ng serve`
+  keep their colours), at `.git/cbx/logs/<svc>.log` in the hub's repo:
+
+  ```sh
+  cbx logs backend --tail 200    # print it here, into YOUR scrollback
+  cbx logs backend --file        # just the path — for grep, less, or cbxcp
+  ```
+
+  Attaching a pane is the wrong tool for a failure: with a tmux around your ssh the scroll keys go to
+  the *outer* tmux, and the window is gone the moment you dismiss it. `--tail` prints into the
+  terminal you are already in, and the file outlives the window.
 - `cbx logs` needs a TTY to attach tmux; the `cbx` alias already provides one (`ssh -t` +
   `docker exec -it`), so it just works.
 
