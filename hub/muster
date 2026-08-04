@@ -18,6 +18,8 @@ set -euo pipefail
 #   $SELF autostart                           # start every service whose manifest sets autostart=true
 #   $SELF box  [name]                         # spawn an agent box (own branch, overlay checkout)
 #   $SELF kill <name>                         # remove an agent box (its upper layer is kept)
+#   $SELF purge <name> [--force]              # …and remove it FOR GOOD: upper layer, caches, session.
+#                                           #   Refuses while its handoff is still unreviewed.
 #   $SELF recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
 #   $SELF ls                                  # list services + boxes (broker)
 #   $SELF forwards [box]                      # re-establish the hub-loopback socat forwards
@@ -49,6 +51,8 @@ set -euo pipefail
 #                                           #   wording, [m] merges. Nothing is rewritten until you
 #                                           #   confirm, and your edits survive quitting. Trees and
 #                                           #   authors are untouched — only the messages change.
+#             [--undo]                      #   put $DEV back and the branch back in the queue (only
+#                                           #   while the merge is still the tip and unpushed)
 #             [--landed]                    #   the merge CONFLICTED and you finished it by hand: retire
 #                                           #   the branch + tell the box, without merging again. Only
 #                                           #   needed when your fix was a squash/hand-written commit —
@@ -85,6 +89,8 @@ set -euo pipefail
 #   $SELF golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
 #   $SELF golden seal <id>                    # finish a staged golden you fixed up by hand
 #   $SELF golden ls | reap                    # list snapshots / delete unreferenced ones
+#   $SELF golden retire <id>                  # free one that boxes are still on: move them onto the
+#                                           #   current golden, or purge them, then reap
 #
 # What the hub and the boxes MOUNT is project set-up, not a runtime knob: it lives in the stack's
 # root-owned `mounts` table (one row per path, a mode for each side), edited on the host and applied
@@ -561,9 +567,53 @@ box_ls() {
 			read -r st age <<< "$(box_activity "$box")"
 			printf '  %-12s %-10s %-22s %s\n' "$box" "$st" "$status" "golden=$golden"
 		done < <(printf '%s' "$resp" | jq -r '.boxes[]? | "\(.box)\t\(.status)\t\(.golden)"' 2>/dev/null)
+		# Boxes with a directory but no container. `kill` keeps that directory on purpose (unpushed work
+		# + warm caches, and `box <same name>` reattaches to it), so they pile up unseen — one of these
+		# is what "out of port-forward slots with two boxes running" used to be about.
+		local rbox rgold rsize any=0
+		while IFS=$'\t' read -r rbox rgold rsize; do
+			[ -n "$rbox" ] || continue
+			[ "$any" = 1 ] || { echo "== retired (kept for '$SELF box <name>' to reattach) =="; any=1; }
+			printf '  %-12s %-10s %-22s %s\n' "$rbox" "-" "on disk: $(human_size "${rsize:-0}")" "golden=$rgold"
+		done < <(printf '%s' "$resp" | jq -r '.retired[]? | "\(.box)\t\(.golden)\t\(.size)"' 2>/dev/null)
+		[ "$any" = 0 ] || echo "  ($SELF purge <name> removes one for good)"
 	else
 		echo "  (broker unreachable)"
 	fi
+}
+
+# Bytes as something you can read at a glance. Deciding what to purge is a size question.
+human_size() {
+	local b="${1:-0}"
+	if   [ "$b" -ge 1073741824 ] 2>/dev/null; then printf '%s.%sG' "$((b/1073741824))" "$(((b%1073741824)*10/1073741824))"
+	elif [ "$b" -ge 1048576 ]    2>/dev/null; then printf '%sM' "$((b/1048576))"
+	elif [ "$b" -ge 1024 ]       2>/dev/null; then printf '%sK' "$((b/1024))"
+	else printf '%sB' "$b"; fi
+}
+
+# Remove a box FOR GOOD — container, volumes, upper layer, caches, session. The one irreversible thing
+# here, so it refuses while the box still has a handoff nobody merged, and asks before doing it.
+box_purge() {
+	[ $# -ge 1 ] || die "purge needs a box name ('$SELF ls' lists them)"
+	local box="$1" force="" resp
+	[ "${2:-}" = --force ] && force=1
+	if git_ rev-parse --verify -q "refs/agents/$box" >/dev/null && [ -z "$force" ]; then
+		echo "$SELF: '$box' still has a handoff waiting in the review queue." >&2
+		echo "$SELF: review it  — $SELF review $box" >&2
+		echo "$SELF: merge it   — $SELF merge $box" >&2
+		echo "$SELF: bin it     — $SELF drop $box   (then purge)" >&2
+		die "refusing to purge a box whose work you have not looked at ($SELF purge $box --force overrides)"
+	fi
+	if [ -t 0 ] && [ -z "$force" ]; then
+		tty_flush
+		printf "%s: permanently remove '%s' — container, upper layer, caches, session? [y/N] " "$SELF" "$box" > /dev/tty
+		local answer=""; read -r answer < /dev/tty || answer=n
+		case "$answer" in y|Y|yes|YES) ;; *) die "not purged" ;; esac
+	fi
+	resp="$(broker DELETE "/box/$box/purge")" || die "purging '$box' failed: $resp"
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.mergeinto"
+	rm -rf "$(reword_dir "$box")"
+	echo "$SELF: purged '$box' — freed $(human_size "$(printf '%s' "$resp" | jqr '.freed // 0')")"
 }
 
 say_to_box() {
@@ -1672,7 +1722,7 @@ reword_apply() {
 
 merge() {
 	[ $# -ge 1 ] || die "merge needs a box name"
-	local box="$1" squash="" edit="" single="" landed="" reword="" a ref msg mref
+	local box="$1" squash="" edit="" single="" landed="" reword="" undo="" a ref msg mref mref_probe
 	shift
 	for a in "$@"; do
 		case "$a" in
@@ -1680,12 +1730,16 @@ merge() {
 			--edit|-e) edit=1 ;;
 			--reword|-r) reword=1 ;;
 			--landed) landed=1 ;;
-			*) die "merge: unknown option '$a' (--squash | --edit | --reword | --landed)" ;;
+			--undo) undo=1 ;;
+			*) die "merge: unknown option '$a' (--squash | --edit | --reword | --landed | --undo)" ;;
 		esac
 	done
+	# Before the "did this box push anything" check below: undoing is precisely the case where the ref
+	# is gone, because merging deleted it.
+	[ -z "$undo" ] || { merge_undo "$box"; return; }
 	[ -z "$reword" ] || [ -z "$squash" ] \
 		|| die "merge: --reword and --squash are opposites — --squash makes ONE commit, --reword keeps them all"
-	ref="refs/agents/$box"
+	ref="refs/agents/$box"; mref_probe="$ref"
 	git_ rev-parse --verify -q "$ref" >/dev/null || die "no branch pushed for '$box'"
 
 	# A minto box's branch is <target> plus a merge commit. Merging that into $DEV would not land a fix
@@ -1739,6 +1793,34 @@ merge() {
 		echo "$SELF: note — local changes in $REPO (kept; the merge aborts only if it would overwrite one):" >&2
 		git_ status --short | sed 's/^/  /' >&2
 	fi
+	# WOULD IT CONFLICT? Ask before touching anything, because the alternative is finding out by being
+	# left in a half-merged worktree — and the usual answer at that point is "abort and rebase first",
+	# which is a thing to decide BEFORE the mess rather than after it. merge-tree computes the merge in
+	# the object store, so this costs nothing and changes nothing.
+	local conf_files
+	conf_files="$(conflicts_between "$DEV" "$mref_probe")"
+	if [ -n "$conf_files" ]; then
+		echo "$SELF: merging '$box' into $DEV would CONFLICT in:" >&2
+		printf '  %s\n' $conf_files >&2
+		# Not a terminal (a script, a pipe): say it and carry on. The merge itself stops safely on the
+		# conflict, so refusing here would break every non-interactive caller for no extra safety.
+		if [ ! -t 0 ]; then
+			echo "$SELF: not a terminal — merging anyway; git will stop on the conflict." >&2
+		else
+			tty_flush
+			printf '%s: [r]ebase the agent first  [m]erge anyway  [q]uit ? ' "$SELF" > /dev/tty
+			local answer=""; read -r answer < /dev/tty || answer=q
+			case "$answer" in
+				r|R)
+					echo "$SELF: asking '$box' to rebase onto $DEV — merge again once it has handed off."
+					rebase "$box"
+					return 0 ;;
+				m|M) echo "$SELF: merging anyway — resolve the conflict in $REPO, then: $SELF merge $box" ;;
+				*)   die "not merged (nothing changed)" ;;
+			esac
+		fi
+	fi
+
 	msg="$(note_of "$box")"; msg="${msg:-work from agent box $box}"
 
 	# Don't land agent work on a stale base. If origin moved (you pushed from the laptop, a colleague
@@ -1845,6 +1927,70 @@ merge() {
 	git_ --no-pager log --oneline -1 | sed 's/^/  /'
 	git_ --no-pager diff --shortstat "$before" "$after" | sed 's/^/  /'
 	merge_finish "$box"
+}
+
+# `$SELF merge <box> --undo` — put $DEV back and the review back in the queue.
+#
+# WHY IT CAN BE DONE AT ALL: merge uses `git merge --no-ff`, so the agent's tip is the merge commit's
+# SECOND PARENT — the handoff is still right there in the history, and restoring the queue entry is one
+# update-ref. The deleted refs/agents/<box> reflog is NOT a way back (git removes a ref's reflog with
+# the ref), which is why this reads the parent rather than the log.
+#
+# HOW THE MERGE IS FOUND: by the `Cbx-Box: <box>` trailer merge() writes into every merge message.
+# Anchored to a whole line, so a box called work1 does not match work12's merge.
+merge_undo() {
+	local box="$1" mc parent1 parent2 origin_ref
+	mc="$(git_ rev-list --max-count=1 --grep="^Cbx-Box: ${box}\$" "$DEV" 2>/dev/null || true)"
+	[ -n "$mc" ] || die "no merge of '$box' found on $DEV (looking for a 'Cbx-Box: $box' trailer).
+     A merge done by hand does not carry one — undo it with plain git:
+       git -C $REPO log --oneline -5 $DEV"
+
+	# ONLY THE TIP. Resetting past commits that landed after the merge would take them with it, and
+	# they are not this command's to remove.
+	[ "$(git_ rev-parse "$DEV")" = "$mc" ] || die "the merge of '$box' is not the tip of $DEV — $(git_ rev-list --count "${mc}..${DEV}") commit(s) landed after it.
+     Undoing it would take those with it. Reverse just this merge instead, keeping the history:
+       git -C $REPO revert -m 1 $(git_ rev-parse --short "$mc")"
+
+	# PUSHED IS PUBLISHED. Rewinding a branch that origin already has needs a force-push, which is not
+	# something to do behind your back — name the alternative and stop.
+	origin_ref="refs/remotes/origin/$DEV"
+	if git_ rev-parse -q --verify "$origin_ref" >/dev/null 2>&1 \
+	   && git_ merge-base --is-ancestor "$mc" "$origin_ref" 2>/dev/null; then
+		die "that merge is already on origin/$DEV — undoing it here would need a force-push.
+     Reverse it instead (keeps the history, no force-push):
+       git -C $REPO revert -m 1 $(git_ rev-parse --short "$mc")"
+	fi
+
+	parent1="$(git_ rev-parse "${mc}^1")"
+	# A --squash merge has ONE parent: the agent's commits were flattened, so there is nothing to
+	# restore the queue entry from. Say so rather than half-doing it.
+	parent2="$(git_ rev-parse -q --verify "${mc}^2" 2>/dev/null || true)"
+
+	# --keep, not --hard: the hub's checkout is your workspace and is routinely dirty with setup work.
+	# --keep rewinds the branch and the files the merge touched while keeping uncommitted changes, and
+	# REFUSES if one of them would be clobbered — which is the answer you want, not a silent loss.
+	git_ reset --keep "$parent1" \
+		|| die "could not rewind $DEV to $(git_ rev-parse --short "$parent1") — the hub's worktree has changes that
+     the merge also touched. Deal with those first (git -C $REPO status), then run this again."
+	echo "$SELF: $DEV is back at $(git_ rev-parse --short HEAD) ($(git_ log -1 --format=%s HEAD))"
+
+	if [ -n "$parent2" ]; then
+		git_ update-ref "refs/agents/$box" "$parent2"
+		echo "$SELF: restored refs/agents/$box at $(git_ rev-parse --short "$parent2") — '$SELF q' shows it again"
+		# The review state is NOT restored: merge deleted .reviewed/.sent, so the next `review` shows the
+		# whole branch rather than "what changed since you last looked". Better than pretending.
+		echo "$SELF: (its review history is gone, so '$SELF review $box' will show the full diff again)"
+	else
+		echo "$SELF: that merge was a --squash: it has no second parent, so the branch cannot be" >&2
+		echo "     restored from it. The BOX still has the commits until it rebases — attach and" >&2
+		echo "     re-publish them:  $SELF box $box   then, inside it:  handoff" >&2
+	fi
+
+	# The box was told to rebase onto the merged $DEV when the merge finished. Whether it did or not,
+	# it needs to know the ground moved back — and must not act on its own.
+	say_to_box "$box" "I UNDID the merge of your work: ${DEV} is back at $(git_ rev-parse --short HEAD) and your branch is in the review queue again. Do NOT rebase, re-push or start anything — wait for my next instruction." 2>/dev/null \
+		&& echo "$SELF: told '$box' that the merge was undone" \
+		|| echo "$SELF: could not reach '$box' to tell it (not running?) — do it yourself if it is working"
 }
 
 drop() {
@@ -2417,6 +2563,63 @@ push() {
 
 # ------------------------------------------------------------------ goldens
 
+
+# `$SELF golden retire <id>` — free a golden that boxes are still overlaid on.
+#
+# `reap` deliberately skips those: a golden is the lowerdir of every box on it, and pulling it out
+# from under a live overlay is undefined behaviour. So the question is never "can I delete it" but
+# "what happens to its boxes", and there are only two answers — MOVE them or REMOVE them.
+#
+# MOVING IS REAL. A box is an overlay, so `$SELF recreate <box>` respawns it on whatever golden is
+# CURRENT, keeping its own upper layer (its uncommitted work) on top. `--fresh` throws that upper
+# layer away for a clean move, which is only safe once the work is pushed. Neither is a "port" in the
+# sense of rewriting anything: the base underneath simply changes.
+golden_retire() {
+	[ $# -ge 1 ] || die "retire needs a golden id ('$SELF golden ls' lists them)"
+	local id="$1" resp cur boxes b answer
+	resp="$(broker GET /golden)" || die "broker unreachable: $resp"
+	cur="$(printf '%s' "$resp" | jqr '.current')"
+	printf '%s' "$resp" | jq -e --arg g "$id" '.goldens[]? | select(.golden==$g)' >/dev/null 2>&1 \
+		|| die "no such golden '$id' ('$SELF golden ls' lists them)"
+	[ "$id" != "$cur" ] || die "'$id' is the CURRENT golden — every new box overlays it.
+     Take a new snapshot first ($SELF golden snapshot), then retire this one."
+	boxes="$(printf '%s' "$resp" | jq -r --arg g "$id" '.goldens[]? | select(.golden==$g) | .boxes[]?' 2>/dev/null)"
+
+	if [ -n "$boxes" ]; then
+		echo "$SELF: these boxes are still overlaid on $id:"
+		for b in $boxes; do printf '  %s\n' "$b"; done
+		echo "$SELF: they have to go somewhere before it can be freed."
+		if [ ! -t 0 ]; then
+			die "not a terminal — rerun interactively, or move them yourself:
+     $SELF recreate <box>          # onto the current golden ($cur), keeping its work
+     $SELF recreate <box> --fresh  # …discarding its upper layer (only once its work is pushed)
+     $SELF purge <box>             # or remove the box for good"
+		fi
+		tty_flush
+		printf '%s: [m]ove them onto %s  [p]urge them  [q]uit ? ' "$SELF" "$cur" > /dev/tty
+		read -r answer < /dev/tty || answer=q
+		case "$answer" in
+			m|M)
+				for b in $boxes; do
+					echo "$SELF: moving '$b' onto $cur..."
+					# Not --fresh: the box's upper layer is its unpushed work, and losing that silently
+					# would be the worst outcome of a housekeeping command. A box that needs a clean base
+					# is one you recreate --fresh deliberately.
+					box_recreate "$b" || die "moving '$b' failed — nothing was deleted; fix it and retry"
+				done ;;
+			p|P)
+				for b in $boxes; do
+					echo "$SELF: purging '$b'..."
+					box_purge "$b" --force || die "purging '$b' failed — nothing else was deleted"
+				done ;;
+			*) die "nothing done" ;;
+		esac
+	fi
+
+	# reap takes every golden that is neither current nor referenced — which now includes this one.
+	golden_reap
+}
+
 golden_ls() {
 	local resp g prov
 	resp="$(broker GET /golden)" || die "broker unreachable: $resp"
@@ -2608,6 +2811,7 @@ case "$cmd" in
 	autostart)     svc_autostart ;;
 	box)      box_new "$@" ;;
 	kill)     box_kill "$@" ;;
+	purge)    box_purge "$@" ;;
 	recreate) box_recreate "$@" ;;
 	ls)       box_ls ;;
 	forwards) forwards_refresh "${1:-}" ;;
@@ -2639,7 +2843,8 @@ case "$cmd" in
 			seal)     golden_seal "$@" ;;
 			ls)       golden_ls ;;
 			reap)     golden_reap ;;
-			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap" ;;
+			retire)   golden_retire "$@" ;;
+			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap | retire <id>" ;;
 		esac ;;
 	# Asking for help is not an error: `--help` prints to stdout and exits 0, so it can be used in a
 	# `set -e` script or a CI check. An unknown command still exits 1, and says which word it did not

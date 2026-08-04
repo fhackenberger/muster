@@ -178,12 +178,50 @@ _muster_run() {
 			live=1
 			case " $* " in *" --tail "*|*" --file "*) live='' ;; esac ;;
 		q|queue) case "${2:-}" in --text|--once|-1) ;; *) live=1 ;; esac ;;
+		# SPAWN THEN ATTACH. `box` is a one-shot that prints two lines and leaves you in front of an
+		# agent you cannot see; attaching was always the next thing you typed. So it happens here, on
+		# the LAPTOP side, where the interactive transport and the PTY already are — the hub cannot do
+		# it, having no terminal of yours to hand the session to.
+		box) _muster_box_spawn "$@"; return ;;
 	esac
 	if [ -n "$live" ]; then
 		_muster_session "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"
 	else
 		_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"
 	fi
+}
+
+# `<prefix> box [name] [--no-attach]` — spawn, then attach to the agent that was created.
+#
+# --no-attach (or MUSTER_BOX_ATTACH=0) keeps the old behaviour, for a script that wants a box and not
+# a session. Attaching is also skipped when stdout is not a terminal, because `box x | cat` asking
+# tmux for a session is a hang, not a feature.
+#
+# THE NAME COMES FROM THE OUTPUT when you did not pass one: the hub invents a short id, and it is only
+# knowable from the line it prints ("box 'abc123' up as …"). Parsing the message we print anyway beats
+# a second round trip to ask what just happened.
+_muster_box_spawn() {
+	local self="${_MUSTER_SELF:-muster}" attach=1 name='' args='' a out rc
+	local -a keep=()
+	for a in "$@"; do
+		case "$a" in
+			--no-attach) attach=0 ;;
+			-*) keep+=("$a") ;;
+			*) keep+=("$a"); [ -n "$name" ] || [ "$a" = box ] || name="$a" ;;
+		esac
+	done
+	[ "${MUSTER_BOX_ATTACH:-1}" = 1 ] || attach=0
+	[ -t 1 ] || attach=0
+	printf -v args ' %q' "${keep[@]}"
+	# Captured rather than streamed so the box name can be read back out of it; a spawn prints its two
+	# lines at the end anyway, so nothing is lost by showing them a moment later.
+	out="$(_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster$args")"; rc=$?
+	printf '%s\n' "$out"
+	[ "$rc" = 0 ] || return "$rc"
+	[ "$attach" = 1 ] || return 0
+	[ -n "$name" ] || name="$(printf '%s' "$out" | sed -n "s/.*box '\([^']*\)' up as.*/\1/p" | head -1)"
+	[ -n "$name" ] || { echo "$self: spawned, but could not tell which box to attach to — use ${self}box <name>" >&2; return 0; }
+	_muster_box_attach "$name"
 }
 
 # drop into a PERSISTENT shell inside the hub, in tmux, so you can detach (Ctrl-b d) and reconnect

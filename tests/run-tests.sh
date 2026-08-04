@@ -89,7 +89,7 @@ test_help_covers_every_command() {
 	documented="$(printf '%s\n' "$OUT" | sed -n 's/^ *muster \([a-z]*\).*/\1/p' | sort -u)"
 	# Aliases and `golden` subcommands are documented on their parent's line, not their own.
 	missing="$(comm -23 <(printf '%s\n' "$dispatch") <(printf '%s\n' "$documented") \
-		| grep -vx 'seal\|snapshot\|reap\|ls\|st\|queue\|services')"
+		| grep -vx 'seal\|snapshot\|reap\|retire\|ls\|st\|queue\|services')"
 	eq "$missing" "" "these subcommands are not in cbx --help"
 	has "muster push"
 	has "muster pull"
@@ -422,6 +422,59 @@ test_merge_plain() {
 	stub_saw POST "/box/work1/say" || fail "the box was never told to rebase"
 }
 
+# UNDOING A MERGE. It is possible at all because merge uses --no-ff: the agent's tip is the merge
+# commit's SECOND parent, so the handoff is still in the history and the queue entry is one update-ref
+# away. The deleted ref's reflog is not a way back — git removes a reflog with its ref — which is why
+# this reads the parent instead.
+test_merge_undo() {
+	local sha before
+	sha="$(handoff work1 2)"; box_up work1
+	before="$(at dev)"
+	cbx merge work1; ok
+	cbx merge work1 --undo
+	ok
+	eq "$(at dev)" "$before" "dev must be back where it was"
+	eq "$(at refs/agents/work1)" "$sha" "the agent's branch must be back in the queue, at its own tip"
+	has "back at"
+	# The box is told, because it was told to rebase when the merge finished and the ground just moved.
+	stub_saw POST "/box/work1/say" || fail "the box was never told the merge was undone"
+	# And it really is in the queue again.
+	cbx q --text; has "work1"
+}
+
+# Refusals, both of which exist so an undo cannot take something else with it.
+test_merge_undo_refuses() {
+	handoff work1 1 >/dev/null; box_up work1
+	cbx merge work1; ok
+	# Something landed after the merge: undoing would remove that too.
+	git_ commit -q --allow-empty -m "a later commit"
+	cbx merge work1 --undo
+	notok; has "not the tip"; has "revert -m 1"
+	eq "$(git_ log -1 --format=%s dev)" "a later commit" "dev must not have moved"
+	# …and once it is on origin, rewinding would need a force-push.
+	git_ reset --hard HEAD~1 -q 2>/dev/null || git_ reset --hard HEAD~1
+	git_ update-ref refs/remotes/origin/dev "$(at dev)"
+	cbx merge work1 --undo
+	notok; has "already on origin"; has "revert -m 1"
+	git_ update-ref -d refs/remotes/origin/dev
+	# With that out of the way it works.
+	cbx merge work1 --undo; ok
+}
+
+# A --squash merge has ONE parent, so the branch cannot be restored from it. Say so rather than
+# leaving the queue looking right and the commits gone.
+test_merge_undo_after_squash() {
+	handoff work1 2 >/dev/null; box_up work1
+	local before; before="$(at dev)"
+	cbx merge work1 --squash; ok
+	cbx merge work1 --undo
+	ok
+	eq "$(at dev)" "$before" "dev must still be rewound"
+	eq "$(at refs/agents/work1)" "" "there is nothing to restore the ref from"
+	has "no second parent"
+	has "handoff"
+}
+
 test_merge_squash() {
 	handoff work1 3 >/dev/null; box_up work1
 	cbx merge work1 --squash
@@ -466,6 +519,35 @@ test_merge_conflict_leaves_a_way_out() {
 	notok
 	has "UNRESOLVED conflicts"
 	git_ merge --abort 2>/dev/null
+}
+
+# ASK BEFORE THE MESS. A merge that will conflict is worth knowing about while dev is still untouched:
+# the usual answer is "stop and rebase the agent first", and that decision is much cheaper before a
+# half-merged worktree than after one.
+test_merge_conflict_asks_first() {
+	command -v script >/dev/null || { skip "no 'script' for driving the prompt"; return 0; }
+	local sha before
+	sha="$(commit_on dev - "agent: b" b.txt "agent version")"
+	git_ update-ref refs/agents/work1 "$sha"
+	commit_on dev refs/heads/dev "dev: b" b.txt "dev version" >/dev/null
+	box_up work1
+	before="$(at dev)"
+	# [r] — rebase instead: the box is told, dev is untouched, the branch stays in the queue.
+	muster_tty "r" merge work1
+	ok
+	has "would CONFLICT in"
+	has "b.txt"
+	eq "$(at dev)" "$before" "dev must not move when you choose to rebase"
+	ne "$(at refs/agents/work1)" "" "the branch must stay in the queue"
+	stub_saw POST "/box/work1/say" || fail "the box was never asked to rebase"
+	# [q] — quit changes nothing either.
+	muster_tty "q" merge work1
+	notok; has "not merged"
+	eq "$(at dev)" "$before" "quitting must not move dev"
+	# [m] — merge anyway, which lands you in the conflict you were warned about.
+	muster_tty "m" merge work1
+	notok; has "merge conflicts"
+	git_ merge --abort 2>/dev/null || git_ reset --merge 2>/dev/null || true
 }
 
 test_merge_reword_rewrites_messages_only() {
@@ -615,6 +697,36 @@ test_box_lifecycle() {
 	hasnt "box-test-work1"
 }
 
+# A KILLED BOX IS STILL THERE, and until now nothing said so: kill keeps the directory (unpushed work
+# + warm caches, and `box <same name>` reattaches to it), so they accumulate unseen — holding disk, and
+# once upon a time holding port slots too. `ls` lists them; `purge` is the way to actually be rid of one.
+test_box_retired_and_purge() {
+	cbx box gone; ok
+	cbx kill gone; ok
+	cbx ls
+	ok
+	has "retired"
+	has "gone"
+	has "on disk"                       # a size, because deciding what to purge is a size question
+	# Purging refuses while the box's work is still sitting in the review queue unlooked-at.
+	git_ update-ref refs/agents/gone "$(at dev)"
+	cbx purge gone
+	notok; has "still has a handoff"; has "--force"
+	git_ update-ref -d refs/agents/gone
+	# With nothing waiting, it goes — and the state files go with it.
+	mkdir -p "$FIX/repo/.git/cbx"; : > "$FIX/repo/.git/cbx/gone.reviewed"
+	cbx purge gone
+	ok; has "purged"
+	absent "$FIX/repo/.git/cbx/gone.reviewed"
+	cbx ls; ok; hasnt "gone"
+	# --force is the override for a box you have already decided about.
+	cbx box gone2; ok; cbx kill gone2; ok
+	git_ update-ref refs/agents/gone2 "$(at dev)"
+	cbx purge gone2 --force
+	ok; has "purged"
+	git_ update-ref -d refs/agents/gone2 2>/dev/null || true
+}
+
 test_forwards() {
 	box_up work1
 	cbx forwards
@@ -692,6 +804,48 @@ test_q_shows_golden_drift() {
 	BROKER_URL="http://127.0.0.1:$port" cbx status
 	ok
 	has "3 commit(s) behind"
+	kill "$pid" 2>/dev/null
+}
+
+# RETIRING A GOLDEN THAT BOXES ARE STILL ON. `reap` skips those on purpose — a golden is the lowerdir
+# of every box overlaid on it — so the question is never "can I delete it" but "what happens to its
+# boxes". Moving is real: a box is an overlay, so recreate respawns it on the CURRENT golden with its
+# own upper layer (its unpushed work) intact.
+test_golden_retire() {
+	command -v script >/dev/null || { skip "no 'script' for driving the prompt"; return 0; }
+	local port pid old cur
+	port=$(( STUB_PORT + 4 ))
+	STUB_LOG="$FIX/stub5.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+	cbx golden snapshot >/dev/null 2>&1            # g1 becomes current
+	cbx golden ls; old="$(printf '%s\n' "$OUT" | sed -n 's/^current: //p' | head -1)"
+	cbx box onold; ok                              # …and this box overlays it
+	# A second `golden snapshot` would MOVE that box onto the new golden (that is what snapshot does),
+	# leaving nothing to retire. The state this command is for — a box left behind on an older golden —
+	# is what a seal produces: it flips `current` and touches no box.
+	cur=g-newer
+	mkdir -p "$FIX/golden-staging/$cur"
+	curl -sf -X POST -H "X-Broker-Token: test" "$BROKER_URL/golden/seal/$cur" >/dev/null
+	ne "$old" "$cur" "the fixture needs two goldens"
+	# The CURRENT golden can never be retired: every new box overlays it.
+	cbx golden retire "$cur"
+	notok; has "CURRENT golden"
+	# Non-interactive: refuses rather than guessing what to do with the box.
+	cbx golden retire "$old"
+	notok; has "still overlaid"; has "not a terminal"
+	# [q] does nothing.
+	muster_tty "q" golden retire "$old"
+	notok; has "nothing done"
+	# [m] moves the box onto the current golden, then reaps.
+	muster_tty "m" golden retire "$old"
+	ok; has "moving"
+	# The golden must actually be GONE — "reaped:" alone is printed even when the list is empty, which
+	# is exactly what a move that did not move would produce.
+	case "$OUT" in *reaped*"$old"*) ;; *) fail "the old golden was not reaped" "$OUT" ;; esac
+	absent "$FIX/golden/$old"
+	unset BROKER_URL
 	kill "$pid" 2>/dev/null
 }
 
@@ -824,6 +978,41 @@ test_aliases_forward_to_the_hub() {
 	ssh_has "muster ls"
 	ssh_has "-e MUSTER_SELF=cbx"
 	ssh_hasnt " cbx ls"
+}
+
+# `box` SPAWNS AND THEN ATTACHES. Attaching was always the next thing you typed, and it has to happen
+# on this side: the hub has no terminal of yours to hand a session to. The name is taken from the
+# arguments when you gave one and parsed out of the spawn message when you did not — the hub invents a
+# short id in that case, and the line it prints is the only place it exists.
+test_aliases_box_spawn_attaches() {
+	alias_fixture
+	# The stub ssh answers a spawn the way the hub does, so the name can be parsed back out.
+	cat >> "$FIX/bin/ssh" <<-'EOF'
+	EOF
+	cat > "$FIX/bin/ssh" <<-'EOF'
+		#!/bin/bash
+		printf 'ssh %s\n' "$*" >> "$MUSTER_SSH_LOG"
+		case "$*" in
+		  *"muster box"*) echo "muster: box 'abc123' up as 'box-proj-abc123' on branch agent/abc123 (golden g-1)." ;;
+		  *FAILSPAWN*) exit 1 ;;
+		esac
+		exit 0
+	EOF
+	chmod +x "$FIX/bin/ssh"
+	TTY=1 al 'cbx box work1'
+	ssh_has "muster box work1"
+	ssh_has "box-proj-work1 tmux attach -t main"     # the name you gave
+	TTY=1 al 'cbx box'
+	ssh_has "box-proj-abc123 tmux attach"            # …or the one the hub invented, parsed from its output
+	# Opting out, both ways.
+	TTY=1 al 'cbx box work1 --no-attach'
+	ssh_has "muster box work1"; ssh_hasnt "tmux attach"
+	ssh_hasnt "--no-attach"                          # the flag is ours; the hub never sees it
+	TTY=1 al 'MUSTER_BOX_ATTACH=0 cbx box work1'
+	ssh_hasnt "tmux attach"
+	# No terminal: `box x | cat` asking tmux for a session is a hang, not a feature.
+	al 'cbx box work1'
+	ssh_hasnt "tmux attach"
 }
 
 # `cbx logs` and the live `cbx q` are long-lived and interactive, so they take the mosh-able
@@ -1699,9 +1888,13 @@ run "prereview: asks the agent to self-review"     test_prereview_asks_the_agent
 
 run "merge: plain merge lands and cleans up"       test_merge_plain
 run "merge: --squash lands one commit"             test_merge_squash
+run "merge: --undo restores dev and the queue"     test_merge_undo
+run "merge: --undo refuses when it would take more" test_merge_undo_refuses
+run "merge: --undo after a squash says why not"    test_merge_undo_after_squash
 run "merge: refuses a stale dev"                   test_merge_refuses_stale_dev
 run "merge: already-contained closes out"          test_merge_already_contained_closes_out
 run "merge: a conflict leaves a way out"           test_merge_conflict_leaves_a_way_out
+run "merge: a conflict asks before touching dev"   test_merge_conflict_asks_first
 run "merge: --reword rewrites messages only"       test_merge_reword_rewrites_messages_only
 run "merge: --reword keeps edits when you quit"    test_merge_reword_keeps_edits_when_you_quit
 run "merge: --reword and --squash are opposites"   test_merge_reword_refuses_squash_and_merges
@@ -1719,12 +1912,14 @@ run "export: produces an mbox"                     test_export_produces_an_mbox
 run "import: replaces the agent's branch"          test_import_replaces_the_branch
 
 run "box: spawn / ls / recreate / kill"            test_box_lifecycle
+run "box: retired boxes are listed and purgeable" test_box_retired_and_purge
 run "forwards: re-establishes them"                test_forwards
 run "broker: unreachable is reported, not fatal"   test_broker_unreachable_is_reported_not_fatal
 run "version: drift between hub and broker warns"  test_version_drift
 
 run "golden: snapshot, ls, reap"                   test_golden_snapshot_and_reap
 run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_worktrees
+run "golden: retire one that boxes are still on"   test_golden_retire
 run "q: shows how far the golden has drifted"      test_q_shows_golden_drift
 
 run "svcs: lists the manifests"                    test_svcs_lists_manifests
@@ -1736,6 +1931,7 @@ run "aliases: forward to the hub"                   test_aliases_forward_to_the_
 run "aliases: ssh vs mosh transport split"         test_aliases_transport_split
 run "aliases: hostile arguments are quoted"        test_aliases_quote_hostile_arguments
 run "aliases: attach to a box / the hub"           test_aliases_box_and_hub_attach
+run "aliases: box spawns then attaches"            test_aliases_box_spawn_attaches
 run "aliases: pipes never allocate a PTY"          test_aliases_pipes_never_allocate_a_pty
 run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the_hub_too
 run "aliases: tunnel specs"                        test_aliases_tunnel_specs

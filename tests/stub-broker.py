@@ -25,6 +25,8 @@ import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 LOG = os.environ.get("STUB_LOG", "/tmp/stub-broker.log")
+# name -> golden, for boxes that were killed: a directory with no container.
+RETIRED = {}
 GOLDEN = os.environ.get("GOLDEN_DIR", "")
 STAGING = os.environ.get("GOLDEN_STAGING", "")
 
@@ -70,9 +72,14 @@ class H(BaseHTTPRequestHandler):
             v = os.environ.get("STUB_MUSTER_VERSION", "0.0.0-stub")
             return self._reply(200, {"broker": v, "box_image": v, "box_image_ref": "stub/box:test"})
         if path == "/box":
+            # RETIRED: a box directory with no container. The real broker derives them from BOXROOT;
+            # here they are whatever the test put in RETIRED, which is enough to exercise the listing
+            # and `purge`.
             return self._reply(200, {"boxes": [
                 {"box": n, "container": f"box-test-{n}", "status": "Up 3 minutes",
-                 "golden": b["golden"]} for n, b in sorted(BOXES.items())]})
+                 "golden": b["golden"]} for n, b in sorted(BOXES.items())],
+                "retired": [{"box": n, "golden": g, "size": 12345678}
+                            for n, g in sorted(RETIRED.items())]})
         if path.startswith("/box/") and path.endswith("/dirty"):
             n = path[len("/box/"):-len("/dirty")]
             return self._reply(200, {"dirty": BOXES.get(n, {}).get("dirty", [])})
@@ -116,12 +123,17 @@ class H(BaseHTTPRequestHandler):
             return self._reply(200, {"reaped": gone})
         if path == "/forwards" or path.startswith("/forwards/"):
             return self._reply(200, {"forwards": sorted(BOXES)})
+        # Recreating respawns a box on whatever golden is CURRENT — which is the whole mechanism behind
+        # `golden retire`'s "move them" answer, so the stub has to model it or that move is untestable.
         if path == "/recreate":
+            for b in BOXES.values():
+                b["golden"] = current_golden()
             return self._reply(200, {"recreated": sorted(BOXES)})
         if path.startswith("/recreate/"):
             n = path[len("/recreate/"):]
             if n not in BOXES:
                 return self._reply(500, {"error": f"no such box {n}"})
+            BOXES[n]["golden"] = current_golden()
             return self._reply(200, {"box": n, "container": f"box-test-{n}"})
         for verb in ("say", "paste"):
             if path.startswith("/box/") and path.endswith("/" + verb):
@@ -144,9 +156,16 @@ class H(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = self._path()
         record("DELETE", self.path)
+        if path.endswith("/purge"):
+            n = path[len("/box/"):-len("/purge")]
+            BOXES.pop(n, None)
+            RETIRED.pop(n, None)
+            return self._reply(200, {"purged": n, "freed": 12345678})
         n = path[len("/box/"):]
         if n not in BOXES:
             return self._reply(500, {"error": f"no such box {n}"})
+        # kill keeps the directory, so the box becomes RETIRED rather than vanishing.
+        RETIRED[n] = BOXES[n]["golden"]
         del BOXES[n]
         return self._reply(200, {"killed": n})
 

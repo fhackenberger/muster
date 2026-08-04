@@ -1114,7 +1114,48 @@ def list_boxes():
 		gf = os.path.join(BOXROOT, name, "golden")
 		rows.append({"container": container, "status": status, "box": name,
 		             "golden": open(gf).read().strip() if os.path.exists(gf) else ""})
-	return {"boxes": rows}
+	# RETIRED BOXES: a directory with no container. `kill` leaves it on purpose — the upper layer holds
+	# work that was never pushed plus warm caches, and `box <same name>` reattaches to it — but until
+	# now nothing listed them, so they accumulated invisibly, holding disk and (once) port slots.
+	live = {r["box"] for r in rows}
+	retired = []
+	if BOXROOT and os.path.isdir(BOXROOT):
+		for d in sorted(os.listdir(BOXROOT)):
+			if d in live or not os.path.isdir(os.path.join(BOXROOT, d)):
+				continue
+			gf = os.path.join(BOXROOT, d, "golden")
+			retired.append({"box": d,
+			                "golden": open(gf).read().strip() if os.path.exists(gf) else "",
+			                "size": dir_size(os.path.join(BOXROOT, d))})
+	return {"boxes": rows, "retired": retired}
+
+
+def dir_size(path):
+	"""Bytes on disk under path, best-effort — a number you can act on when deciding what to purge."""
+	total = 0
+	for root, _dirs, files in os.walk(path, onerror=lambda e: None):
+		for f in files:
+			try:
+				total += os.lstat(os.path.join(root, f)).st_size
+			except OSError:
+				pass
+	return total
+
+
+def purge_box(name):
+	"""Remove a box FOR GOOD: container, overlay volumes, and the directory kill deliberately keeps.
+
+	The one irreversible operation in this workflow, which is why the hub asks first and why nothing
+	calls it implicitly. What goes with it: the upper layer (any work the agent never pushed), its
+	warm caches, its session id — so `box <name>` afterwards is a genuinely new box, not a reattach."""
+	stop_forwarders(name)
+	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True)
+	for vol in created_volumes(name):
+		subprocess.run(["docker", "volume", "rm", vol], capture_output=True, text=True)
+	box_dir = os.path.join(BOXROOT, name)
+	freed = dir_size(box_dir) if os.path.isdir(box_dir) else 0
+	shutil.rmtree(box_dir, ignore_errors=True)
+	return {"purged": name, "freed": freed}
 
 
 def box_dirty(name):
@@ -1381,11 +1422,15 @@ class Handler(BaseHTTPRequestHandler):
 	def do_DELETE(self):
 		if not self._authed():
 			return
-		name = self._path()[len("/box/"):]
+		path = self._path()
+		# /box/<name>        kill: container goes, the directory stays (reattachable)
+		# /box/<name>/purge  purge: the directory goes too, permanently
+		purge = path.endswith("/purge")
+		name = path[len("/box/"):-len("/purge")] if purge else path[len("/box/"):]
 		if not NAME_RE.match(name):
 			return self._reply(400, {"error": "bad box name"})
 		try:
-			self._reply(200, kill_box(name))
+			self._reply(200, purge_box(name) if purge else kill_box(name))
 		except Exception as e:  # noqa: BLE001
 			self._reply(500, {"error": str(e)})
 

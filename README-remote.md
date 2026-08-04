@@ -312,6 +312,19 @@ That gives you:
 - **`cbx …`** — run any cbx subcommand on the remote hub (`cbx up backend`, `cbx ls`, `cbx box work1`).
 - **`cbxhub`** — a persistent tmux shell in the hub you can detach (Ctrl-b d) / reconnect to.
 - **`cbxbox <name>`** — attach an agent box's `main` tmux session (Ctrl-b d to detach).
+- **`cbx purge <box>`** — remove a box for good: container, upper layer, warm caches, session id. `kill`
+  keeps all of that so `cbx box <same name>` can reattach; `cbx ls` now lists what has accumulated
+  (with its size on disk) under **retired**. Purge refuses while the box's handoff is still unreviewed
+  — `--force` overrides, and `cbx drop` is the deliberate way to bin the work first.
+- **`cbx golden retire <id>`** — free a golden that boxes are still overlaid on. `reap` skips those on
+  purpose (a golden is the lowerdir of every box on it), so the question is what happens to its boxes,
+  and it asks: **[m]ove** them onto the current golden — `recreate` respawns a box on whatever golden
+  is current, keeping its own upper layer, so a box really can be ported — or **[p]urge** them. Then
+  it reaps. The current golden is never retirable; take a snapshot first.
+- **`cbx box [name]`** — spawn an agent **and attach to it**, which was always the next thing you
+  typed. `--no-attach` (or `MUSTER_BOX_ATTACH=0`) spawns and returns; so does a non-terminal stdout,
+  since `cbx box x | cat` waiting for a tmux session is a hang rather than a feature. With no name the
+  hub invents one and the alias reads it back out of the spawn message to know what to attach to.
 - **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql myapp_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
 - **`cbxfe <box>` / `cbxfe <box> --own`** — project shorthand: open **one agent's** frontend at
@@ -627,6 +640,14 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   **pane claude runs in**, resolved from its window name — not at the session, which tmux delivers to
   whichever window is current. Open a second window in a box you attached to, and a session-targeted
   message lands in *that* shell instead: sent, never received, and no error on either side.
+- **`cbx merge <box> --undo`** puts `dev` back and the branch back in the queue. It works because
+  merge uses `--no-ff`: the agent's tip is the merge commit's *second parent*, so the handoff is still
+  in the history (the deleted `refs/agents/<box>` reflog is not a way back — git drops a reflog with
+  its ref). It refuses when the merge is no longer the tip, or when origin already has it, naming
+  `git revert -m 1 <merge>` instead; and after a `--squash` there is no second parent, so it rewinds
+  `dev` and tells you to re-`handoff` from the box, which still has the commits. The rewind is
+  `git reset --keep`, so uncommitted work in the hub's checkout survives — or stops the undo, rather
+  than being silently overwritten.
 - **`cbx merge <box> --edit` seeds the editor with what the agent wrote**, never a blank buffer, and
   never git's `SQUASH_MSG` (which wraps every message in `Squashed commit of the following:` and
   indents it four spaces under a `commit`/`Author:`/`Date:` header — a log to read, not a message to
