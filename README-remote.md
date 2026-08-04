@@ -376,6 +376,12 @@ That gives you:
   stdin is forwarded, and stderr stays on stderr — a local pipe sees only real output. The exit status
   is the command's own. Use `cbxbox` instead when you want the *interactive* tmux attach.
 
+**Tab completion follows what you just did.** `box`, `kill` and `purge` patch the laptop's completion
+cache themselves on success, so Tab is right immediately rather than after the next background
+refresh. A killed box moves to a *retired* key instead of disappearing — `cbx box <TAB>` offers
+exactly those, the names that can be brought back (its directory and upper layer are still there),
+while `kill`, `review`, `merge` and friends keep offering the ones that are running.
+
 **Tab completion, on both sides.** On the laptop the alias family completes subcommands, flags, box
 names, service names and branches from a cache it refreshes in the background over ssh. The
 subcommands and flags are parsed from the **deployed hub's own `muster --help`**, not from a list in

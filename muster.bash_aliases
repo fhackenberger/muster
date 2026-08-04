@@ -187,7 +187,16 @@ _muster_run() {
 	if [ -n "$live" ]; then
 		_muster_session "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"
 	else
-		_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"
+		local rc
+		_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster$args"; rc=$?
+		# Only on success: a kill that failed left the box exactly where it was.
+		if [ "$rc" = 0 ]; then
+			case "${1:-}" in
+				kill)  _muster_cache_box killed "${2:-}" ;;
+				purge) _muster_cache_box purged "${2:-}" ;;
+			esac
+		fi
+		return "$rc"
 	fi
 }
 
@@ -218,8 +227,11 @@ _muster_box_spawn() {
 	out="$(_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster$args")"; rc=$?
 	printf '%s\n' "$out"
 	[ "$rc" = 0 ] || return "$rc"
-	[ "$attach" = 1 ] || return 0
+	# The name BEFORE the attach decision: --no-attach still spawned a box, and completion should know
+	# about it either way.
 	[ -n "$name" ] || name="$(printf '%s' "$out" | sed -n "s/.*box '\([^']*\)' up as.*/\1/p" | head -1)"
+	_muster_cache_box spawned "$name"
+	[ "$attach" = 1 ] || return 0
 	[ -n "$name" ] || { echo "$self: spawned, but could not tell which box to attach to — use ${self}box <name>" >&2; return 0; }
 	_muster_box_attach "$name"
 }
@@ -581,10 +593,14 @@ hub=$(docker ps -q -f label=com.docker.compose.project="$proj" -f label=com.dock
 # that isn't a bare name, which throws away the "(broker unreachable)" / "(none — drop a manifest …)"
 # lines. `muster` and not the prefix: the prefix is a runtime symlink and completion must not be the
 # thing that discovers it is missing.
+# `== retired` is the boxes that were killed: no container, but the directory and its upper layer are
+# still there, so `box <name>` reattaches to them. They are the useful completion for `box`, which
+# otherwise has nothing to offer.
 docker exec "$hub" muster ls 2>/dev/null | awk '
-	/^== services/ { sec="svc"; next }
-	/^== boxes/    { sec="box"; next }
-	/^==/          { sec="";    next }
+	/^== services/ { sec="svc";  next }
+	/^== boxes/    { sec="box";  next }
+	/^== retired/  { sec="rbox"; next }
+	/^==/          { sec="";     next }
 	sec != "" && $1 ~ /^[A-Za-z0-9][-A-Za-z0-9_]*$/ { print sec, $1 }'
 # Boxes with a handoff waiting but no running container — review/merge/drop still apply to them.
 docker exec "$hub" git -C /home/dev/repo for-each-ref --format='box %(refname:strip=2)' refs/agents/ 2>/dev/null
@@ -677,6 +693,37 @@ _muster_names() { _muster_complete_cache | awk -v k="$1" '$1==k {print $2}' | so
 # Flags are cached as `flag <cmd> <--flag>`, so they need the extra column.
 _muster_flags() { _muster_complete_cache | awk -v c="$1" '$1=="flag" && $2==c {print $3}' | sort -u; }
 
+# KEEP THE CACHE HONEST WITHOUT A ROUND TRIP. Spawning or killing a box changes exactly one line of
+# what completion knows, and waiting out the TTL to learn it means `kill <TAB>` offering a box you just
+# killed — or worse, `box <TAB>` not offering the one you just killed and might want back. So the
+# commands that change it patch it.
+#
+# Cheap and idempotent: rewrite the file without the line, append if it should be there. No lock — the
+# worst a lost race can do is leave the cache as the next background refresh will find it anyway.
+_muster_cache_set() {                       # _muster_cache_set <key> <name> <present:0|1>
+	local f key="$1" name="$2" want="$3" tmp
+	f="$(_muster_cache_file)"
+	[ -f "$f" ] || return 0                 # nothing cached yet: the first Tab will fetch it all
+	tmp="$f.$$"
+	grep -v -x -F "$key $name" "$f" > "$tmp" 2>/dev/null || : > "$tmp"
+	[ "$want" = 1 ] && printf '%s %s\n' "$key" "$name" >> "$tmp"
+	mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+}
+
+# What just happened to <box>, in the cache's terms.
+#   spawned  live, and no longer a retired name to re-spawn
+#   killed   gone from live, now a retired name that `box` can bring back
+#   purged   gone from both
+_muster_cache_box() {
+	local what="$1" name="$2"
+	[ -n "$name" ] || return 0
+	case "$what" in
+		spawned) _muster_cache_set box "$name" 1; _muster_cache_set rbox "$name" 0 ;;
+		killed)  _muster_cache_set box "$name" 0; _muster_cache_set rbox "$name" 1 ;;
+		purged)  _muster_cache_set box "$name" 0; _muster_cache_set rbox "$name" 0 ;;
+	esac
+}
+
 # Force the next Tab to re-fetch — after `cbx box foo`, `cbx kill foo`, or a handoff.
 _muster_refresh() { rm -f "$(_muster_cache_file)"; _muster_complete_cache >/dev/null; echo "${_MUSTER_SELF:-cbx}: completion cache refreshed"; }
 
@@ -726,8 +773,11 @@ _muster_complete() {
 	case "$cmd" in
 		up|down)   COMPREPLY=($(compgen -W "$(_muster_names svc)" -- "$cur")) ;;
 		logs)      COMPREPLY=($(compgen -W "$(_muster_names svc) gitd" -- "$cur")) ;;
-		# `box` takes a NEW name (nothing to complete); `import`/`export` and every review-queue verb
-		# take an existing one.
+		# `box <name>` is either a NEW name (nothing to complete) or one that was killed and can be
+		# brought back — the directory and its upper layer are still there. Those are worth offering;
+		# a name that is already running is not, since `box` on it is a no-op you did not mean.
+		box|purge) COMPREPLY=($(compgen -W "$(_muster_names rbox)" -- "$cur")) ;;
+		# `import`/`export` and every review-queue verb take an existing one.
 		kill|forwards|review|fix|prereview|merge|drop|export|import)
 		           COMPREPLY=($(compgen -W "$(_muster_names box)" -- "$cur")) ;;
 		recreate|rebase)

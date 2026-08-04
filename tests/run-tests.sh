@@ -799,11 +799,29 @@ test_q_shows_golden_drift() {
 	ok
 	hasnt "commit(s) behind"
 	# Three commits later it says three.
+	# Real file changes, because the point of the message is how much a new box would copy up.
 	local i
-	for i in 1 2 3; do git_ commit -q --allow-empty -m "later $i"; done
+	for i in 1 2 3; do commit_on dev refs/heads/dev "later $i" "later$i.txt" "$(printf 'x%.0s' $(seq 400))" >/dev/null; done
 	BROKER_URL="http://127.0.0.1:$port" cbx status
 	ok
 	has "3 commit(s) behind"
+	# …and WHAT that costs, since the boxes' git state is current either way: the copy-up.
+	has "copies up"
+	has "file(s)"
+	hasnt "fresher base"
+	# With no boxes on the golden there is nothing to multiply by, and it says nothing about totals.
+	hasnt "duplicated across"
+	# Two boxes on it (one running, one killed — both keep a directory and an upper layer), one on an
+	# older golden that must not be counted.
+	local gid; gid="$(printf '%s\n' "$OUT" | sed -n 's/^  \(g-[^ ]*\) from .*/\1/p' | head -1)"
+	mkdir -p "$FIX/boxes/one" "$FIX/boxes/two" "$FIX/boxes/elsewhere"
+	printf '%s\n' "$gid" > "$FIX/boxes/one/golden"
+	printf '%s\n' "$gid" > "$FIX/boxes/two/golden"
+	printf '%s\n' "g-ancient" > "$FIX/boxes/elsewhere/golden"
+	BROKER_URL="http://127.0.0.1:$port" cbx status
+	ok
+	has "2 box(es) sit on it"
+	has "duplicated across"
 	kill "$pid" 2>/dev/null
 }
 
@@ -1119,6 +1137,7 @@ test_aliases_completion() {
 		box work1
 		branch dev
 		branch release/2025
+		rbox wasKilled
 		cmd minto
 		cmd afutureverb
 		flag merge --squash
@@ -1137,7 +1156,9 @@ test_aliases_completion() {
 	    try 'cbx minto'        MINTOFLAGS  '--';
 	    try 'cbx merge'        FLAGSBEFORE '--';
 	    try 'cbx merge work1'  FLAGSAFTER  '--';
-	    try 'cbx afutureverb'  FROMHUB     '--'"
+	    try 'cbx afutureverb'  FROMHUB     '--';
+	    try 'cbx box'          RESPAWNABLE '';
+	    try 'cbx kill'         LIVE        ''"
 	has "FIRSTWORD: minto"
 	has "BRANCHES: dev release/2025"
 	case "$OUT" in *"MINTOFLAGS: "*--here*) ;; *) fail "minto flags should complete" ;; esac
@@ -1146,6 +1167,50 @@ test_aliases_completion() {
 	case "$OUT" in *"FLAGSAFTER: "*--reword*) ;; *) fail "flags must complete after the box name" ;; esac
 	# A verb this file has never heard of, taken from the hub's help — the whole point of caching them.
 	has "FROMHUB: --brandnew"
+	# `box <name>` is a NEW name or one that was killed and can be brought back — offering a box that
+	# is already running would be offering a no-op.
+	has "RESPAWNABLE: wasKilled"
+	# That ONE line, not the whole output — a `*RESPAWNABLE:*work1*` glob matches the LIVE line further
+	# down and would pass whatever `box` offered.
+	case "$(printf '%s\n' "$OUT" | sed -n 's/^RESPAWNABLE: //p')" in
+		*work1*) fail "box should not offer a box that is already running" ;;
+	esac
+	has "LIVE: work1"
+}
+
+# COMPLETION MUST KNOW WHAT JUST HAPPENED. Spawning or killing a box changes exactly one line of what
+# completion knows, and waiting out the cache TTL to learn it means `kill <TAB>` offering a box you
+# just killed. So those commands patch the cache — and a killed box moves to the RETIRED key rather
+# than vanishing, because `box <name>` brings it back and that is the one thing worth completing there.
+test_aliases_cache_follows_boxes() {
+	alias_fixture
+	cat > "$FIX/bin/ssh" <<-'EOF'
+		#!/bin/bash
+		printf 'ssh %s\n' "$*" >> "$MUSTER_SSH_LOG"
+		case "$*" in
+		  *FAILME*) exit 1 ;;
+		  *"muster box"*) echo "muster: box 'newbox' up as 'box-proj-newbox' on branch agent/newbox (golden g-1)." ;;
+		esac
+		exit 0
+	EOF
+	chmod +x "$FIX/bin/ssh"
+	local cache="$FIX/cbx-complete.proj.$UID"
+	seed() { printf 'box live1\nbox live2\nrbox retired1\nsvc backend\n' > "$cache"; }
+	# TMPDIR points the alias's cache at our file; AL_PROJECT keeps the name in step with it.
+	run_al() { seed; TMPDIR="$FIX" al "$1"; }
+
+	run_al 'cbx box newbox --no-attach'
+	grep -qx 'box newbox' "$cache" || fail "a spawned box should be completable at once" "$(cat "$cache")"
+	run_al 'cbx kill live1'
+	grep -qx 'rbox live1' "$cache" || fail "a killed box should move to the retired key" "$(cat "$cache")"
+	grep -qx 'box live1'  "$cache" && fail "…and stop being listed as live" "$(cat "$cache")"
+	run_al 'cbx purge retired1'
+	grep -q 'retired1' "$cache" && fail "a purged box should be gone from both keys" "$(cat "$cache")"
+	# A command that FAILED changed nothing on the server, so it must change nothing here.
+	run_al 'cbx kill FAILME'
+	grep -qx 'box live1' "$cache" || fail "a failed kill must leave the cache alone" "$(cat "$cache")"
+	unset -f seed run_al
+	return 0
 }
 
 # THE reason the factory exists: two stacks, one shell, no re-sourcing and no cross-talk.
@@ -1938,6 +2003,7 @@ run "aliases: tunnel specs"                        test_aliases_tunnel_specs
 run "aliases: refuse an unconfigured stack"        test_aliases_refuse_without_a_server
 run "aliases: cbxcp argument checking"             test_aliases_cbxcp_argument_checking
 run "aliases: completion (cmds, flags, branches)"   test_aliases_completion
+run "aliases: the cache follows box changes"       test_aliases_cache_follows_boxes
 run "aliases: project helpers"                     test_aliases_project_helpers
 run "aliases: two stacks side by side"             test_aliases_two_stacks_side_by_side
 run "aliases: project helpers are per stack"       test_aliases_project_helpers_are_per_stack

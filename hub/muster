@@ -943,12 +943,63 @@ status_overview() {
 		[ -n "$gsha" ] && git_ rev-parse -q --verify "${gsha}^{commit}" >/dev/null 2>&1 \
 			&& gbehind="$(git_ rev-list --count "${gsha}..${DEV}" 2>/dev/null || true)"
 		if [ -n "$gbehind" ] && [ "$gbehind" != 0 ]; then
-			printf '  %s(%s commit(s) behind %s — a snapshot would give new boxes a fresher base)%s\n' \
-				"$C_YEL" "$gbehind" "$DEV" "$C_RESET"
+			# WHAT A SNAPSHOT ACTUALLY BUYS, which is not what this line used to claim. A new box does
+			# `git checkout -B agent/<box> hub/<dev>` in muster-box-init, so its git state is the hub's
+			# CURRENT dev however old the golden is — "a fresher base" was simply untrue.
+			#
+			# What an old golden costs is COPY-UP. The checkout rewrites every file that differs between
+			# the golden's commit and dev, and each rewrite copies that file out of the shared lower
+			# layer into the box's own upper one: paid per box, in disk, for files that would otherwise
+			# be shared by all of them. The same files are what invalidates the prepared build the
+			# golden carries (GOLDEN_PREP_CMD), so the first build in each box redoes that much work.
+			#
+			# The size is the files' size AT DEV, which is what lands in the upper layer. Skipped past a
+			# few thousand files: this renders on every dashboard repaint, and a number nobody reads is
+			# not worth a second of git.
+			local gfiles gbytes gnote gid gboxes gd
+			gfiles="$(git_ diff --name-only "${gsha}..${DEV}" 2>/dev/null | grep -c . || true)"
+			gnote=""
+			# How many boxes sit on this golden — running or stopped, since a killed box keeps its
+			# directory and its upper layer with it. Counted from the box dirs rather than the broker so
+			# the dashboard needs no extra request per repaint.
+			gid="$(printf '%s' "$gprov" | awk '{print $1}')"
+			gboxes=0
+			if [ -n "$gid" ] && [ -d "$BOXES" ]; then
+				for gd in "$BOXES"/*/golden; do
+					[ -f "$gd" ] || continue
+					[ "$(cat "$gd" 2>/dev/null)" = "$gid" ] && gboxes=$((gboxes + 1))
+				done
+			fi
+			if [ "${gfiles:-0}" -gt 0 ] 2>/dev/null; then
+				gnote="$gfiles file(s)"
+				if [ "$gfiles" -le 3000 ]; then
+					# `git -C "$REPO"`, not the git_ helper: xargs execs a PROGRAM, and git_ is a shell
+					# function — it fails with "No such file or directory" and takes the status with it.
+					gbytes="$(git_ diff --name-only -z "${gsha}..${DEV}" 2>/dev/null \
+						| xargs -0 -r git -C "$REPO" ls-tree -r -l "$DEV" -- 2>/dev/null \
+						| awk '{s += $4} END {printf "%d", s + 0}')"
+					[ -n "$gbytes" ] && [ "$gbytes" != 0 ] && gnote="$gnote / $(human_size "$gbytes")"
+				fi
+				gnote=" — each new box copies up $gnote of changed files instead of sharing them, and redoes that much of the golden's prepared build"
+				# …times the boxes on it. UP TO, not exactly: a box that spawned while this golden was
+				# younger copied up the smaller diff of that moment, and none of it is refunded by a
+				# snapshot — moving a box keeps its upper layer. It is the scale of what is duplicated
+				# across their upper layers, which is the number worth knowing before deciding.
+				if [ "$gboxes" -gt 0 ] && [ -n "$gbytes" ] && [ "$gbytes" != 0 ]; then
+					gnote="$gnote; $gboxes box(es) sit on it, so up to $(human_size "$((gbytes * gboxes))") is duplicated across their upper layers"
+				elif [ "$gboxes" -gt 0 ]; then
+					gnote="$gnote; $gboxes box(es) sit on it"
+				fi
+			fi
+			printf '  %s(%s commit(s) behind %s%s)%s\n' \
+				"$C_YEL" "$gbehind" "$DEV" "$gnote" "$C_RESET"
 		elif [ -z "$gbehind" ] && [ -n "$gsha" ] && ! git_ merge-base --is-ancestor "$DEV" "$gsha" 2>/dev/null; then
 			# The recorded commit is not in this repo any more (history rewritten, or a golden from
 			# another clone). Say the thing we still know rather than a number we would be inventing.
-			printf '  %s(%s has moved since — a snapshot would give new boxes a fresher base)%s\n' \
+			# Same correction as above, for the case where the recorded commit is not in this repo any
+			# more so the cost cannot be measured: a snapshot changes what boxes SHARE, not what they
+			# check out.
+			printf '  %s(%s has moved since — a snapshot would cut what each new box copies up)%s\n' \
 				"$C_YEL" "$DEV" "$C_RESET"
 		fi
 	fi
