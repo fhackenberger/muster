@@ -64,12 +64,21 @@ node --version && npm --version
 # pinchtab: the npm package is a launcher that fetches a self-contained Go binary; install it in a
 # throwaway HOME, copy the binary onto PATH system-wide (survives the home bind-mount), drop the
 # wrapper. The box uses it as a CLI (no Chrome); the hub runs it as a server (with Chrome libs).
-HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION}"
+# PINCHTAB_VERSION may be `latest` — the CI resolves it to a number and passes that instead, because
+# a `latest` baked into this RUN would be re-resolved only when an earlier layer changes. A local
+# build has no such machinery, so `latest` still works here; it is just not reproducible, which is
+# what the recorded version below is for.
+HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION:-latest}"
 cp "$(find /tmp/pt/.pinchtab -name 'pinchtab-linux-amd64' -type f | head -1)" /usr/local/bin/pinchtab
 chmod 0755 /usr/local/bin/pinchtab
 npm rm -g pinchtab
 rm -rf /tmp/pt
 pinchtab --version
+# What actually landed, readable at RUNTIME. With `latest` in play, "which pinchtab is this?" stops
+# being answerable from the build args alone — and it is the first question when an endpoint the skill
+# documents turns out not to be there.
+mkdir -p /opt/muster
+pinchtab --version > /opt/muster/pinchtab-version
 
 # …and pinchtab's own Claude skill, so an agent uses the CLI's session/snapshot workflow instead of
 # reinventing it from --help. Fetched from upstream at BUILD time rather than vendored: it is

@@ -62,7 +62,7 @@ Trigger the **muster images** Jenkins job to build them (or, to build the box im
 without Jenkins):
 
 ```sh
-NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=0.13.2 \
+NODE_VERSION=v26.2.0 NPM_VERSION=11.13.0 PINCHTAB_VERSION=latest \
   path/to/myapp/docker-claude/build.sh
 ```
 
@@ -103,12 +103,28 @@ Jenkins-built `muster-hub` / `muster-broker` images; `=build` rebuilds them loca
 this dir; `=always` pulls (point `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified
 names for a different host).
 
+**pinchtab tracks its newest release.** The published images do not pin it: the Actions workflow asks
+npm for the current version and passes THAT as the build-arg, rather than putting `@latest` in the
+Dockerfile — a `RUN npm install pinchtab@latest` sits in a cached layer and would re-resolve only when
+something above it changed, so the image would quietly keep a version from months ago while claiming
+to track latest. Set the repository variable `PINCHTAB_VERSION` to pin one. Whatever landed is
+readable in the image at `/opt/muster/pinchtab-version`, which is the first thing to check when an
+endpoint the skill documents is not there.
+
 **pinchtab** ([pinchtab/pinchtab](https://github.com/pinchtab/pinchtab)) — the headless-Chrome bridge
 agents use to look at what they built — needs **nothing**. The hub seeds `data/pinchtab/config.json`
 from the image on first boot and fills in a token: `PT_TOKEN` from `.env` when you set one, otherwise
 a generated one, which the broker reads back out of that same file for the boxes. So both sides agree
 without a secret for anyone to invent, and `autostart=true` in the shipped manifest means the server
 is up before an agent reaches for it.
+
+Two skills ship with it. Upstream's own `pinchtab` skill is fetched at image build (`common-setup.sh`)
+so it stays pinchtab's file rather than a fork nobody updates, and muster adds `muster-pinchtab`
+beside it (`skills/`, copied into the image by `hub/Dockerfile.base`): where the browser actually runs
+in this topology, which URL reaches a box's dev server from there, and the viewport/device-emulation
+API upstream's skill does not cover — including its three real limits (no touch emulation, one CSS
+media feature at a time, no user-agent route). The hub's entrypoint installs the whole directory into
+the shared `~/.claude/skills` on every boot, so hub and boxes see both.
 
 A config that is already there is never overwritten, and neither is a token that is already real — so
 dropping in your own is still the way to change anything. The shipped one is bound to `0.0.0.0:9867`
@@ -375,6 +391,11 @@ That gives you:
   your local tool; quoted, the box's own shell does. No PTY on either hop, so stdout is byte-exact,
   stdin is forwarded, and stderr stays on stderr — a local pipe sees only real output. The exit status
   is the command's own. Use `cbxbox` instead when you want the *interactive* tmux attach.
+
+**Flags go wherever you typed them.** `cbx merge --squash mybox` and `cbx merge mybox --squash` are
+the same command, for `merge`, `review`, `minto`, `logs`, `recreate` and `push`. Each command still
+parses its own flags; one helper (`argsort`) reorders the arguments first, so there is a single place
+that knows about ordering. `--` ends the flags — everything after it is positional, verbatim.
 
 **Tab completion follows what you just did.** `box`, `kill` and `purge` patch the laptop's completion
 cache themselves on success, so Tab is right immediately rather than after the next background

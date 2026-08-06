@@ -111,6 +111,26 @@ test_unknown_command_prints_usage() {
 # a private registry or a real credential leaking into a tracked file is a release bug, not a style
 # nit. This is the cheap, mechanical half of that check (the rest is the secret scan in
 # tools/split-out.sh, which reads history rather than the tip).
+# Two halves that only work together: a skill directory is useless if the image does not carry it, and
+# the COPY is dead weight if the skill is not a skill. Both are static facts about the tree, so they
+# are cheap to assert and exactly the kind of thing a rename breaks silently.
+test_skills_ship() {
+	local f="$ROOT/skills/muster-pinchtab/SKILL.md"
+	exists "$f"
+	OUT="$(head -1 "$f")"; has "---"
+	OUT="$(cat "$f")"
+	has "name: muster-pinchtab"
+	# It ADDS to upstream's pinchtab skill rather than replacing it — a different name, and it says so.
+	has "pinchtab"
+	hasnt "name: pinchtab\n"
+	# The hub image must actually carry /opt/muster/skills, next to the copy common-setup.sh fetches
+	# from upstream; the entrypoint installs the whole directory into the shared ~/.claude.
+	OUT="$(cat "$ROOT/hub/Dockerfile.base")"
+	has "COPY skills /opt/muster/skills"
+	OUT="$(cat "$ROOT/hub/entrypoint.sh")"
+	has "/opt/muster/skills"
+}
+
 test_no_project_defaults() {
 	local bad=""
 	# Every per-stack file that carries credentials or project wiring ships as an .example; the real
@@ -482,6 +502,43 @@ test_merge_squash() {
 	eq "$(git_ rev-list --count dev)" "2" "squash should land exactly one commit"
 	OUT="$(git_ log -1 --format=%B dev)"
 	has "Cbx-Box: work1"
+}
+
+# FLAGS ANYWHERE. `merge --squash <box>` used to die with "unknown option '<box>'", because every
+# command took $1 as its positional and treated the rest as flags — so the order that reads naturally
+# was the one that failed. Asserted per command, not on the helper alone: the bug was never in the
+# parsing, it was in which functions got wired to it.
+test_flags_before_the_positional() {
+	# review first: it needs a box that has handed off, and the merge below consumes one.
+	handoff work2 1 >/dev/null; box_up work2
+	cbx review --plain work2
+	ok
+
+	handoff work1 3 >/dev/null; box_up work1
+	cbx merge --squash work1
+	ok
+	eq "$(git_ rev-list --count dev)" "2" "--squash before the name should still squash"
+
+	# A value-taking flag keeps its value when it moves ahead of the positional. --intent is only
+	# consulted when there is a conflict to resolve — that is the whole point of it — so this needs the
+	# conflict fixture rather than a clean merge.
+	setup_minto_conflict
+	cbx minto --intent "integration branch for the staging server" --box staging
+	ok
+	eq "$(sed -n 4p "$FIX/repo/.git/cbx/minto-staging.mergeinto")" \
+	   "integration branch for the staging server" "the value must travel with its flag"
+
+	# --tail takes an OPTIONAL count, so the reordering must not let it swallow the service name.
+	# Asserted on the parse, not the outcome: no service has ever run in the fixture, so both spellings
+	# get as far as "nothing captured for 'web'" — which is exactly how far we need them to get.
+	cbx logs --tail 5 web
+	notok
+	has "no captured output for 'web'"
+	hasnt "unknown option"
+	cbx logs --tail web
+	notok
+	has "no captured output for 'web'"
+	hasnt "unknown option"
 }
 
 test_merge_refuses_stale_dev() {
@@ -1928,6 +1985,7 @@ PYEOF
 # =====================================================================  the run
 
 run "syntax: every script parses"                  test_syntax
+run "skills: muster ships its own, and the image carries them" test_skills_ship
 run "config: no project defaults in the source tree" test_no_project_defaults
 run "help: every command is documented"            test_help_covers_every_command
 run "help: an unknown command prints usage"        test_unknown_command_prints_usage
@@ -1953,6 +2011,7 @@ run "prereview: asks the agent to self-review"     test_prereview_asks_the_agent
 
 run "merge: plain merge lands and cleans up"       test_merge_plain
 run "merge: --squash lands one commit"             test_merge_squash
+run "cli: flags work before the positional"        test_flags_before_the_positional
 run "merge: --undo restores dev and the queue"     test_merge_undo
 run "merge: --undo refuses when it would take more" test_merge_undo_refuses
 run "merge: --undo after a squash says why not"    test_merge_undo_after_squash

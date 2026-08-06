@@ -57,7 +57,7 @@ RUN printf '%s\n' 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="
 # build args (build.sh captures them from the host; the Jenkins pipeline passes them explicitly).
 ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
-ARG PINCHTAB_VERSION=0.13.2
+ARG PINCHTAB_VERSION=latest
 ARG TUICR_VERSION=0.19.1
 ENV FNM_DIR=/opt/fnm
 COPY common-setup.sh terminfo-ghostty tmux.conf /tmp/

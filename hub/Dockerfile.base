@@ -31,7 +31,7 @@ RUN groupadd -g 1000 dev \
 # muster image uses.
 ARG NODE_VERSION=v26.2.0
 ARG NPM_VERSION=11.13.0
-ARG PINCHTAB_VERSION=0.13.2
+ARG PINCHTAB_VERSION=latest
 ARG TUICR_VERSION=0.19.1
 ENV FNM_DIR=/opt/fnm
 COPY common-setup.sh terminfo-ghostty tmux.conf /tmp/
@@ -94,6 +94,12 @@ COPY pinchtab-config.json.example /opt/muster/pinchtab-config.json
 # not have to contain one for the browser to exist, which is the point — pinchtab is part of the
 # setup, not an example somebody has to notice and copy.
 COPY hub/services /opt/muster/hub-services
+# Skills MUSTER writes, next to the ones common-setup.sh fetches from upstream (pinchtab's own). Same
+# directory on purpose: the entrypoint copies /opt/muster/skills wholesale into the shared ~/.claude,
+# so hub and every box see them. This one is additive — it says where the browser actually runs in
+# this topology and documents the viewport/emulation API upstream's skill leaves out — which is why it
+# has its own name instead of overwriting theirs.
+COPY skills /opt/muster/skills
 
 USER 1000
 WORKDIR /home/dev

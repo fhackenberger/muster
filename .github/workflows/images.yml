@@ -77,6 +77,23 @@ jobs:
           v="$(git describe --tags --always | sed 's/^v//')"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "publishing as $v"
+      # RESOLVE "latest" HERE, not in the Dockerfile. `npm install -g pinchtab@latest` inside the build
+      # would look right and be wrong: that RUN sits in a cached layer, so it re-resolves only when
+      # something ABOVE it changes — the image would sit on whatever version it happened to bake months
+      # ago while claiming to track latest. Resolving it out here turns the answer into a build-arg, and
+      # a changed build-arg is exactly what busts the cache.
+      #
+      # Set the repository variable PINCHTAB_VERSION to pin one instead; empty or missing means track the
+      # newest release. `npm view` is the registry's own answer, so this installs what `pinchtab@latest`
+      # would have — with the version recorded in the run log and baked into the image, which is the
+      # part `@latest` cannot give you.
+      - id: deps
+        run: |
+          pt="${{ vars.PINCHTAB_VERSION }}"
+          [ -n "$pt" ] || pt="$(npm view pinchtab version)"
+          [ -n "$pt" ] || { echo "could not resolve the newest pinchtab from npm" >&2; exit 1; }
+          echo "pinchtab=$pt" >> "$GITHUB_OUTPUT"
+          echo "pinchtab $pt"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -128,7 +145,7 @@ jobs:
             MUSTER_VERSION=${{ steps.ver.outputs.version }}
             NODE_VERSION=${{ vars.NODE_VERSION || 'v26.2.0' }}
             NPM_VERSION=${{ vars.NPM_VERSION || '11.13.0' }}
-            PINCHTAB_VERSION=${{ vars.PINCHTAB_VERSION || '0.13.2' }}
+            PINCHTAB_VERSION=${{ steps.deps.outputs.pinchtab }}
             TUICR_VERSION=${{ vars.TUICR_VERSION || '0.19.1' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
