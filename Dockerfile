@@ -117,7 +117,8 @@ RUN for t in xclip xsel; do \
 #   handoff       push the branch to the hub for review, with a summary as a git note
 #   mydiff        exactly what this box will hand over (its branch vs the hub's dev)
 #   muster-activity  Claude Code hook: records busy/idle/waiting for the hub (see cbx ls / cbx status)
-COPY box-bin/muster-box-init box-bin/handoff box-bin/mydiff box-bin/muster-activity /usr/local/bin/
+COPY box-bin/muster-box-init box-bin/handoff box-bin/mydiff box-bin/muster-activity \
+     box-bin/muster-pinchtab-session /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/muster-box-init /usr/local/bin/handoff /usr/local/bin/mydiff \
 	/usr/local/bin/muster-activity
 

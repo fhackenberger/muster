@@ -778,7 +778,7 @@ _muster_complete() {
 		# a name that is already running is not, since `box` on it is a no-op you did not mean.
 		box|purge) COMPREPLY=($(compgen -W "$(_muster_names rbox)" -- "$cur")) ;;
 		# `import`/`export` and every review-queue verb take an existing one.
-		kill|forwards|review|fix|prereview|merge|drop|export|import)
+		kill|forwards|review|fix|prereview|merge|drop|export|import|say|peek|point|hold|release)
 		           COMPREPLY=($(compgen -W "$(_muster_names box)" -- "$cur")) ;;
 		recreate|rebase)
 		           COMPREPLY=($(compgen -W "$(_muster_names box) all" -- "$cur")) ;;
@@ -793,7 +793,7 @@ _muster_complete() {
 # Flags offered by each box-name-completing command. A project extras file (see
 # muster.bash_aliases.project.example) adds its own commands with e.g.
 #     muster_complete_box cbxfe --own          # the helper; sets the entry below and calls `complete`
-declare -A _MUSTER_BOXONLY_FLAGS=([cbxexport]="--show --3way")
+declare -A _MUSTER_BOXONLY_FLAGS=([cbxexport]="--show --3way" [cbxpeek]="--point --snap --full --selector")
 
 _muster_complete_boxonly() {
 	local cur="${COMP_WORDS[COMP_CWORD]}"
@@ -851,6 +851,48 @@ _muster_complete_exec() {
 	return 0
 }
 
+# cbxpeek <box> [--snap|--full|--selector CSS] — SEE what an agent sees, on your own screen.
+#
+#   cbxpeek work1                 # screenshot of that box's browser tab, opened here
+#   cbxpeek work1 --snap          # the accessibility tree instead — the text the agent actually reads
+#   cbxpeek work1 --point         # …with pinchtab's labelled overlay drawn on first, so you can then
+#                                 #   say `cbx say work1 "e5 is the misaligned one"` and be understood
+#
+# The capture happens on the hub (that is where Chrome is) and the PNG comes back over the same ssh
+# connection, through `docker exec -i` and ssh WITHOUT -t: a PTY would translate newlines and corrupt
+# the image, exactly as it would a patch. --snap needs none of that — it is text, so it just prints.
+_muster_peek() {
+	_muster_need_server || return 1
+	local cmd=peek box="" args=() a
+	for a in "$@"; do
+		case "$a" in
+			--point) cmd=point ;;
+			-*)      args+=("$a") ;;
+			*)       [ -n "$box" ] && args+=("$a") || box="$a" ;;
+		esac
+	done
+	[ -n "$box" ] || { echo "usage: ${_MUSTER_SELF} <box> [--point] [--snap] [--full] [--selector CSS]" >&2; return 2; }
+	local self="${_MUSTER_PREFIX:-cbx}" out path local_png
+	# Text modes print and are done with it.
+	case " ${args[*]-} " in
+		*" --snap "*|*" --text "*)
+			_muster_ssh "$(_muster_hub "-e MUSTER_SELF=$self") muster $cmd $box ${args[*]-}"
+			return ;;
+	esac
+	out="$(ssh "$MUSTER_SERVER" "$(_muster_hub_pipe) env MUSTER_SELF=$self muster $cmd $box ${args[*]-}")" || return 1
+	# The hub prints the path it wrote as the only line that starts with a slash; the rest is advice.
+	path="$(printf '%s\n' "$out" | grep '^/' | tail -1)"
+	printf '%s\n' "$out" | grep -v '^/' >&2
+	[ -n "$path" ] || { echo "${_MUSTER_SELF}: the hub captured nothing" >&2; return 1; }
+	local_png="${TMPDIR:-/tmp}/${_MUSTER_SELF}-${box}.png"
+	ssh "$MUSTER_SERVER" "$(_muster_hub_pipe) cat $path" > "$local_png" || return 1
+	[ -s "$local_png" ] || { echo "${_MUSTER_SELF}: the image came back empty" >&2; return 1; }
+	echo "$local_png"
+	# Best-effort open: on a headless laptop shell the path above is the useful output anyway.
+	(xdg-open "$local_png" >/dev/null 2>&1 || open "$local_png" >/dev/null 2>&1) &
+	return 0
+}
+
 # ---------------------------------------------------------------------------------------------
 # THE STACK FACTORY
 #
@@ -880,11 +922,13 @@ declare -A _MUSTER_COMP_PREFIX=() _MUSTER_COMP_FN=()
 _MUSTER_FAMILY=(
 	-:_muster_run  hub:_muster_hub_attach  box:_muster_box_attach  tun:_muster_tun  sync:_muster_sync
 	export:_muster_export  import:_muster_import  cp:_muster_cp  exec:_muster_exec  refresh:_muster_refresh
+	peek:_muster_peek
 )
 # suffix:completion-function, for the ones that complete more than nothing.
 _MUSTER_FAMILY_COMP=(
 	-:_muster_complete  box:_muster_complete_boxonly  export:_muster_complete_boxonly
 	import:_muster_complete_import  tun:_muster_complete_tun  cp:_muster_complete_cp  exec:_muster_complete_exec
+	peek:_muster_complete_boxonly
 )
 
 # muster_define <prefix> <suffix> <implementation> — generate ONE command for a stack. Project helper
@@ -943,6 +987,7 @@ muster_stack() {
 	done
 	if [ -n "${BASH_VERSION:-}" ]; then
 		_MUSTER_BOXONLY_FLAGS["${p}export"]="--show --3way"
+		_MUSTER_BOXONLY_FLAGS["${p}peek"]="--point --snap --full --selector"
 		complete -W '--rebase' "${p}sync"
 	fi
 }

@@ -54,6 +54,23 @@ fi
 # (so it can't be a build-time ENV). A /etc/profile.d drop-in covers login shells too.
 export PATH="$HOME/.local/bin:$PATH"
 
+# THIS BOX'S OWN BROWSER TAB. pinchtab isolates by session and gives each session its own tab, so a
+# session per box is what stops two agents from driving the same tab and silently yanking the page out
+# from under each other. Created here, before claude starts, and exported — passing a session per call
+# would mean a wrapper around every `pinchtab` invocation, i.e. a different command line every time,
+# i.e. a permission prompt every time for the agent.
+#
+# As the box user (setpriv), because the token file lives in the user's home at 0600 and a root-owned
+# one would be unreadable to the agent that needs it. Best-effort throughout: the server may not be up
+# yet, or there may be no pinchtab at all, and neither is a reason to fail to start a box — the agent
+# can re-run `muster-pinchtab-session` once it is.
+if [ -x /usr/local/bin/muster-pinchtab-session ]; then
+	_pt="$(setpriv --reuid "$HOST_UID" --regid "$HOST_GID" --init-groups \
+		env HOME="$HOME" PATH="$PATH" muster-pinchtab-session 2>/dev/null || true)"
+	[ -n "$_pt" ] && export PINCHTAB_SESSION="$_pt"
+	unset _pt
+fi
+
 # Ctrl-Z on the container tty sends SIGTSTP to the foreground app. For the claude TUI that strands
 # the box: claude stops mid-run while the host-side docker client keeps the terminal in raw mode, so
 # it looks hung with no shell to `fg` from (the stop is INSIDE the container — the docker client is

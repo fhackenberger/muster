@@ -42,6 +42,16 @@ set -euo pipefail
 #                                           #   MUSTER_REVIEW_TUI picks a different TUI (empty = never one)
 #   $SELF fix    <box> -m "..."               # send review feedback into that box's claude session
 #   $SELF prereview <box>                     # ask the agent to self-review its diff before you look
+#   $SELF say    <box> "..."                  # say something into that box's claude, no review framing
+#   $SELF peek   <box> [--snap] [--full]      # SEE what that agent sees: a screenshot of ITS browser tab
+#             [-o FILE]                     #   --snap = the accessibility tree instead (what it reads)
+#                                           #   --full = the whole scrollable page
+#   $SELF point  <box> [--selector CSS]       # same, with pinchtab's labelled overlay drawn on first —
+#             [--clear] [-o FILE]           #   the refs in the image are that agent's own, so you can
+#                                           #   then say "e5 is the misaligned one". --clear removes it
+#   $SELF hold   <box> [--reason "..."]       # PAUSE that box's browser tab so you can drive it into the
+#             [--timeout SECS]              #   state you want it to work on; its actions get a 409
+#   $SELF release <box>                       # let it browse again (and tell it the page moved)
 #   $SELF merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
 #                                           #   (--edit on a 1-commit branch: no merge commit)
@@ -1601,6 +1611,156 @@ prereview() {
 	echo "$SELF: asked $1 to self-review and re-hand off."
 }
 
+# ---- looking at what an agent is looking at (pinchtab) ---------------------------------------
+#
+# Every box creates its own pinchtab session at boot (box-bin/muster-pinchtab-session) and pinchtab
+# gives each session its own dedicated browser tab. The session TOKEN is therefore the whole address:
+# any request carrying it lands on that box's current tab, with no tab id to look up and nothing to
+# keep in step. The box writes it into its home, which the hub mounts read-only — the same channel
+# the activity hooks use.
+PT_URL="${PINCHTAB_SERVER:-http://127.0.0.1:9867}"
+
+# One JSON string, quoted and escaped by jq rather than by hand — a reason with a quote or a newline in
+# it would otherwise produce a body the server rejects, which reads as "hold is broken".
+json_str() { printf '%s' "$1" | jq -Rs .; }
+
+# RETURNS, does not die. Both callers below read it through $( ), and a `die` in there kills only the
+# subshell: the message prints, the status is swallowed by the assignment, and the command carries on
+# to capture somebody else's tab. Hence the explicit `|| return 1` at every call site.
+box_pt_token() {
+	local f="$BOXES/$1/home/.muster-pinchtab-session" tok
+	tok="$(cat "$f" 2>/dev/null || true)"
+	if [ -z "$tok" ]; then
+		echo "$SELF: box '$1' has no pinchtab session yet ($f is empty or missing).
+     It is created when the box starts and needs the server up: $SELF up pinchtab, then in the box
+     run 'muster-pinchtab-session'. A box that has never browsed has nothing to look at either." >&2
+		return 1
+	fi
+	printf '%s' "$tok"
+}
+
+# The CLI, as the box. Everything the box could run, run from here against the same tab.
+pt_cli() {
+	local box="$1" tok; shift
+	tok="$(box_pt_token "$box")" || return 1
+	PINCHTAB_SESSION="$tok" pinchtab "$@"
+}
+
+# The HTTP API, as the box. Used where the CLI would need a tab id we deliberately do not track:
+# `pinchtab tab handoff <id>` wants one, while the shorthand route acts on the session's CURRENT tab,
+# which is exactly the tab we mean. `Authorization: Session <token>` is how a session authenticates
+# (a server token would be `Bearer`, and would land on the wrong — global — current tab).
+pt_api() {
+	local box="$1" method="$2" path="$3" tok; shift 3
+	tok="$(box_pt_token "$box")" || return 1
+	curl -sS -X "$method" -H "Authorization: Session $tok" \
+		-H "Content-Type: application/json" "${PT_URL}${path}" "$@"
+}
+
+# Where a capture lands when you do not say. Under $STATE so it is inside the repo's .git and gets
+# cleaned with the rest of the hub's scratch state, and named per box so a second peek at the same box
+# overwrites rather than accumulates.
+pt_out() { mkdir -p "$STATE/peek"; printf '%s/peek/%s.png' "$STATE" "$1"; }
+
+peek() {
+	argsort "-o" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	[ $# -ge 1 ] || die "peek needs a box name"
+	local box="$1" out="" snap="" full="" a; shift
+	for a in "$@"; do
+		case "$a" in
+			--snap|--text) snap=1 ;;
+			--full)        full=--beyond-viewport ;;
+			-o)            ;;                      # its value follows, handled below
+			-*)            die "peek: unknown option '$a' (--snap | --full | -o FILE)" ;;
+			*)             out="$a" ;;
+		esac
+	done
+	# The accessibility tree, not the picture: it is literally the text the agent reasons over, so when
+	# an agent "doesn't get it" this is more often the answer than a screenshot is.
+	if [ -n "$snap" ]; then
+		pt_cli "$box" snap || exit 1
+		return
+	fi
+	[ -n "$out" ] || out="$(pt_out "$box")"
+	pt_cli "$box" screenshot -o "$out" ${full:+$full} >/dev/null \
+		|| die "could not capture box '$box' — has it opened a page yet? ($SELF peek $box --snap shows the tree)"
+	echo "$out"
+}
+
+point() {
+	argsort "-o --selector" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	[ $# -ge 1 ] || die "point needs a box name"
+	local box="$1" out="" sel="" clear="" a want=""; shift
+	for a in "$@"; do
+		case "$want" in o) out="$a"; want=""; continue ;; s) sel="$a"; want=""; continue ;; esac
+		case "$a" in
+			--clear)     clear=1 ;;
+			-o)          want=o ;;
+			--selector)  want=s ;;
+			-*)          die "point: unknown option '$a' (--selector CSS | --clear | -o FILE)" ;;
+			*)           out="$a" ;;
+		esac
+	done
+	if [ -n "$clear" ]; then
+		pt_cli "$box" annotate --clear >/dev/null && echo "$SELF: overlay cleared in box '$box'."
+		return
+	fi
+	# The overlay is injected into the live DOM, so it is in the screenshot — which is the point here.
+	# Nobody can click a headless browser, but nobody needs to: the labels are readable in the image and
+	# the refs are the AGENT'S OWN, because this is the agent's own tab. Annotating a browser on your
+	# laptop would give you refs that mean nothing to it.
+	pt_cli "$box" annotate ${sel:+--selector "$sel"} >/dev/null \
+		|| die "could not annotate box '$box' — has it opened a page yet?"
+	[ -n "$out" ] || out="$(pt_out "$box")"
+	pt_cli "$box" screenshot -o "$out" >/dev/null || die "annotated, but the screenshot failed"
+	echo "$out"
+	echo "$SELF: labels are that box's own refs — '$SELF say $box \"the misaligned one is e5\"' means something to it."
+}
+
+hold() {
+	argsort "--reason --timeout" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	[ $# -ge 1 ] || die "hold needs a box name"
+	local box="$1" reason="you are setting the page up" secs=600 a want=""; shift
+	for a in "$@"; do
+		case "$want" in r) reason="$a"; want=""; continue ;; t) secs="$a"; want=""; continue ;; esac
+		case "$a" in
+			--reason)  want=r ;;
+			--timeout) want=t ;;
+			*)         die "hold: unknown option '$a' (--reason TEXT | --timeout SECS)" ;;
+		esac
+	done
+	case "$secs" in ''|*[!0-9]*) die "hold: --timeout wants whole seconds" ;; esac
+	# A TIMEOUT ALWAYS. A tab left paused rejects the agent's every browser action, and an agent that
+	# cannot browse does not stop — it concludes the page is broken and works around it. Ten minutes of
+	# that is a nuisance; forever is a box you have to remember to release.
+	pt_api "$box" POST /handoff \
+		--data "$(printf '{"reason":%s,"timeoutMs":%s}' "$(json_str "$reason")" "$((secs * 1000))")" >/dev/null \
+		|| die "could not pause box '$box's tab"
+	echo "$SELF: box '$box's tab is PAUSED for up to ${secs}s — its browser actions now fail with"
+	echo "     409 tab_paused_handoff. Drive the tab yourself, then: $SELF release $box"
+}
+
+release() {
+	[ $# -ge 1 ] || die "release needs a box name"
+	pt_api "$1" POST /resume --data '{"status":"completed"}' >/dev/null \
+		|| die "could not resume box '$1's tab"
+	echo "$SELF: box '$1's tab is live again."
+	say_to_box "$1" "I paused your browser tab to set a page up and have now released it. Re-snapshot before you act on anything you saw earlier — the page has changed under you." 2>/dev/null || true
+}
+
+# Plain delivery into a box's claude, with none of fix()'s review framing. `fix` says "review feedback
+# … then run: handoff", which is wrong for pointing at something mid-task and would send an agent off
+# to hand off work it has not finished.
+say() {
+	[ $# -ge 1 ] || die "say needs a box name"
+	local box="$1"; shift
+	[ "${1:-}" = -m ] && shift
+	local msg="$*"
+	[ -n "$msg" ] || die "say needs a message: $SELF say $box \"look at the header on /en/logbook\""
+	say_to_box "$box" "$msg" || die "not delivered — is the box running? ($SELF ls)"
+	echo "$SELF: delivered to '$box'."
+}
+
 # Everything that has to happen once an agent's work is IN $DEV: retire the ref, clear the review
 # state, tell the box, and say whether origin still needs it.
 #
@@ -2918,6 +3078,11 @@ case "$cmd" in
 	review)   review "$@" ;;
 	fix)      fix "$@" ;;
 	prereview) prereview "$@" ;;
+	say)      say "$@" ;;
+	peek)     peek "$@" ;;
+	point)    point "$@" ;;
+	hold)     hold "$@" ;;
+	release)  release "$@" ;;
 	merge)    merge "$@" ;;
 	minto)    colors_init; minto "$@" ;;
 	drop)     drop "$@" ;;

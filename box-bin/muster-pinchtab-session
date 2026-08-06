@@ -1,0 +1,106 @@
+#!/bin/bash
+set -euo pipefail
+
+# muster-pinchtab-session — this box's own pinchtab session, and therefore its own browser tab.
+#
+# WHY THIS EXISTS. Every box points its pinchtab CLI at ONE server (the hub's, or the laptop's), and
+# without a session they all drive the SAME tab: two agents browsing at once yank the page out from
+# under each other and neither can tell. pinchtab isolates by session and gives each session its own
+# dedicated tab, so one session per box is the whole fix.
+#
+# The token also makes the box's tab addressable FROM THE HUB. `muster peek/point/hold` read this file
+# (the box's home is visible to the hub read-only at /work/boxes/<box>/home) and run pinchtab with the
+# box's session, which resolves to the box's current tab — that is how you look at what an agent is
+# looking at, without a tab-id lookup anywhere.
+#
+#   muster-pinchtab-session               # ensure one exists, print its id (idempotent)
+#   muster-pinchtab-session --force-new   # after '401 invalid or expired agent session'
+#   muster-pinchtab-session --print       # print the stored id, create nothing
+#   muster-pinchtab-session --delete      # revoke server-side and drop the file
+#
+# The box's entrypoint runs this before claude starts and exports PINCHTAB_SESSION, so nothing has to
+# pass a session per call — a wrapper script around every `pinchtab` invocation means a new command
+# line every time, which for an agent means a permission prompt every time. If the server was not up
+# then, re-export it in the shell:  export PINCHTAB_SESSION="$(muster-pinchtab-session)"
+
+# The header block IS the help — printed from line 4 to the first line that is not a comment, so it
+# cannot drift out of step with the file you are reading (a hard-coded line range always does).
+usage() { sed -n '4,${/^[^#]/q; s/^# \{0,1\}//p;}' "$0"; }
+die() { echo "muster-pinchtab-session: $*" >&2; exit 1; }
+
+# WHO THIS SESSION BELONGS TO — the box, not the claude session. Infostars keyed this on
+# CLAUDE_CODE_SESSION_ID because nothing else identified the agent; here the box name is the better
+# key, because it is the name the HUB knows. A claude session id is invisible from the hub, so a
+# session labelled with one could never be looked up by `muster peek <box>`.
+#
+# Outside a server-mode box (a laptop box from muster-box.sh, or the hub itself) MUSTER_BOX is unset
+# and the hostname stands in: nothing there needs to find the session by name, it only needs to not
+# collide with anyone else's.
+BOX="${MUSTER_BOX:-$(hostname 2>/dev/null || echo box)}"
+AGENT_ID="muster-${BOX}"
+# Subagents: parallel subagents inherit their parent's environment, so they share this file and its
+# tab. One that needs its own tab sets MUSTER_PINCHTAB_SESSION_FILE (and gets its own label from it).
+FILE="${MUSTER_PINCHTAB_SESSION_FILE:-$HOME/.muster-pinchtab-session}"
+[ "$FILE" = "${MUSTER_PINCHTAB_SESSION_FILE:-}" ] && AGENT_ID="${AGENT_ID}-$(basename "$FILE" | tr -cd 'a-zA-Z0-9' | tail -c 8)"
+
+mode=ensure
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--force-new) mode=force ;;
+		--print)     mode=print ;;
+		--delete)    mode=delete ;;
+		-h|--help)   usage; exit 0 ;;
+		*) die "unknown argument '$1' (--force-new | --print | --delete)" ;;
+	esac
+	shift
+done
+
+# Revoke this box's sessions server-side. `pinchtab session revoke` wants the SHORT public id from
+# `session list`, not the long token this file holds — passing the token is a 404 — so the id is
+# looked up by our label. That also reaps whatever earlier --force-new runs left behind.
+revoke_self() {
+	local list ids id
+	list="$(pinchtab session list 2>/dev/null)" || return 0
+	ids="$(printf '%s' "$list" | python3 -c 'import sys, json
+try:
+    sessions = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+want = sys.argv[1]
+for s in sessions if isinstance(sessions, list) else []:
+    if s.get("agentId") == want and s.get("status") == "active":
+        print(s["id"])' "$AGENT_ID" 2>/dev/null)" || return 0
+	for id in $ids; do
+		pinchtab session revoke "$id" >/dev/null 2>&1 || true
+	done
+}
+
+case "$mode" in
+	print)
+		[ -s "$FILE" ] || exit 1
+		cat "$FILE"
+		exit 0 ;;
+	delete)
+		revoke_self
+		rm -f "$FILE"
+		exit 0 ;;
+	ensure)
+		# Reuse. NOT validated against the server on purpose: this runs before every browse, and a
+		# round trip to prove a token still works costs more than the one 401 that teaches the agent
+		# to run --force-new.
+		if [ -s "$FILE" ]; then cat "$FILE"; exit 0; fi ;;
+	force)
+		revoke_self ;;
+esac
+
+# Create into a temp file first (mktemp is 0600) and move it into place, so a failed create can never
+# clobber a session that still works.
+tmp="$(mktemp "${FILE}.XXXXXX")" || die "cannot write next to $FILE"
+if ! pinchtab session create --agent-id "$AGENT_ID" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+	rm -f "$tmp"
+	die "could not create a session — is the pinchtab server reachable?
+     PINCHTAB_SERVER=${PINCHTAB_SERVER:-<unset, so the CLI falls back to 127.0.0.1>}
+     On a muster stack the server runs on the hub — ask your reviewer to check: up pinchtab"
+fi
+mv "$tmp" "$FILE"
+cat "$FILE"

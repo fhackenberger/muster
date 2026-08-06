@@ -854,7 +854,19 @@ def box_memo():
 		          "of the in-box port. Same two ports, two different consumers.",
 		          "",
 		          "The service has to be up on the hub (`up pinchtab` there); if it is not, ask your",
-		          "reviewer rather than assuming the page is broken."]
+		          "reviewer rather than assuming the page is broken.",
+		          "",
+		          "**You have your own tab.** Every box gets its own pinchtab session at start-up and each",
+		          "session owns a dedicated tab, so your navigation cannot disturb another agent's — and",
+		          "theirs cannot disturb yours. `$PINCHTAB_SESSION` is already exported; if a call fails",
+		          "with `401 invalid or expired agent session` (they last 24h), run",
+		          "`export PINCHTAB_SESSION=\"$(muster-pinchtab-session --force-new)\"` and carry on.",
+		          "",
+		          "Two consequences worth knowing. Your reviewer can SEE that tab — screenshot or",
+		          "accessibility tree — and can annotate it, so a message like \"e5 is the misaligned one\"",
+		          "refers to YOUR refs and means exactly what it says. And your reviewer can PAUSE it while",
+		          "setting a page up for you: browser calls then fail with `409 tab_paused_handoff`. That is",
+		          "not a broken page and not something to work around — wait, or ask, and it will come back."]
 	keys = []
 	try:
 		keys = [l.split("=", 1)[0] for l in parse_box_env()]
@@ -905,25 +917,47 @@ def ensure_box_memo():
 	print(f"box-broker: refreshed the box memo in {path}", flush=True)
 
 
-def session_args(box_dir, resume):
+def transcript_path(workdir, sid):
+	"""Where claude keeps this session's transcript, or "" if we cannot know.
+
+	claude files transcripts per PROJECT DIRECTORY, named after the cwd with every '/' turned into
+	'-' — /home/dev/repo becomes projects/-home-dev-repo. Every box has the same workdir, so they all
+	share that directory and are told apart by the session id alone."""
+	if not CLAUDE_HOME or not workdir:
+		return ""
+	return os.path.join(CLAUDE_HOME, "projects", workdir.replace("/", "-"), f"{sid}.jsonl")
+
+
+def session_args(box_dir, resume, workdir=""):
 	"""The --session-id / --resume flag for this box's claude.
 
 	All boxes share CLAUDE_HOME, so `claude --continue` would be ambiguous across them; instead each
-	box pins a stable session id (stored in its box dir). A fresh spawn passes --session-id (recording
-	it); a recreate passes --resume, so the box picks up exactly where it left off.
+	box pins a stable session id, stored in its box dir. THE ID IS THE BOX'S, not the container's: a
+	box that is killed and brought back up is the same box, with the same work in its upper layer and
+	the same branch — an agent that has forgotten the conversation that produced them is not much use.
 
-	Note claude stores transcripts per project directory, so moving a box's workdir orphans its
-	session and --resume then fails at startup. Recovering means moving the .jsonl under
-	CLAUDE_HOME/projects/ to the new directory name (or clearing this box's session-id file)."""
+	Which flag depends only on whether a transcript for that id exists. --resume against an id claude
+	has never seen fails at STARTUP, so the box comes up with no agent at all; that happens whenever a
+	session-id file outlives its transcript — a workdir that moved (claude files transcripts per
+	project directory), a cleaned CLAUDE_HOME, a box killed before claude ever wrote anything. Falling
+	back to --session-id with the SAME id keeps the box's identity and simply starts a new
+	conversation, which is the outcome you would want anyway."""
 	session_file = os.path.join(box_dir, "session-id")
-	if resume and os.path.exists(session_file):
+	sid = ""
+	if os.path.exists(session_file):
 		with open(session_file) as fh:
 			sid = fh.read().strip()
-		if sid:
+	if not sid:
+		sid = str(uuid.uuid4())
+		with open(session_file, "w") as fh:
+			fh.write(sid)
+		return f"--session-id {sid}"
+	if resume:
+		t = transcript_path(workdir, sid)
+		if t and os.path.exists(t):
 			return f"--resume {sid}"
-	sid = str(uuid.uuid4())
-	with open(session_file, "w") as fh:
-		fh.write(sid)
+		print(f"box-broker: no transcript for session {sid} ({t or 'CLAUDE_HOME unset'}) — "
+		      "starting a new conversation under the same id", flush=True)
 	return f"--session-id {sid}"
 
 
@@ -969,7 +1003,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	slot = alloc_slot(box_dir) if forwards else None
 	svc_env = parse_service_env()
 	rows, checkout_dst, checkout_ro = parse_mounts(golden)
-	claude_args = session_args(box_dir, resume)
+	claude_args = session_args(box_dir, resume, checkout_dst)
 	job = box_job(box_dir, base, merge)
 	# Project policy for how this box's claude comes up (MUSTER_CLAUDE_PERMISSION_MODE / MUSTER_BOX_PROMPT).
 	# The mode is a flag, so it joins the claude args; the prompt travels separately, base64-encoded,
@@ -1411,7 +1445,11 @@ class Handler(BaseHTTPRequestHandler):
 			for b in (base, merge):
 				if b is not None and not valid_branch(b):
 					return self._reply(400, {"error": f"bad branch name: {b!r}"})
-			result = create_box(name, base=base, merge=merge)
+			# resume=True even though this is the "spawn" route: it is also the route that brings a
+			# KILLED box back (`muster box <name>` on a name that still has its directory), and that
+			# box's agent should pick up its own conversation. For a genuinely new box there is no
+			# session-id file yet, so session_args creates one and this is a fresh session either way.
+			result = create_box(name, resume=True, base=base, merge=merge)
 		except Exception as e:  # noqa: BLE001
 			return self._reply(500, {"error": str(e)})
 		self._reply(201, result)

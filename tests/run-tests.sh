@@ -24,7 +24,9 @@ ROOT="$(dirname "$HERE")"
 # checked for teeth: mutate a copy, confirm the right test goes red.
 MUSTER_BIN="${MUSTER_BIN:-$ROOT/hub/muster}"
 BOX_INIT="$ROOT/box-bin/muster-box-init"
-BROKER_PY="$ROOT/box-broker/broker.py"
+# Overridable like MUSTER_BIN above, so a test can be checked for teeth by running it against a
+# mutated copy: BROKER_PY=/tmp/broken.py ./tests/run-tests.sh broker:
+BROKER_PY="${BROKER_PY:-$ROOT/box-broker/broker.py}"
 FILTER="${1:-}"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cbx-tests.XXXXXX")"
@@ -539,6 +541,72 @@ test_flags_before_the_positional() {
 	notok
 	has "no captured output for 'web'"
 	hasnt "unknown option"
+}
+
+# THE BOX'S SESSION TOKEN IS THE WHOLE ADDRESS. Everything in this family works by running pinchtab as
+# the box — same session, therefore same tab — so the one thing worth asserting hardest is that the
+# token actually reaches the call, and that a box without one fails with an explanation instead of
+# silently capturing somebody else's tab.
+test_peek_uses_the_box_session() {
+	stub_pinchtab
+	box_pt_session work1 ses_work1token
+	cbx peek work1
+	ok
+	OUT="$(pt_log)"
+	has "session=ses_work1token"
+	has "screenshot"
+
+	# --snap is text: it prints the tree rather than writing a file.
+	cbx peek work1 --snap
+	ok
+	has "button"
+	OUT="$(pt_log)"; has "args=snap"
+
+	# point draws the overlay FIRST, then captures — the labels are in the DOM, so they are in the image.
+	: > "$FIX/pinchtab.log"
+	cbx point work1 --selector '#pricing'
+	ok
+	OUT="$(pt_log)"
+	has "annotate --selector #pricing"
+	has "screenshot"
+	case "$(pt_log)" in *annotate*screenshot*) ;; *) fail "annotate must run before the screenshot" ;; esac
+}
+
+test_peek_without_a_session_explains() {
+	stub_pinchtab
+	cbx peek work1
+	notok
+	has "no pinchtab session"
+	# The fix, not just the fault.
+	has "muster-pinchtab-session"
+	OUT="$(pt_log)"; hasnt "screenshot"
+}
+
+# hold/release go over HTTP rather than the CLI: `pinchtab tab handoff` wants a tab id, while the
+# shorthand route acts on the session's CURRENT tab, which is the tab we mean.
+test_hold_pauses_with_a_timeout() {
+	stub_pinchtab
+	box_pt_session work1
+	mkdir -p "$FIX/bin"
+	cat > "$FIX/bin/curl" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$FIX/curl.log"
+exit 0
+EOF
+	chmod +x "$FIX/bin/curl"
+	: > "$FIX/curl.log"
+	cbx hold work1 --reason 'setting up the cart' --timeout 30
+	ok
+	has "PAUSED"
+	OUT="$(cat "$FIX/curl.log")"
+	has "/handoff"
+	has "Authorization: Session ses_deadbeef"
+	# Milliseconds, and always present: a tab paused forever is a box you have to remember to release.
+	has '"timeoutMs":30000'
+	has "setting up the cart"
+
+	cbx release work1
+	OUT="$(cat "$FIX/curl.log")"; has "/resume"
 }
 
 test_merge_refuses_stale_dev() {
@@ -1613,6 +1681,58 @@ PY
 	ok; has ok
 }
 
+# A KILLED BOX THAT COMES BACK IS THE SAME BOX. Its upper layer, its branch and its work all survive
+# the kill; the conversation that produced them has to survive too, or you bring back an agent that
+# has to be told everything again. The spawn route is the one that brings a killed box back, and it
+# never asked for a resume — every re-up silently started a new session and orphaned the old one.
+test_broker_session_resume() {
+	OUT="$(python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+fix = sys.argv[2]
+os.environ["CLAUDE_HOME"] = os.path.join(fix, "claude")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+
+d = os.path.join(fix, "sbox"); os.makedirs(d, exist_ok=True)
+wd = "/home/dev/repo"
+
+# A fresh box: a new id, recorded, and nothing to resume.
+first = b.session_args(d, resume=False, workdir=wd)
+assert first.startswith("--session-id "), first
+sid = first.split()[1]
+assert open(os.path.join(d, "session-id")).read().strip() == sid
+
+# Re-up with no transcript on disk: SAME id, still a new conversation — --resume would fail at
+# startup and leave the box with no agent at all.
+again = b.session_args(d, resume=True, workdir=wd)
+assert again == f"--session-id {sid}", again
+
+# Now claude has written one. The re-up resumes it.
+t = b.transcript_path(wd, sid)
+os.makedirs(os.path.dirname(t), exist_ok=True)
+open(t, "w").write("{}")
+assert b.session_args(d, resume=True, workdir=wd) == f"--resume {sid}", "should resume"
+
+# A spawn that does not ask to resume still keeps the box's id — the id is the BOX's.
+assert b.session_args(d, resume=False, workdir=wd) == f"--session-id {sid}"
+
+# The path claude actually uses: cwd with every slash turned into a dash.
+assert b.transcript_path("/home/dev/repo", "abc").endswith("/projects/-home-dev-repo/abc.jsonl")
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# The route that brings a killed box back is POST /box/<name>, not recreate — so that is where the
+# resume has to be asked for.
+test_broker_spawn_route_resumes() {
+	OUT="$(grep -c 'create_box(name, resume=True, base=base, merge=merge)' "$BROKER_PY")"; RC=$?
+	ok
+	eq "$OUT" "1" "the spawn route must ask create_box to resume"
+}
+
 test_broker_query_params() {
 	OUT="$(python3 - "$BROKER_PY" <<'PY' 2>&1
 import importlib.util, os, sys
@@ -2012,6 +2132,9 @@ run "prereview: asks the agent to self-review"     test_prereview_asks_the_agent
 run "merge: plain merge lands and cleans up"       test_merge_plain
 run "merge: --squash lands one commit"             test_merge_squash
 run "cli: flags work before the positional"        test_flags_before_the_positional
+run "peek: runs pinchtab as the box"               test_peek_uses_the_box_session
+run "peek: a box with no session says so"          test_peek_without_a_session_explains
+run "hold: pauses the box's tab, with a timeout"   test_hold_pauses_with_a_timeout
 run "merge: --undo restores dev and the queue"     test_merge_undo
 run "merge: --undo refuses when it would take more" test_merge_undo_refuses
 run "merge: --undo after a squash says why not"    test_merge_undo_after_squash
@@ -2088,6 +2211,8 @@ run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
+run "broker: a killed box resumes its session"      test_broker_session_resume
+run "broker: the spawn route asks for a resume"     test_broker_spawn_route_resumes
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: messages target claude's pane"        test_broker_box_target

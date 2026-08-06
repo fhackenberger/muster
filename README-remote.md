@@ -103,6 +103,42 @@ Jenkins-built `muster-hub` / `muster-broker` images; `=build` rebuilds them loca
 this dir; `=always` pulls (point `HUB_IMAGE` / `BOX_BROKER_IMAGE` / `BOX_IMAGE` at registry-qualified
 names for a different host).
 
+### Seeing what an agent sees
+
+Every box creates its own pinchtab session at start-up (`muster-pinchtab-session`, run by the box's
+entrypoint, which exports `PINCHTAB_SESSION`), and pinchtab gives each session its own dedicated
+browser tab. That is first of all a correctness fix — without it every box drives the *same* tab and
+two agents browsing at once yank the page out from under each other, invisibly. It is also what makes
+an agent's browser addressable from the hub: the session token is written into the box's home, which
+the hub mounts read-only, and any request carrying it lands on that box's current tab. No tab id is
+tracked anywhere.
+
+```sh
+cbx peek  work1                  # screenshot of that box's tab -> a path on the hub
+cbx peek  work1 --snap           # the accessibility tree instead: the text the agent actually reads
+cbx point work1                  # draw pinchtab's labelled overlay, then capture
+cbx say   work1 "e5 is the one that's misaligned"
+cbxpeek   work1 [--point]        # from the laptop: fetches the PNG over ssh and opens it here
+```
+
+`point` is the one that needed a design decision. pinchtab's own annotate flow expects a **headed**
+browser where you click a label and it copies a reference to your clipboard; the hub's Chrome is
+headless, so nobody can click anything. But the overlay is injected into the live DOM, so it is *in
+the screenshot* — you read the label off the image and type it. Annotating a browser on your laptop
+instead would have given you refs that mean nothing to the agent, because refs are scoped to the
+snapshot that produced them. Annotating the agent's own tab gives you the agent's own refs.
+
+```sh
+cbx hold    work1 --reason "setting up the cart" --timeout 300
+# …drive the tab yourself, from anywhere that can reach the pinchtab API…
+cbx release work1
+```
+
+`hold` pauses that box's tab (pinchtab's handoff: `409 tab_paused_handoff` on its browser actions)
+so you can put a page into the state you want it to work on. Always with a timeout — an agent that
+cannot browse does not stop and ask, it concludes the page is broken and works around it. `release`
+tells the box the page moved under it, so it re-snapshots instead of acting on what it saw before.
+
 **pinchtab tracks its newest release.** The published images do not pin it: the Actions workflow asks
 npm for the current version and passes THAT as the build-arg, rather than putting `@latest` in the
 Dockerfile — a `RUN npm install pinchtab@latest` sits in a cached layer and would re-resolve only when

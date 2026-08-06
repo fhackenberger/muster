@@ -43,8 +43,34 @@ fail() {                                 # fail <message> [detail…]
 
 # Run cbx, capturing stdout+stderr into $OUT and the status into $RC. Never fails the shell.
 cbx() {
-	OUT="$(bash "$MUSTER_BIN" "$@" </dev/null 2>&1)"; RC=$?
+	# $FIX/bin first so a test can stand in for an external binary the hub shells out to (pinchtab, for
+	# the peek/point/hold family). Empty in every other test, which is the same PATH as before.
+	OUT="$(PATH="$FIX/bin:$PATH" bash "$MUSTER_BIN" "$@" </dev/null 2>&1)"; RC=$?
 	return 0
+}
+
+# A pinchtab stand-in on $FIX/bin, recording every call to $FIX/pinchtab.log. `screenshot -o F` writes
+# a file so the caller's "did it capture anything" checks are real.
+stub_pinchtab() {
+	mkdir -p "$FIX/bin"
+	cat > "$FIX/bin/pinchtab" <<EOF
+#!/bin/bash
+printf 'session=%s args=%s\\n' "\${PINCHTAB_SESSION:-}" "\$*" >> "$FIX/pinchtab.log"
+case "\$1" in
+	screenshot) shift; while [ \$# -gt 0 ]; do [ "\$1" = -o ] && { printf 'PNG' > "\$2"; }; shift; done ;;
+	snap)       echo 'e1 button "Save"' ;;
+esac
+exit 0
+EOF
+	chmod +x "$FIX/bin/pinchtab"
+	: > "$FIX/pinchtab.log"
+}
+pt_log() { cat "$FIX/pinchtab.log" 2>/dev/null; }
+
+# Give box <name> a pinchtab session token where the hub looks for it.
+box_pt_session() {
+	mkdir -p "$FIX/boxes/$1/home"
+	printf '%s\n' "${2:-ses_deadbeef}" > "$FIX/boxes/$1/home/.muster-pinchtab-session"
 }
 
 # Wait until the program under test is sitting at a prompt with its input flushed. Two signals, both

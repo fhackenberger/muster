@@ -1,6 +1,6 @@
 ---
 name: muster-pinchtab
-description: "Use this skill together with the `pinchtab` skill whenever you drive a browser from inside a muster box or hub: it covers where Chrome actually runs (the hub, not your box), which URL reaches your dev server from there, and viewport/device emulation — responsive checks, mobile layouts, DPR, and the per-tab override that lets several agents hold different viewports on one shared Chrome."
+description: "Use this skill together with the `pinchtab` skill whenever you drive a browser from inside a muster box or hub: it covers where Chrome actually runs (the hub, not your box), which URL reaches your dev server from there, your own session and tab (and what to do when it expires), what it means when your reviewer pauses or annotates that tab, and viewport/device emulation for responsive and mobile checks."
 ---
 
 # pinchtab inside muster
@@ -19,6 +19,63 @@ The consequence that catches everyone: **the URL you pass is resolved on the hub
 Your dev server is published on the hub's loopback for exactly this reason — use the hub column of
 the port table in your box memo (`http://localhost:$PORT_FORWARD_<NAME>_TO_HUB`). The in-box port is
 the right one for `curl` from here and the wrong one for pinchtab; the hub port is the reverse.
+
+### The two ports, and the one wrong move
+
+Your box and the hub are docker-network siblings: no shared loopback. `PORT_FORWARDS` names each
+tunnel, and each name `ABC` has two numbers:
+
+```
+PORT_FORWARD_ABC_FROM      the port your server binds INSIDE your box
+PORT_FORWARD_ABC_TO_HUB    where the hub sees it, on the HUB's loopback
+```
+
+So `curl` from here uses `_FROM`; pinchtab uses `http://localhost:$PORT_FORWARD_<NAME>_TO_HUB`,
+because the browser resolves it on the hub. **`_TO_HUB` ports bind the hub's loopback only**, so
+`hub:<TO_HUB>` is refused even when the tunnel is perfectly healthy — verify your own server with
+`curl` locally and the tunnel by navigating the browser, never by probing `hub:<port>`.
+
+Read the numbers from the environment; do not hardcode them. They differ per box, and a box that was
+recreated may not get the same ones back.
+
+If `$PINCHTAB_SERVER` is unset you are not in a server-mode box (a laptop box, or the hub itself) and
+the CLI's own `127.0.0.1` default applies. Never "fix" a failure by falling back to `127.0.0.1` inside
+a box: it answers `health ok` and drives no browser you can see.
+
+## Your own session, and therefore your own tab
+
+Every box points its CLI at that one server, so without sessions every box would drive the **same
+tab** — two agents browsing at once yank the page out from under each other, and neither can tell.
+pinchtab isolates by session and gives each session a dedicated tab, so muster creates one per box at
+start-up and exports it:
+
+```bash
+echo "$PINCHTAB_SESSION"                                    # already set; nothing to pass per call
+export PINCHTAB_SESSION="$(muster-pinchtab-session)"        # if it is empty (server was down at boot)
+export PINCHTAB_SESSION="$(muster-pinchtab-session --force-new)"   # after 401 invalid or expired
+```
+
+Sessions expire 24h after creation — a fixed lifetime, **not** extended by activity — and the cue is
+`401 invalid or expired agent session`. `--force-new` revokes the old one first.
+
+Keep it as an exported variable rather than passing a session on each command line: a different
+command line every time is a permission prompt every time.
+
+**Subagents** inherit your environment, so they share your tab. One that needs its own sets
+`MUSTER_PINCHTAB_SESSION_FILE` to a distinct path before calling `muster-pinchtab-session`.
+
+### Your reviewer can see that tab — and pause it
+
+Because the session is muster's, the hub can act on your tab:
+
+- `peek` — a screenshot, or the accessibility tree. When you say "the page looks fine" and your
+  reviewer disagrees, this is how they check what you actually got.
+- `point` — pinchtab's labelled overlay drawn on your tab, then captured. So a message like **"e5 is
+  the misaligned one" refers to YOUR refs** and means exactly what it says. Re-snapshot to resolve a
+  ref you have not seen; do not guess.
+- `hold` / `release` — your tab paused while a page is set up for you. Your browser calls then fail
+  with **`409 tab_paused_handoff`**. That is not a broken page and not something to work around: wait,
+  or ask. When it is released you are told, and you should re-snapshot — the page moved under you.
 
 Everything below was verified against pinchtab 0.13.2 and 0.14.1. The images track pinchtab's newest
 release rather than pinning it, so if something here does not match what you see, check which version
@@ -59,8 +116,8 @@ curl -X POST http://hub:9867/tabs/$TAB/emulation/viewport \
 **Set it before you navigate, or reload after.** A page parses its `<meta name="viewport">` and
 evaluates media queries against the metrics in force at parse time.
 
-**It is per tab and per target.** Agents sharing one Chrome can each hold a different viewport, so
-you never have to coordinate with the other boxes — take your own tab and set it there.
+**It is per tab and per target.** Your session already owns its own tab (above), so a viewport you
+set is yours alone — no coordination with the other boxes, and nothing of yours changes under them.
 
 ## What emulation does NOT give you here
 

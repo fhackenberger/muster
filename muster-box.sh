@@ -301,12 +301,19 @@ if [ "$HEADLESS" = 1 ]; then
 		&& MUSTER_DEV_URL="http://localhost:${PORT_FORWARD_FRONTEND_TO_HUB}"
 	[ -n "${MUSTER_DEV_URL:-}" ] && DEV_ENV=(-e FRONTEND_DEV_HOST=0.0.0.0 -e MUSTER_DEV_URL="$MUSTER_DEV_URL")
 elif DEV_PORT="$(pick_free_port)"; then
+	# WHY 0.0.0.0 IS NOT OPTIONAL HERE, and what it does and does not expose. Docker's port publishing
+	# connects to the CONTAINER's external interface, so a dev server bound to the container's loopback
+	# refuses the connection and the -p below silently does nothing. What binding 0.0.0.0 exposes is
+	# that interface: the docker bridge, i.e. this host and other containers on it. The published side
+	# is 127.0.0.1 on purpose — the LAN never sees it.
 	DEV_PUBLISH=(-p "127.0.0.1:${DEV_PORT}:4200")
 	DEV_ENV=(
 		-e FRONTEND_DEV_HOST=0.0.0.0
 		-e MUSTER_DEV_URL="http://localhost:${DEV_PORT}"
 	)
-	echo "muster: dev server publishes to http://localhost:${DEV_PORT} (MUSTER_DEV_URL in the box)" >&2
+	echo "muster: dev server on http://localhost:${DEV_PORT} (MUSTER_DEV_URL in the box) — published on" >&2
+	echo "        this host's loopback only; inside the box it binds all interfaces, so containers on" >&2
+	echo "        the same docker bridge can reach it too." >&2
 else
 	echo "muster: no free host port in 8930-9029 — dev server not published." >&2
 fi
