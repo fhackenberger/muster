@@ -229,7 +229,9 @@ _muster_box_spawn() {
 	[ "$rc" = 0 ] || return "$rc"
 	# The name BEFORE the attach decision: --no-attach still spawned a box, and completion should know
 	# about it either way.
-	[ -n "$name" ] || name="$(printf '%s' "$out" | sed -n "s/.*box '\([^']*\)' up as.*/\1/p" | head -1)"
+	# 'up as' and 'already up as' both: a name you already have is a reattach, which the hub says in
+	# its own words but still has to be parseable here.
+	[ -n "$name" ] || name="$(printf '%s' "$out" | sed -n "s/.*box '\([^']*\)' \(already \)\?up as.*/\1/p" | head -1)"
 	_muster_cache_box spawned "$name"
 	[ "$attach" = 1 ] || return 0
 	[ -n "$name" ] || { echo "$self: spawned, but could not tell which box to attach to — use ${self}box <name>" >&2; return 0; }

@@ -743,6 +743,33 @@ test_rebase_asks_the_box() {
 	case "$(stub_body /box/work1/say)" in *"git rebase hub/dev"*) ;; *) fail "the rebase command was not in the message" ;; esac
 }
 
+# A REBASE CANNOT START ON A DIRTY TREE, and the agent is the one standing there when it refuses.
+# Left unsaid, the recoveries it invents are not equivalent: `git stash` puts work somewhere a
+# conflict can lose it, and `git add -A` commits the files a project keeps untracked on purpose. So
+# both prompts that ask for a rebase have to carry the by-path instruction — and ask to be told what
+# was committed, because a commit made on the agent's own judgement should not be a surprise later.
+test_rebase_prompt_covers_a_dirty_tree() {
+	handoff work1 1 >/dev/null; box_up work1
+	commit_on dev refs/heads/dev "dev moved" c.txt moved >/dev/null
+	cbx rebase work1
+	ok
+	local msg; msg="$(stub_body /box/work1/say)"
+	case "$msg" in *"working tree is dirty"*) ;; *) fail "the dirty-tree case is not covered" ;; esac
+	case "$msg" in *"'git add' the specific paths"*) ;; *) fail "committing BY PATH is not spelled out" ;; esac
+	case "$msg" in *"git add -A"*) ;; *) fail "'git add -A' is not ruled out" ;; esac
+	case "$msg" in *"git stash"*) ;; *) fail "'git stash' is not ruled out" ;; esac
+	case "$msg" in *"Say in one line what you committed"*) ;; *) fail "the agent is not asked to report the commit" ;; esac
+}
+
+# The same instruction, on the OTHER prompt that asks for a rebase: the one merge sends when it has
+# just landed the box's work. Same tree, same refusal, same wrong recoveries.
+test_merge_rebase_prompt_covers_a_dirty_tree() {
+	handoff work1 1 >/dev/null; box_up work1
+	cbx merge work1 >/dev/null
+	ok
+	case "$(stub_body /box/work1/say)" in *"working tree is dirty"*) ;; *) fail "merge's rebase prompt lost the dirty-tree case" ;; esac
+}
+
 # =====================================================================  pull / push
 
 test_push_nothing_to_do() {
@@ -1733,6 +1760,49 @@ test_broker_spawn_route_resumes() {
 	eq "$OUT" "1" "the spawn route must ask create_box to resume"
 }
 
+# A NAME THAT IS ALREADY UP IS A REATTACH. Spawning over a live box used to surface docker's name
+# conflict ("the container name /box-<project>-<box> is already in use"), which reads like a broken
+# stack — but `muster box <name>` on a box you already have is just "put me back in it". The response
+# has to be the SAME SHAPE as a spawn's, because the alias attaches to whatever comes back.
+test_broker_box_already_up() {
+	fixture
+	mkdir -p "$FIX/boxes/work1"
+	printf 'g-001\n' > "$FIX/boxes/work1/golden"
+	printf '2\n'     > "$FIX/boxes/work1/slot"
+	printf 'FRONTEND 4211 4300\nBACKEND  8091 8900\n' > "$FIX/port-forwards"
+	OUT="$(BOXROOT="$FIX/boxes" PORT_FORWARDS_FILE="$FIX/port-forwards" PROJECT_NAME=myapp \
+		python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+info = b.existing_box("work1")
+assert info["existing"] is True, info
+assert info["container"] == "box-myapp-work1", info      # the same container, not a new one
+assert info["branch"] == "agent/work1", info
+assert info["golden"] == "g-001", info                   # its OWN golden, not the current one
+# The forwards are the box's actual hub ports (base + its slot), so `cbxfe` keeps working after a
+# reattach — a reattach that reported slot 0's ports would send the reviewer to another box.
+assert info["slot"] == 2, info
+assert info["forwards"] == {"FRONTEND": 4302, "BACKEND": 8902}, info
+# No container of that name: nothing to reattach to, and the spawn route falls through to create_box.
+assert b.box_state("work1") == "", b.box_state("work1")
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# ...and the route has to CONSULT that before creating anything, or the conflict is back.
+test_broker_spawn_route_reattaches() {
+	OUT="$(grep -c 'state = box_state(name)' "$BROKER_PY")"; RC=$?
+	ok
+	eq "$OUT" "1" "the spawn route must check for an existing container first"
+	OUT="$(grep -c 'self._reply(200, existing_box(name))' "$BROKER_PY")"; RC=$?
+	ok
+	eq "$OUT" "1" "an existing RUNNING box must be answered with existing_box"
+}
+
 test_broker_query_params() {
 	OUT="$(python3 - "$BROKER_PY" <<'PY' 2>&1
 import importlib.util, os, sys
@@ -2148,6 +2218,8 @@ run "merge: --reword and --squash are opposites"   test_merge_reword_refuses_squ
 
 run "drop: retires the branch and tells the box"   test_drop
 run "rebase: asks the box to rebase"               test_rebase_asks_the_box
+run "rebase: the prompt covers a dirty tree"       test_rebase_prompt_covers_a_dirty_tree
+run "merge: its rebase prompt covers that too"     test_merge_rebase_prompt_covers_a_dirty_tree
 
 run "push: nothing to push"                        test_push_nothing_to_do
 run "push: dev to origin"                          test_push_dev
@@ -2213,6 +2285,8 @@ run "broker: the branch job survives a recreate"   test_broker_persists_the_bran
 run "broker: query parameters"                     test_broker_query_params
 run "broker: a killed box resumes its session"      test_broker_session_resume
 run "broker: the spawn route asks for a resume"     test_broker_spawn_route_resumes
+run "broker: a box that is already up reattaches"   test_broker_box_already_up
+run "broker: the spawn route checks for it first"   test_broker_spawn_route_reattaches
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: messages target claude's pane"        test_broker_box_target

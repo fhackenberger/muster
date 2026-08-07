@@ -1313,6 +1313,34 @@ def _box_name_of(container):
 	return container[len(prefix):] if container.startswith(prefix) else container
 
 
+def box_state(name):
+	"""docker's state for this box's container ('running', 'exited', …), or '' when there is none."""
+	r = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", box_container(name)],
+	                   capture_output=True, text=True)
+	return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def existing_box(name):
+	"""The spawn response for a box that is ALREADY UP — same shape as create_box's, so the hub can
+	treat both the same and just attach.
+
+	Spawning over a live box used to surface docker's name conflict verbatim ("the container name
+	/box-<project>-<box> is already in use"), which reads like a broken stack and isn't: `muster box
+	<name>` on a box you already have is the ordinary way of saying "put me back in it". The
+	container's own labels are not consulted — everything here is state the broker persisted when it
+	created the box, which is also what survives a broker restart."""
+	box_dir = os.path.join(BOXROOT, name)
+	gf = os.path.join(box_dir, "golden")
+	slot = _slot_of(name)
+	forwards = {f[0]: f[2] + slot for f in parse_port_forwards()} if slot is not None else {}
+	job = box_job(box_dir, None, None)
+	return {"box": name, "container": box_container(name), "existing": True,
+	        "workdir": CHECKOUT_DST, "branch": f"agent/{name}",
+	        "golden": open(gf).read().strip() if os.path.exists(gf) else "",
+	        "base": job.get("base", DEV_BRANCH), "merge": job.get("merge", ""),
+	        "slot": slot, "forwards": forwards}
+
+
 def recreate_box(name, fresh_upper=False):
 	"""Pull the newest image, drop the old container, and respawn the box resuming ITS session — now on
 	whatever golden is current. fresh_upper=True also discards the box's upper layer, which is what
@@ -1445,6 +1473,26 @@ class Handler(BaseHTTPRequestHandler):
 			for b in (base, merge):
 				if b is not None and not valid_branch(b):
 					return self._reply(400, {"error": f"bad branch name: {b!r}"})
+			# ALREADY THERE? Then this is a reattach, not a spawn (200, not 201) — see existing_box.
+			# A container that exists but is NOT running is recreated rather than `docker start`ed: a start
+			# re-runs the command frozen into it at creation, whose claude args may be `--session-id <id>`
+			# for a session that by now exists — i.e. a box that comes back up with claude refusing to
+			# start. recreate_box recomputes them with resume=True, keeps the upper layer, and rebuilds the
+			# forwarders that died with the container.
+			state = box_state(name)
+			if state:
+				# ...unless a branch job was asked for. `muster minto` means "start this box on <base> with
+				# <merge> merged in and conflicted", and an existing box is on neither; attaching would hand
+				# back a box that looks right and has had none of the setup.
+				if base or merge:
+					return self._reply(409, {"error": f"box '{name}' already exists — kill it first "
+					                                  f"('muster kill {name}') or use another name"})
+				if state == "running":
+					return self._reply(200, existing_box(name))
+				result = recreate_box(name)
+				result["existing"] = True
+				result["restarted"] = True
+				return self._reply(200, result)
 			# resume=True even though this is the "spawn" route: it is also the route that brings a
 			# KILLED box back (`muster box <name>` on a name that still has its directory), and that
 			# box's agent should pick up its own conversation. For a genuinely new box there is no

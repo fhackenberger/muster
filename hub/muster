@@ -16,7 +16,8 @@ set -euo pipefail
 #   $SELF logs <service> --file             #   what you want when it FAILED to start (a pane you
 #                                           #   cannot scroll is no help), or its path
 #   $SELF autostart                           # start every service whose manifest sets autostart=true
-#   $SELF box  [name]                         # spawn an agent box (own branch, overlay checkout)
+#   $SELF box  [name]                         # spawn an agent box (own branch, overlay checkout);
+#                                             # a name that is already up just reattaches to it
 #   $SELF kill <name>                         # remove an agent box (its upper layer is kept)
 #   $SELF purge <name> [--force]              # …and remove it FOR GOOD: upper layer, caches, session.
 #                                           #   Refuses while its handoff is still unreviewed.
@@ -567,7 +568,22 @@ box_new() {
 	resp="$(broker POST "/box/$name")" || die "spawning box '$name' failed: $resp"
 	container="$(printf '%s' "$resp" | jqr '.container // empty')"
 	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-	echo "$SELF: box '$name' up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty'))."
+	# A NAME YOU ALREADY HAVE IS A REQUEST TO GO BACK INTO IT, not a mistake — so the broker answers
+	# with the existing box (or, if its container had stopped, a recreated one) instead of letting
+	# docker's "container name is already in use" conflict out, and the only difference here is which
+	# line we print. `cbxbox`/the alias attaches after either one, which is the whole point.
+	case "$(printf '%s' "$resp" | jqr '.existing // empty')" in
+		true)
+			if [ "$(printf '%s' "$resp" | jqr '.restarted // empty')" = true ]; then
+				echo "$SELF: box '$name' already up as '$container' (it had stopped — recreated on golden $(printf '%s' "$resp" | jqr '.golden // empty'), resuming its session)."
+			else
+				echo "$SELF: box '$name' already up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty')) — attaching, nothing was respawned."
+			fi
+			;;
+		*)
+			echo "$SELF: box '$name' up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty'))."
+			;;
+	esac
 	echo "  docker exec -it -u dev $container tmux attach -t main      # Ctrl-b d to detach"
 }
 
@@ -1792,7 +1808,7 @@ merge_finish() {
 		after_rebase="Then STOP and wait for my next instruction. There is no next task queued for you: do NOT start, plan, or pick up any other work, and do not look for something to do."
 		resume_note="and then wait for instructions"
 	fi
-	if say_to_box "$box" "Your work was merged into ${DEV}. Run exactly: git fetch hub && git rebase hub/${DEV} — that only replays the commits you have already made onto the merged ${DEV}. It is NOT a request for new changes, and nothing in the merge needs fixing. ${after_rebase}"; then
+	if say_to_box "$box" "Your work was merged into ${DEV}. Run exactly: git fetch hub && git rebase hub/${DEV} — that only replays the commits you have already made onto the merged ${DEV}. It is NOT a request for new changes, and nothing in the merge needs fixing. $(rebase_dirty_note)${after_rebase}"; then
 		echo "$SELF: asked $box to rebase onto $DEV $resume_note"
 	else
 		echo "$SELF: (box $box not reachable — rebase it later with '$SELF rebase $box')"
@@ -2658,6 +2674,18 @@ minto() {
 	fi
 }
 
+# WHAT AN AGENT SHOULD DO WHEN ITS TREE IS DIRTY, said out loud. `git rebase` refuses to start with
+# uncommitted changes, and the prompts below used to stop at "replays your own commits" — leaving the
+# agent to invent a recovery at the moment it is least supervised. The inventions are not equivalent:
+# `git stash` hides work that a conflict then drops on the floor, and `git add -A` sweeps the files a
+# project keeps deliberately untracked (build tarballs, patches, node_modules) into the very branch
+# you are about to review. Committing BY PATH is the one that keeps both halves right, so it is
+# spelled out instead of hoped for — and the agent is asked to report it, because a commit made on
+# the agent's own judgement should not be something you discover later in a diff.
+rebase_dirty_note() {
+	printf '%s' "If git refuses to start because your working tree is dirty, commit YOUR OWN work first and then rebase: 'git add' the specific paths you changed and commit them with a normal message. Do NOT use 'git add -A' and do NOT use 'git stash' — files this project keeps untracked on purpose must stay untracked. Say in one line what you committed. "
+}
+
 rebase() {
 	[ $# -ge 1 ] || die "rebase needs a box name (or 'all')"
 	local box list behind n=0 ok=0 force="" rstate rage after_rebase repush
@@ -2700,7 +2728,7 @@ rebase() {
 		else
 			after_rebase="Then STOP and wait for my next instruction — do NOT start, plan, or pick up any other work."
 		fi
-		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved, so this only replays your own commits on top of it. Resolve any conflicts it reports. It is NOT a request for new changes. ${repush}${after_rebase}"; then
+		if say_to_box "$box" "Please run: git fetch hub && git rebase hub/${DEV} — the ${DEV} branch has moved, so this only replays your own commits on top of it. Resolve any conflicts it reports. It is NOT a request for new changes. $(rebase_dirty_note)${repush}${after_rebase}"; then
 			ok=$((ok + 1))
 			echo "  $box: asked to rebase ($behind${repush:+, and to re-handoff})"
 		else

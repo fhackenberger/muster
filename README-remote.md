@@ -377,6 +377,11 @@ That gives you:
   typed. `--no-attach` (or `MUSTER_BOX_ATTACH=0`) spawns and returns; so does a non-terminal stdout,
   since `cbx box x | cat` waiting for a tmux session is a hang rather than a feature. With no name the
   hub invents one and the alias reads it back out of the spawn message to know what to attach to.
+  **A name that is already up is not an error** — it is how you get back into a box you already have,
+  so the broker answers with the existing one and you attach to it (`already up as …`, nothing
+  respawned). A box whose container exists but has *stopped* is recreated on the way in, resuming its
+  session and keeping its upper layer; only `cbx minto`'s `?base=&merge=` refuses, because a box that
+  is already running is on neither branch and attaching would skip the setup it asked for.
 - **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql myapp_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
 - **`cbxfe <box>` / `cbxfe <box> --own`** — project shorthand: open **one agent's** frontend at
