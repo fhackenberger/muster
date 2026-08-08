@@ -784,6 +784,22 @@ test_push_dev() {
 	ok
 	has "pushed dev to origin"
 	eq "$(at refs/remotes/origin/dev)" "$(at dev)"
+	# -y means "no prompt AND none of the exposition that leads up to it". The listing exists to inform
+	# an answer already given, it goes through the PAGER (so a scripted push on a tty could sit in
+	# `less` waiting for a keypress nobody will press), and the commit subject is what gives it away.
+	hasnt "local work"
+	hasnt "would go to origin"
+}
+
+# …and without -y the preview is still there: that is the last chance to notice a stray file or a
+# second box's work before the one irreversible step in the loop.
+test_push_shows_the_preview_when_asking() {
+	commit_on dev refs/heads/dev "visible work" c.txt visible >/dev/null
+	# Not a terminal, so the confirm is skipped and the push proceeds — the preview must still print.
+	cbx push
+	ok
+	has "would go to origin"
+	has "visible work"
 }
 
 test_push_named_branch() {
@@ -1154,6 +1170,91 @@ test_service_dead_window_is_not_up() {
 	cbx svcs; has "dier         DEAD(1)"
 	# …and `up` starts it again instead of refusing. This is the recovery path an agent needs.
 	cbx up dier; ok; has "had exited (status 1)"; has "started dier"
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+	unset TMUX_SESSION
+}
+
+# RUNNING IS NOT USABLE. A process can hold its port, answer most endpoints and still be no use to a
+# client with a deadline — a pinchtab whose /health took 3s was up, authenticated and driving Chrome
+# while every agent box was told "server is not running", and nothing on the hub disagreed because
+# nothing on the hub had ever asked. `ready=` asks. It REPORTS ONLY: no waiting, no restarting.
+test_service_ready_probe() {
+	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
+	cat > "$FIX/services/quick" <<-'EOF'
+		description=answers at once
+		command=sleep 600
+		ready=true
+	EOF
+	cat > "$FIX/services/sick" <<-'EOF'
+		description=running, but not serving
+		command=sleep 600
+		ready=false
+	EOF
+	# The case that matters: the probe RETURNS, just too late to be any use.
+	cat > "$FIX/services/slow" <<-'EOF'
+		description=answers, slowly
+		command=sleep 600
+		ready=sleep 1
+		ready_warn_ms=200
+		ready_timeout=5
+	EOF
+	# …and one that never returns at all: it must be SLOW, not a hung `svcs`.
+	cat > "$FIX/services/hung" <<-'EOF'
+		description=never answers
+		command=sleep 600
+		ready=sleep 30
+		ready_timeout=1
+	EOF
+	export TMUX_SESSION="mustertest-$$"
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
+	cbx up quick >/dev/null; cbx up sick >/dev/null; cbx up slow >/dev/null; cbx up hung >/dev/null
+	cbx svcs; ok
+	has "quick        up"
+	has "sick         up(UNREADY)"
+	has "slow         up(SLOW"
+	has "hung         up(SLOW"
+	# A service with no ready= is reported exactly as before — this must not turn "no probe" into a fault.
+	cat > "$FIX/services/plain" <<-'EOF'
+		description=no probe declared
+		command=sleep 600
+	EOF
+	cbx up plain >/dev/null; cbx svcs; has "plain        up"
+	# `ready <svc>`: the number, and a non-zero status a script can branch on.
+	cbx ready quick; ok; has "ready=ok"
+	cbx ready sick;  notok; has "ready=UNREADY"
+	cbx ready slow;  notok; has "ready=SLOW"; has "ANSWERS, just slowly"
+	cbx ready plain; ok;    has "declares no ready="
+	# A DOWN service is not probed into looking ready.
+	cbx down sick >/dev/null; cbx ready sick; notok; has "is down"
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+	unset TMUX_SESSION
+}
+
+# The dashboard repaints on a timer, so the probe is memoised — otherwise `q` would run every
+# service's ready= command every few seconds, which for a browser probe is a real load.
+test_service_ready_is_cached() {
+	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
+	# The probe APPENDS a line, so the file counts how many times it actually ran.
+	cat > "$FIX/services/counted" <<-EOF
+		description=counts its probes
+		command=sleep 600
+		ready=echo x >> $FIX/probes.txt
+	EOF
+	export TMUX_SESSION="mustertest-$$"
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
+	: > "$FIX/probes.txt"
+	cbx up counted >/dev/null
+	# Two overview renders (the dashboard's own path) run the probe once; `svcs` forces a fresh one.
+	OUT="$(cbx q --text 2>&1)"; RC=$?
+	OUT="$(cbx q --text 2>&1)"; RC=$?
+	ok
+	eq "$(wc -l < "$FIX/probes.txt")" "1" "a cached read must not re-run the probe"
+	cbx svcs >/dev/null
+	eq "$(wc -l < "$FIX/probes.txt")" "2" "svcs must force a fresh probe"
 	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
 	unset TMUX_SESSION
 }
@@ -2251,6 +2352,7 @@ run "merge: its rebase prompt covers that too"     test_merge_rebase_prompt_cove
 
 run "push: nothing to push"                        test_push_nothing_to_do
 run "push: dev to origin"                          test_push_dev
+run "push: without -y the preview shows"           test_push_shows_the_preview_when_asking
 run "push: a named branch"                         test_push_named_branch
 run "push: rejects an unknown branch"              test_push_rejects_unknown_branch
 run "pull: fast-forwards from origin"              test_pull_fast_forward
@@ -2274,6 +2376,8 @@ run "svcs: built-in manifests + override"          test_svcs_builtin_and_overrid
 run "svcs: up and down a service"                  test_service_up_down
 run "svcs: a failed start leaves readable output"  test_service_output_is_captured
 run "svcs: a dead service is not 'up'"            test_service_dead_window_is_not_up
+run "svcs: ready= says running vs usable"          test_service_ready_probe
+run "svcs: the ready probe is memoised"            test_service_ready_is_cached
 
 run "aliases: forward to the hub"                   test_aliases_forward_to_the_hub
 run "aliases: ssh vs mosh transport split"         test_aliases_transport_split

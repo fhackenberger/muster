@@ -9,6 +9,22 @@ The `pinchtab` skill (installed alongside this one) is upstream's and documents 
 accessibility-ref workflow and the HTTP API. **Read it first — this file only adds what is different
 here, and what its docs do not cover.**
 
+## "server at hub:9867 is not running" usually means SLOW, not down
+
+The pinchtab CLI prints that whenever its **preflight** (a `/health` call) does not answer in time —
+so a server that is up, authenticated and serving every other endpoint produces it too, and the
+message names the wrong thing. Before believing it, ask the server directly:
+
+```sh
+pinchtab health                       # no preflight deadline: succeeds against a merely-slow server
+curl -sS -o /dev/null -w '%{time_total}\n' -H "Authorization: Bearer $PINCHTAB_TOKEN" \
+     "$PINCHTAB_SERVER/health"        # how slow, in seconds
+```
+
+If `health` works, it is latency: tell your reviewer, who can see it on the hub as
+`muster ready pinchtab` / `muster svcs` (it shows `up(SLOW 3.0s)`). Do NOT conclude the browser is
+unavailable and verify against fixtures — that is the failure this browser exists to prevent.
+
 ## Where the browser is
 
 `pinchtab server` runs as a **hub service**, autostarted at boot (`muster ls` shows it; `muster

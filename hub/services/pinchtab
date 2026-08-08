@@ -10,3 +10,10 @@ description=pinchtab server (headless Chrome bridge)
 # start a service for it, and a box that finds pinchtab down concludes the page is broken.
 autostart=true
 command=pinchtab server
+# USABLE, not merely running. `pinchtab health` drives the browser, which is exactly what the CLI's
+# own preflight does before nav/session-create — so this probe fails when agents would fail, and the
+# hub says so instead of a box two containers away reporting "server is not running". 500ms because a
+# healthy probe is single-digit ms; anything approaching a second is already eating client deadlines.
+ready=pinchtab health
+ready_timeout=5
+ready_warn_ms=500

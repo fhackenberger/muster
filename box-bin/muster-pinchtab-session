@@ -98,6 +98,18 @@ esac
 tmp="$(mktemp "${FILE}.XXXXXX")" || die "cannot write next to $FILE"
 if ! pinchtab session create --agent-id "$AGENT_ID" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
 	rm -f "$tmp"
+	# WHY THIS ASKS `health` FIRST. "server is not running" is what the pinchtab CLI says when its
+	# PREFLIGHT does not answer in time — which is also what a server that is up, authenticated and
+	# merely SLOW produces. That sent a whole evening after a dead server that was serving fine (a
+	# 3.4GB browser profile had taken /health from 303ms to 3s). `health` has no such deadline, so if
+	# it succeeds here the server is up and the problem is latency, and saying so is the difference
+	# between "check the hub's pinchtab" and "check how long the hub's pinchtab takes".
+	if pinchtab health >/dev/null 2>&1; then
+		die "the pinchtab server ANSWERS but was too slow for the session-create preflight.
+     It is up and reachable at ${PINCHTAB_SERVER:-127.0.0.1} — this is latency, not a dead server.
+     On the hub: 'muster ready pinchtab' prints the probe time, 'muster logs pinchtab --tail 50' the rest.
+     A browser profile that has grown large is the usual cause."
+	fi
 	die "could not create a session — is the pinchtab server reachable?
      PINCHTAB_SERVER=${PINCHTAB_SERVER:-<unset, so the CLI falls back to 127.0.0.1>}
      On a muster stack the server runs on the hub — ask your reviewer to check: up pinchtab"

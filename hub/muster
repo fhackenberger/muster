@@ -9,6 +9,8 @@ set -euo pipefail
 #
 # Usage:
 #   $SELF svcs | services                     # list dev services (declared in hub-services/) + state
+#   $SELF ready <service>                     # is it USABLE? runs the manifest's ready= probe,
+#                                             #   with timing — 'up' only means it is running
 #   $SELF up   <service>                      # start a service in its tmux window
 #   $SELF down <service>                      # stop it
 #   $SELF logs <service>|gitd                 # attach that service window (Ctrl-b d to detach)
@@ -95,7 +97,7 @@ set -euo pipefail
 # working — `$SELF ls` and `$SELF status` show busy | waiting | idle per box. Add --force to interrupt.
 #   $SELF pull [--rebase]                     # bring dev up to date with origin (merge by default)
 #   $SELF push [-y]                           # push dev to the real origin (shows a --stat preview and
-#                                           #   asks first; -y skips the question)
+#                                           #   asks first; -y skips BOTH the preview and the question)
 #
 #   $SELF golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
 #   $SELF golden seal <id>                    # finish a staged golden you fixed up by hand
@@ -375,6 +377,12 @@ review_pager() {
 #                to run while it is up (a torn snapshot otherwise). Was the hard-coded backend/frontend.
 #   autostart    (optional) true = started automatically at hub boot (`$SELF autostart`, from entrypoint).
 #   description  (optional) shown by `$SELF svcs`.
+#   ready        (optional) a command that answers "is this service USABLE", not merely running —
+#                e.g. `pinchtab health`. Run by `$SELF svcs` / `$SELF ready <svc>`; REPORTING ONLY,
+#                nothing waits for it or restarts anything. $VAR/$(…) as in `command`.
+#   ready_timeout   (optional) seconds before the probe counts as SLOW (default 5).
+#   ready_warn_ms   (optional) a probe slower than this, but returning, is SLOW too (default 1000) —
+#                the state that matters, because a client with a shorter deadline calls it DOWN.
 
 # Parse one manifest into SVC_* globals. Returns 1 (no such manifest) / 2 (no command) / 0 (ok).
 # The stack's manifest for a name, else muster's own. Overriding is by FILENAME, so a project that
@@ -389,6 +397,7 @@ svc_load() {
 	local name="$1" file line key val
 	file="$(svc_file "$name")" || file=""
 	SVC_COMMAND=""; SVC_WORKDIR=""; SVC_WRITES_REPO=""; SVC_AUTOSTART=""; SVC_DESCRIPTION=""
+	SVC_READY=""; SVC_READY_TIMEOUT=""; SVC_READY_WARN_MS=""
 	[ -f "$file" ] || return 1
 	while IFS= read -r line || [ -n "$line" ]; do
 		case "$line" in ''|'#'*) continue ;; esac
@@ -402,10 +411,124 @@ svc_load() {
 			writes_repo) SVC_WRITES_REPO="$val" ;;
 			autostart)   SVC_AUTOSTART="$val" ;;
 			description) SVC_DESCRIPTION="$val" ;;
+			# USABLE is not the same fact as RUNNING, and only the service knows how to tell. A
+			# process can hold its port, answer some endpoints and still be no use to the thing that
+			# depends on it — a pinchtab whose /health took 3s was up, authenticated and driving
+			# Chrome, while every agent was told "server is not running" because the CLI's preflight
+			# gave up first. Nothing on the hub disagreed, because nothing on the hub had ever asked.
+			ready)          SVC_READY="$val" ;;
+			ready_timeout)  SVC_READY_TIMEOUT="$val" ;;
+			ready_warn_ms)  SVC_READY_WARN_MS="$val" ;;
 		esac
 	done < "$file"
 	[ -n "$SVC_COMMAND" ] || return 2
 	return 0
+}
+
+# ------------------------------------------------------------------ readiness
+#
+# REPORTING ONLY. Nothing here starts, stops or waits for anything: `ready=` answers "is this service
+# any use right now", `svcs` shows it, and what to do about it stays yours. That line is the whole
+# feature — the evening this came from was spent proving, from a box, that a server the hub called
+# `up` was answering /sessions in 1ms and /health in 3s.
+#
+# States, printed by svc_ready_state: ok | SLOW(<n>s) | UNREADY | (empty when no ready= is declared).
+# SLOW is deliberately distinct from UNREADY: a probe that RETURNS, late, is the case that misleads —
+# it looks healthy from every angle except the one with a deadline.
+SVC_READY_TIMEOUT_DEFAULT=5
+SVC_READY_WARN_MS_DEFAULT=1000
+# How long a cached verdict is reused. `q` repaints on a timer and must not run a probe per repaint;
+# `svcs` is typed by a human and forces a fresh one.
+SVC_READY_TTL=15
+
+svc_ready_cache() { printf '%s/ready/%s\n' "$STATE" "$1"; }
+
+# "<state> <ms>" for a service, running its probe. Empty output when the manifest declares none.
+svc_ready_probe() {
+	local svc="$1" t0 t1 ms rc cmd to warn
+	svc_load "$svc" || return 0
+	[ -n "$SVC_READY" ] || return 0
+	to="${SVC_READY_TIMEOUT:-$SVC_READY_TIMEOUT_DEFAULT}"
+	warn="${SVC_READY_WARN_MS:-$SVC_READY_WARN_MS_DEFAULT}"
+	cmd="$SVC_READY"
+	[ -n "$SVC_WORKDIR" ] && cmd="cd $SVC_WORKDIR && $cmd"
+	t0="$(date +%s%N)"
+	# `timeout` rather than a bare run: a probe that HANGS must not hang `svcs`, and 124 is how we
+	# learn it did. Output is dropped — this is a verdict, not a log; `logs <svc>` is for reading.
+	timeout "$to" bash -lc "$cmd" >/dev/null 2>&1; rc=$?
+	t1="$(date +%s%N)"
+	ms=$(( (t1 - t0) / 1000000 ))
+	if [ "$rc" = 124 ]; then printf 'SLOW %s\n' "$ms"
+	elif [ "$rc" != 0 ];  then printf 'UNREADY %s\n' "$ms"
+	elif [ "$ms" -gt "$warn" ]; then printf 'SLOW %s\n' "$ms"
+	else printf 'ok %s\n' "$ms"
+	fi
+}
+
+# Same, memoised for SVC_READY_TTL seconds. force=1 skips the cache (what `svcs` and `ready` pass).
+svc_ready_state() {
+	local svc="$1" force="${2:-0}" f age now out
+	f="$(svc_ready_cache "$svc")"
+	mkdir -p "${f%/*}" 2>/dev/null || true
+	if [ "$force" != 1 ] && [ -f "$f" ]; then
+		now="$(date +%s)"; age=$(( now - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+		[ "$age" -lt "$SVC_READY_TTL" ] && { cat "$f"; return 0; }
+	fi
+	out="$(svc_ready_probe "$svc")"
+	[ -n "$out" ] || { rm -f "$f"; return 0; }
+	printf '%s\n' "$out" > "$f"
+	printf '%s\n' "$out"
+}
+
+# The column `svcs`/`q` print: up | up(SLOW 3.0s) | up(UNREADY) | DEAD(n) | down.
+svc_state_label() {
+	local svc="$1" force="${2:-0}" st ms
+	if svc_dead "$svc"; then printf 'DEAD(%s)\n' "$(svc_exit_status "$svc")"; return 0; fi
+	svc_running "$svc" || { printf 'down\n'; return 0; }
+	read -r st ms <<< "$(svc_ready_state "$svc" "$force")"
+	case "${st:-}" in
+		SLOW)    printf 'up(SLOW %s.%ss)\n' "$((ms / 1000))" "$(( (ms % 1000) / 100 ))" ;;
+		UNREADY) printf 'up(UNREADY)\n' ;;
+		*)       printf 'up\n' ;;
+	esac
+}
+
+# ONE LINE ON THE OVERVIEW, and only when something is wrong. This is what the whole feature is for:
+# the screen you already stare at says "pinchtab up(SLOW 3.0s)" instead of you learning it from an
+# agent, two containers away, reporting the wrong component. Cached (see SVC_READY_TTL) because this
+# renders on every repaint and a browser probe is not free. A merely-`down` service is not a warning:
+# services are on-demand by design, and shouting about the ones you chose not to run trains you to
+# ignore the line.
+svc_trouble_line() {
+	local svc st out=""
+	for svc in $(svc_names); do
+		st="$(svc_state_label "$svc")"
+		case "$st" in up|down) continue ;; esac
+		out="${out}${out:+, }${svc} ${st}"
+	done
+	[ -n "$out" ] || return 0
+	printf '  %s⚠ services: %s%s  %s($SELF ready <svc> for the timing, $SELF logs <svc> --tail 50)%s\n' \
+		"$C_B$C_YEL" "$out" "$C_RESET" "$C_DIM" "$C_RESET"
+}
+
+# `<cli> ready <svc>` — the verdict on stdout, non-zero when it is not ok, for a script or a person
+# who wants the number rather than the column.
+svc_ready_cmd() {
+	[ $# -ge 1 ] || die "ready needs a service name ('$SELF svcs' lists them)"
+	local svc="$1" st ms
+	svc_load "$svc" || die "unknown service '$svc'"
+	[ -n "$SVC_READY" ] || { echo "$SELF: $svc declares no ready= probe — 'up' only means its command is running"; return 0; }
+	if ! svc_running "$svc"; then
+		echo "$SELF: $svc is $(svc_state_label "$svc" 1)"
+		return 1
+	fi
+	read -r st ms <<< "$(svc_ready_state "$svc" 1)"
+	echo "$SELF: $svc ready=$st (${ms}ms, probe: $SVC_READY)"
+	case "$st" in
+		ok) return 0 ;;
+		SLOW) echo "     it ANSWERS, just slowly — a client with a shorter deadline will report it as down." >&2; return 1 ;;
+		*) return 1 ;;
+	esac
 }
 
 # true/1/yes/on -> success; anything else (incl. empty) -> failure.
@@ -519,12 +642,8 @@ svc_list() {
 		flags=""
 		svc_truthy "$SVC_AUTOSTART"   && flags="${flags}autostart "
 		svc_truthy "$SVC_WRITES_REPO" && flags="${flags}writes-repo "
-		local state
-		if svc_running "$svc"; then state=up
-		elif svc_dead "$svc"; then state="DEAD($(svc_exit_status "$svc"))"
-		else state=down
-		fi
-		printf '  %-12s %-5s %s%s\n' "$svc" "$state" \
+		# force=1: `svcs` is typed by a person who wants the truth now, not a cached verdict.
+		printf '  %-12s %-14s %s%s\n' "$svc" "$(svc_state_label "$svc" 1)" \
 			"${flags:+[$flags] }" "${SVC_DESCRIPTION:-}"
 	done
 	[ "$any" = 1 ] || echo "  (none — drop a manifest in $HUB_SERVICES_DIR; see hub-services.example)"
@@ -901,6 +1020,8 @@ status_overview() {
 			"$C_B" "$wtb" "$C_RESET" "$C_YEL" "$DEV" "$C_RESET" "$wtd"
 		todo+=("$SELF minto $wtb --landed   # finish the merge you started (or --abort)")
 	done
+
+	svc_trouble_line
 
 	# The queue lives INSIDE the overview (rather than beside it) so one screen answers both "who is
 	# waiting on me" and "what do I do about it" — `$SELF q --text` still prints the bare table.
@@ -2838,10 +2959,17 @@ push() {
 	# Show exactly what leaves the hub before it leaves. A push is the one irreversible step in the
 	# loop (agents' work is public from here on), and it is easy to have merged more than you meant —
 	# so the per-commit --stat is the last chance to notice a stray file or a second box's work.
-	echo "$SELF: $ahead commit(s) would go to origin/$DEV:"
-	# `|| true`: quitting the pager early SIGPIPEs git, and pipefail would otherwise abort the push
-	# right there — pressing 'q' must mean "seen enough", not "cancelled".
-	git_ log --stat --oneline "origin/$DEV..$DEV" | review_pager || true
+	#
+	# -y SKIPS THE LISTING TOO, not just the question. The listing exists to inform the answer; with
+	# the answer already given it is output nobody reads — and worse, it goes through the PAGER, so a
+	# scripted `push -y` on a terminal could sit in `less` waiting for a keypress that is not coming.
+	# One flag, one meaning: no prompt and none of the exposition that leads up to it.
+	if [ -z "$yes" ]; then
+		echo "$SELF: $ahead commit(s) would go to origin/$DEV:"
+		# `|| true`: quitting the pager early SIGPIPEs git, and pipefail would otherwise abort the push
+		# right there — pressing 'q' must mean "seen enough", not "cancelled".
+		git_ log --stat --oneline "origin/$DEV..$DEV" | review_pager || true
+	fi
 	# Only ask when someone is there to answer: piped/cron use keeps the old non-interactive behaviour.
 	if [ -z "$yes" ] && [ -t 0 ] && [ -t 1 ]; then
 		read -r -p "$SELF: push these $ahead commit(s) to origin/$DEV? [y/N] " reply
@@ -3112,6 +3240,7 @@ case "$cmd" in
 	down)   [ $# -ge 1 ] || die "down needs a service ($SELF svcs to list)"; svc_down "$1" ;;
 	logs)   [ $# -ge 1 ] || die "logs needs a service ($SELF svcs to list)"; svc_logs "$@" ;;
 	svcs|services) svc_list ;;
+	ready)  svc_ready_cmd "$@" ;;
 	autostart)     svc_autostart ;;
 	box)      box_new "$@" ;;
 	kill)     box_kill "$@" ;;

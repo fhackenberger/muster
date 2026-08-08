@@ -15,6 +15,14 @@
 #                (it writes into the repo, so a snapshot taken mid-run would be torn).
 #   autostart    (optional) true → started automatically at hub boot (via `cbx autostart`).
 #   description  (optional) shown by `cbx svcs`.
+#   ready        (optional) a command answering "is this service USABLE", not merely running — the
+#                two are different facts, and only the service knows how to tell them apart. `cbx
+#                svcs` shows the verdict (`up`, `up(SLOW 3.0s)`, `up(UNREADY)`) and `cbx ready <svc>`
+#                prints the timing. REPORTING ONLY: nothing waits on it, nothing is restarted.
+#   ready_timeout   (optional) seconds before the probe is called SLOW (default 5).
+#   ready_warn_ms   (optional) a probe that RETURNS but takes longer than this is SLOW too (default
+#                1000). That is the state worth naming: a client with a shorter deadline of its own
+#                reports such a service as DOWN, from wherever it happens to be running.
 
 description=Spring backend (bootRun) with the aspectj weaver javaagent
 writes_repo=true

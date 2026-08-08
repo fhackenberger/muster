@@ -535,6 +535,7 @@ Start dev services on demand and manage boxes — all via the `cbx` alias:
 
 ```sh
 cbx svcs              # list the dev services declared in hub-services/ + their state
+cbx ready pinchtab    # is it USABLE (not just running)? prints the probe's timing
 cbx up backend        # start one (any service that has a hub-services/<name> manifest)
 cbx up frontend
 cbx up pinchtab
@@ -569,6 +570,18 @@ command=gradle -x test build && gradle :app:bootRun -PbootRunExtraJvmArgs="-java
 | `writes_repo` | Optional. `true` → the service writes into the checkout, so `cbx golden snapshot` refuses while it's up (a mid-run snapshot would be torn). This replaced the old hard-coded backend/frontend guard. |
 | `autostart` | Optional. `true` → started automatically when the hub boots. |
 | `description` | Optional. Shown by `cbx svcs`. |
+| `ready` | Optional. A command answering **"is this service usable"**, which is not the same fact as "is it running" — only the service knows how to tell. Run by `cbx svcs` and `cbx ready <svc>`; **reporting only**, nothing waits on it or restarts anything. |
+| `ready_timeout` | Optional, default 5s. Longer than this and the probe counts as SLOW (it is killed, so a hung probe can never hang `cbx svcs`). |
+| `ready_warn_ms` | Optional, default 1000. A probe that **returns**, but slower than this, is SLOW too. |
+
+**Why `ready=` exists, and why SLOW is its own state.** `up` means the command is still running. It
+does not mean anything depending on the service can use it — and the gap between those is where a
+whole class of failures hides. A pinchtab whose `/health` had slowed to 3s (an unbounded browser
+profile) was up, authenticated, and driving Chrome, while every agent box was told *"server at
+hub:9867 is not running"*, because the pinchtab CLI's own preflight gave up first. Nothing on the hub
+disagreed, because nothing on the hub had ever asked. `cbx svcs` now shows `up(SLOW 3.0s)`, and the
+overview prints a one-line `⚠ services:` warning when anything is DEAD, SLOW or UNREADY — the probe
+is cached for 15s so the repainting dashboard doesn't run it every frame.
 
 Two things make this work where the old `*_CMD` env vars did:
 
