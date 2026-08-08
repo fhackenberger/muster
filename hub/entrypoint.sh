@@ -229,6 +229,32 @@ if [ -d "$(dirname "$PT_CONFIG")" ]; then
 	fi
 fi
 
+# A FRESH BROWSER PROFILE ON EVERY HUB BOOT. The profile lives in the bind-mounted ~/.pinchtab, so it
+# is the one part of the browser that survives a recreate — and nothing prunes it. On hetzner1 it
+# reached 3.4GB (3.0GB of Chrome HTTP cache), which is not merely disk: pinchtab's /health touches the
+# profile, so it went from 303ms to 3.0s, and 3s is longer than the deadline every pinchtab CLI
+# command gives its preflight. Agents in boxes then got "server at <hub>:9867 is not running" for a
+# server that was up, authenticated and driving Chrome fine — and gave up on browser verification,
+# which is the exact failure this browser exists to prevent.
+#
+# Reaping is right beyond the disk: this browser reviews a frontend whose bundles change all day, so a
+# cached asset or a surviving service worker means an agent can verify THE WRONG BUILD and report
+# success. A profile per hub lifetime makes "what the browser shows" always the build that is running.
+# The cost is a Chrome first-run (~1s) and forgetting cookies/history nobody relies on — the stack's
+# AnonymousLogin means no session to lose. Set MUSTER_PINCHTAB_KEEP_PROFILE=1 if you do want a
+# persistent browser.
+#
+# ONLY profiles/ — config.json holds the token both sides agree on and sessions.json the boxes' tabs;
+# removing ~/.pinchtab wholesale would take those with it. Before `muster autostart` on purpose: that
+# is the one moment the server is guaranteed not to be running, so nothing is deleted under it.
+PT_PROFILES="$(dirname "$PT_CONFIG")/profiles"
+if [ "${MUSTER_PINCHTAB_KEEP_PROFILE:-0}" = 1 ]; then
+	echo "hub: keeping the pinchtab browser profile (MUSTER_PINCHTAB_KEEP_PROFILE=1)" >&2
+elif [ -d "$PT_PROFILES" ]; then
+	echo "hub: reaping the pinchtab browser profile ($(du -sh "$PT_PROFILES" 2>/dev/null | cut -f1)) — it is rebuilt on first use" >&2
+	rm -rf "$PT_PROFILES" || echo "hub: could not remove $PT_PROFILES" >&2
+fi
+
 # pinchtab's own Claude skill, from the image into the shared ~/.claude every box mounts. Baking it
 # straight into that path would be pointless — it is a bind mount, so the image's copy is hidden.
 # Overwritten on every boot on purpose: it is upstream's file, versioned with the image, and a local

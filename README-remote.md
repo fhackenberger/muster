@@ -113,6 +113,18 @@ an agent's browser addressable from the hub: the session token is written into t
 the hub mounts read-only, and any request carrying it lands on that box's current tab. No tab id is
 tracked anywhere.
 
+**The browser profile is thrown away on every hub boot** (the entrypoint removes `~/.pinchtab/profiles`
+before `muster autostart`; `MUSTER_PINCHTAB_KEEP_PROFILE=1` opts out). It is bind-mounted, so it is the
+one piece of browser state that outlives a recreate, and nothing else prunes it — one stack reached
+3.4 GB, almost all of it Chrome's unbounded HTTP cache. That is not just disk: pinchtab's `/health`
+touches the profile, so it slowed from 303 ms to **3 s**, which is longer than the deadline the pinchtab
+CLI gives its own preflight — and every box command that preflights (`nav`, `session create`) then
+failed with *"server at hub:9867 is not running"* for a server that was up, authenticated and driving
+Chrome fine. Agents concluded the browser was unavailable and verified without one. A fresh profile per
+hub lifetime also means a review can never be done against a cached copy of a bundle that has changed;
+cap the cache in the pinchtab config (`browser.extraFlags: --disk-cache-size=…`) to bound the growth
+*between* boots.
+
 ```sh
 cbx peek  work1                  # screenshot of that box's tab -> a path on the hub
 cbx peek  work1 --snap           # the accessibility tree instead: the text the agent actually reads

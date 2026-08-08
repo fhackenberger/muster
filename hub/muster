@@ -424,13 +424,31 @@ svc_names() {
 	return 0
 }
 
-svc_running() { tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$1"; }
+# UP MEANS THE COMMAND IS STILL RUNNING, NOT THAT A WINDOW EXISTS. svc_up deliberately keeps the
+# window open after the command exits so the failure stays readable ("press enter to close") — which
+# means a service that CRASHED leaves a window behind, and a window was all this used to look at. A
+# dead pinchtab then reads as `up` in `svcs`, `up pinchtab` answers "already running" and does
+# nothing, and the agent is left with a browser that half-works and no way to fix it. The window
+# wrapper drops the exit status in a file; its presence is what tells the two apart.
+svc_exit_file() { printf '%s.exit\n' "$(svc_log "$1")"; }
+svc_window() { tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$1"; }
+svc_running() { svc_window "$1" && [ ! -f "$(svc_exit_file "$1")" ]; }
+# A window whose command exited and is sitting on its "press enter" — the state that has to be
+# distinguishable from both up and down, because it is the one that needs saying out loud.
+svc_dead() { svc_window "$1" && [ -f "$(svc_exit_file "$1")" ]; }
+svc_exit_status() { cat "$(svc_exit_file "$1")" 2>/dev/null || echo '?'; }
 
 svc_up() {
 	local svc="$1" cmd
 	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc or $HUB_SERVICES_BUILTIN/$svc ('$SELF svcs' lists them)"
 	if svc_running "$svc"; then
 		echo "$SELF: $svc already running ($SELF logs $svc to view)"; return 0
+	fi
+	# Crashed, window still open: START IT. Refusing with "already running" is what turned a service
+	# that died into one nobody could bring back without knowing to kill a tmux window first.
+	if svc_dead "$svc"; then
+		echo "$SELF: $svc had exited (status $(svc_exit_status "$svc")) — restarting it ($SELF logs $svc --tail 200 for why)"
+		tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null || true
 	fi
 	# The hub's entrypoint starts this server at boot and every service is a WINDOW in it. If it is
 	# gone, tmux would fail with a bare "error connecting to /tmp/tmux-<uid>/default", which says
@@ -441,14 +459,17 @@ svc_up() {
 	cmd="$SVC_COMMAND"
 	# workdir overrides the window's default cwd; unquoted so $REPO/$VAR expand in the launch shell.
 	[ -n "$SVC_WORKDIR" ] && cmd="cd $SVC_WORKDIR && $cmd"
-	local log; log="$(svc_log "$svc")"
+	local log exitf; log="$(svc_log "$svc")"; exitf="$(svc_exit_file "$svc")"
 	mkdir -p "${log%/*}"; : > "$log"
+	# Clear LAST run's death certificate before this one starts, or the service comes up already
+	# looking dead.
+	rm -f "$exitf"
 	# Keep the window alive after the command exits so failures stay readable — and SAY the exit
 	# status and where the output is. "backend exited" alone sends you hunting through a pane you may
 	# not be able to scroll: nested tmux eats the scroll keys, and the window is gone once you press
 	# enter. $? is captured on the very next line, before echo overwrites it.
 	tmux new-window -t "$TMUX_SESSION" -n "$svc" -c "$REPO" \
-		"bash -lc $(printf '%q' "$cmd; _rc=\$?; echo; echo \"[muster] $svc exited (status \$_rc) — full output: $log\"; echo '[muster] read it from anywhere with: $SELF logs $svc --tail 200'; echo '[muster] scroll here: Shift-PageUp — inside another tmux, press Ctrl-b twice first'; echo '[muster] press enter to close this window'; read _")"
+		"bash -lc $(printf '%q' "$cmd; _rc=\$?; printf '%s\\n' \"\$_rc\" > $exitf; echo; echo \"[muster] $svc exited (status \$_rc) — full output: $log\"; echo '[muster] read it from anywhere with: $SELF logs $svc --tail 200'; echo '[muster] scroll here: Shift-PageUp — inside another tmux, press Ctrl-b twice first'; echo '[muster] press enter to close this window'; read _")"
 	# pipe-pane copies everything the pane shows into a FILE, without touching the process: the service
 	# keeps its tty (so gradle/ng keep their colours and progress), and the output survives both the
 	# scrollback and the window itself. -o toggles it on for this pane only.
@@ -498,7 +519,12 @@ svc_list() {
 		flags=""
 		svc_truthy "$SVC_AUTOSTART"   && flags="${flags}autostart "
 		svc_truthy "$SVC_WRITES_REPO" && flags="${flags}writes-repo "
-		printf '  %-12s %-5s %s%s\n' "$svc" "$(svc_running "$svc" && echo up || echo down)" \
+		local state
+		if svc_running "$svc"; then state=up
+		elif svc_dead "$svc"; then state="DEAD($(svc_exit_status "$svc"))"
+		else state=down
+		fi
+		printf '  %-12s %-5s %s%s\n' "$svc" "$state" \
 			"${flags:+[$flags] }" "${SVC_DESCRIPTION:-}"
 	done
 	[ "$any" = 1 ] || echo "  (none — drop a manifest in $HUB_SERVICES_DIR; see hub-services.example)"

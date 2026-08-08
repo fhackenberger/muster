@@ -1130,6 +1130,34 @@ test_service_output_is_captured() {
 	unset TMUX_SESSION
 }
 
+# A SERVICE THAT DIED MUST NOT REPORT AS UP. The window outlives the command on purpose (the failure
+# has to stay readable), so "a window called pinchtab exists" and "pinchtab is serving" are different
+# facts — and treating them as one is how a crashed pinchtab kept `svcs` saying up while agents got
+# "server at hub:9867 is not running", with `up pinchtab` answering "already running" and doing
+# nothing. It also unblocks golden snapshots, which refuse while a writes_repo service is "running".
+test_service_dead_window_is_not_up() {
+	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
+	cat > "$FIX/services/dier" <<-'EOF'
+		description=dies like a crashed server
+		command=echo serving; false
+	EOF
+	export TMUX_SESSION="mustertest-$$"
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
+	cbx up dier; ok; has "started dier"
+	# The wrapper writes the exit status as the command dies; wait for it rather than race it.
+	local f i; f="$FIX/repo/.git/cbx/logs/dier.exit"
+	for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$f" ] && break; sleep 0.3; done
+	[ -s "$f" ] || fail "no exit status was recorded for a service whose command died"
+	# NOT up — with the status, so the listing itself says what happened.
+	cbx svcs; has "dier         DEAD(1)"
+	# …and `up` starts it again instead of refusing. This is the recovery path an agent needs.
+	cbx up dier; ok; has "had exited (status 1)"; has "started dier"
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+	unset TMUX_SESSION
+}
+
 # =====================================================================  laptop aliases
 #
 # These build command STRINGS for ssh; the bugs they can have are quoting and PTY bugs. See
@@ -2245,6 +2273,7 @@ run "svcs: lists the manifests"                    test_svcs_lists_manifests
 run "svcs: built-in manifests + override"          test_svcs_builtin_and_override
 run "svcs: up and down a service"                  test_service_up_down
 run "svcs: a failed start leaves readable output"  test_service_output_is_captured
+run "svcs: a dead service is not 'up'"            test_service_dead_window_is_not_up
 
 run "aliases: forward to the hub"                   test_aliases_forward_to_the_hub
 run "aliases: ssh vs mosh transport split"         test_aliases_transport_split
@@ -2293,7 +2322,44 @@ run "broker: messages target claude's pane"        test_broker_box_target
 run "broker: a killed box frees its port slot"     test_broker_slot_reuse
 run "broker: box-env, expanded per box"            test_broker_box_env
 run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
+# THE BROWSER PROFILE IS REAPED ON EVERY HUB BOOT, and only the profile. It lives in the bind-mounted
+# ~/.pinchtab, so it is the one browser state that survives a recreate and nothing else prunes it: on
+# one stack it reached 3.4GB, which took pinchtab's /health from 303ms to 3.0s — longer than the
+# deadline every pinchtab CLI command gives its preflight, so agents in boxes were told the server was
+# "not running" and stopped verifying in a browser at all. Reaping also means a review can never be
+# done against a cached copy of a bundle that has since changed.
+#
+# The test runs the entrypoint's own block, extracted from the file, so it cannot drift from what
+# boots. Two invariants: profiles/ goes, and config.json (the shared token) + sessions.json stay.
+test_hub_reaps_the_pinchtab_profile() {
+	fixture
+	# The block, verbatim from the entrypoint: PT_PROFILES= up to the fi that closes it.
+	local blk="$FIX/reap.sh"
+	awk '/^PT_PROFILES=/,/^fi$/' "$ROOT/hub/entrypoint.sh" > "$blk"
+	[ -s "$blk" ] || fail "could not find the reap block in hub/entrypoint.sh"
+	mkdir -p "$FIX/pt/profiles/default/Default/Cache"
+	printf '{"server":{"token":"t"}}\n' > "$FIX/pt/config.json"
+	printf '{}\n'                       > "$FIX/pt/sessions.json"
+	head -c 4096 /dev/zero               > "$FIX/pt/profiles/default/Default/Cache/data_1"
+	PT_CONFIG="$FIX/pt/config.json" bash "$blk" >/dev/null 2>&1
+	[ ! -d "$FIX/pt/profiles" ] || fail "the profile survived the boot"
+	[ -f "$FIX/pt/config.json" ]   || fail "config.json was taken with it — that is the shared token"
+	[ -f "$FIX/pt/sessions.json" ] || fail "sessions.json was taken with it — those are the boxes' tabs"
+	# Opt out, for a browser someone wants to keep logged in.
+	mkdir -p "$FIX/pt/profiles/default"
+	MUSTER_PINCHTAB_KEEP_PROFILE=1 PT_CONFIG="$FIX/pt/config.json" bash "$blk" >/dev/null 2>&1
+	[ -d "$FIX/pt/profiles" ] || fail "MUSTER_PINCHTAB_KEEP_PROFILE=1 must keep the profile"
+	ok
+	# ORDERING, which is what makes the delete safe: before autostart, the server cannot be running.
+	local reap auto
+	reap="$(grep -n '^PT_PROFILES=' "$ROOT/hub/entrypoint.sh" | head -1 | cut -d: -f1)"
+	auto="$(grep -n '^muster autostart' "$ROOT/hub/entrypoint.sh" | head -1 | cut -d: -f1)"
+	[ -n "$reap" ] && [ -n "$auto" ] || fail "could not locate the reap and autostart lines"
+	[ "$reap" -lt "$auto" ] || fail "the profile is reaped AFTER autostart — pinchtab would be using it"
+}
+
 run "pinchtab: the hub seeds a token"              test_pinchtab_token
+run "pinchtab: the hub reaps the profile"           test_hub_reaps_the_pinchtab_profile
 run "pinchtab: the broker hands boxes that token"  test_broker_pinchtab_token
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 
