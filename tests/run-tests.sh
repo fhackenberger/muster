@@ -1248,9 +1248,10 @@ test_service_ready_is_cached() {
 	fi
 	: > "$FIX/probes.txt"
 	cbx up counted >/dev/null
-	# Two overview renders (the dashboard's own path) run the probe once; `svcs` forces a fresh one.
-	OUT="$(cbx q --text 2>&1)"; RC=$?
-	OUT="$(cbx q --text 2>&1)"; RC=$?
+	# Two overview renders run the probe once; `svcs` forces a fresh one. `st` IS the overview the live
+	# dashboard repaints (status_overview) — `q --text` is deliberately the bare table and never probes.
+	OUT="$(cbx st 2>&1)"; RC=$?
+	OUT="$(cbx st 2>&1)"; RC=$?
 	ok
 	eq "$(wc -l < "$FIX/probes.txt")" "1" "a cached read must not re-run the probe"
 	cbx svcs >/dev/null

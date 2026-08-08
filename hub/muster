@@ -553,7 +553,9 @@ svc_names() {
 # dead pinchtab then reads as `up` in `svcs`, `up pinchtab` answers "already running" and does
 # nothing, and the agent is left with a browser that half-works and no way to fix it. The window
 # wrapper drops the exit status in a file; its presence is what tells the two apart.
-svc_exit_file() { printf '%s.exit\n' "$(svc_log "$1")"; }
+# NOT "$(svc_log …).exit": svc_log already ends in .log, so that spelled <svc>.log.exit — a name
+# nobody would guess when looking for it by hand.
+svc_exit_file() { printf '%s/logs/%s.exit\n' "$STATE" "$1"; }
 svc_window() { tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep -qx "$1"; }
 svc_running() { svc_window "$1" && [ ! -f "$(svc_exit_file "$1")" ]; }
 # A window whose command exited and is sitting on its "press enter" — the state that has to be
