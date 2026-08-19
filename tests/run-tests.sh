@@ -1894,13 +1894,30 @@ test_broker_spawn_route_resumes() {
 # conflict ("the container name /box-<project>-<box> is already in use"), which reads like a broken
 # stack — but `muster box <name>` on a box you already have is just "put me back in it". The response
 # has to be the SAME SHAPE as a spawn's, because the alias attaches to whatever comes back.
+#
+# `docker` is shimmed rather than assumed: box_state() shells out to it, and the suite must run
+# where there is no docker at all (Jenkins, which is exactly where this test started dying with
+# FileNotFoundError). Letting the real docker answer would also make the result depend on whether the
+# machine happens to have a container of that name. The shim reports whatever DOCKER_SHIM_STATE says
+# for the box's own container and answers like docker does for anything else, so both branches of
+# box_state — a live box and no box — are covered here rather than only the empty one.
 test_broker_box_already_up() {
 	fixture
-	mkdir -p "$FIX/boxes/work1"
+	mkdir -p "$FIX/boxes/work1" "$FIX/bin"
 	printf 'g-001\n' > "$FIX/boxes/work1/golden"
 	printf '2\n'     > "$FIX/boxes/work1/slot"
 	printf 'FRONTEND 4211 4300\nBACKEND  8091 8900\n' > "$FIX/port-forwards"
-	OUT="$(BOXROOT="$FIX/boxes" PORT_FORWARDS_FILE="$FIX/port-forwards" PROJECT_NAME=myapp \
+	cat > "$FIX/bin/docker" <<-'EOF'
+		#!/bin/bash
+		# Stand-in for docker(1): only `inspect -f {{.State.Status}} <container>` is used here.
+		[ "$1" = inspect ] || { echo "docker shim: unexpected: $*" >&2; exit 64; }
+		if [ "${!#}" = "box-myapp-work1" ] && [ -n "${DOCKER_SHIM_STATE:-}" ]; then
+			echo "$DOCKER_SHIM_STATE"; exit 0
+		fi
+		echo "Error: No such object: ${!#}" >&2; exit 1
+	EOF
+	chmod +x "$FIX/bin/docker"
+	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" PORT_FORWARDS_FILE="$FIX/port-forwards" PROJECT_NAME=myapp \
 		python3 - "$BROKER_PY" <<'PYEOF' 2>&1
 import importlib.util, os, sys
 os.environ.setdefault("BROKER_TOKEN", "t")
@@ -1917,6 +1934,9 @@ assert info["slot"] == 2, info
 assert info["forwards"] == {"FRONTEND": 4302, "BACKEND": 8902}, info
 # No container of that name: nothing to reattach to, and the spawn route falls through to create_box.
 assert b.box_state("work1") == "", b.box_state("work1")
+# One that IS up reports its state, which is what sends the route down the reattach branch.
+os.environ["DOCKER_SHIM_STATE"] = "running"
+assert b.box_state("work1") == "running", b.box_state("work1")
 print("ok")
 PYEOF
 )"; RC=$?
@@ -2302,6 +2322,189 @@ PYEOF
 	ok; has ok
 }
 
+# THE MOUNTS TABLE GRAMMAR. One file feeds two very different consumers (this parser for the boxes,
+# gen-hub-mounts.sh for the hub), so a mode one side accepts and the other does not is the failure to
+# guard. A bad mode must NAME the line, because the table is edited on the server by hand.
+test_broker_parse_mounts() {
+	fixture
+	mkdir -p "$FIX/golden/g-1/docs"
+	cat > "$FIX/mounts" <<-'EOF'
+		# comments and blanks ignored
+
+		CHECKOUT                          repo             rw
+		./data/npm-cache                  .npm             rw     rw
+		./data/gradle-cache               .gradle          rw     cow-keep
+		./data/scratch                    scratch          rw     cow
+		./data/sealed                     sealed           rw     overlay
+		/var/jenkins_home/.m2/repository  .m2/repository   ro     ro
+		docs                              reference        -      ro
+		./data/hub-only                   hubonly          rw     -
+	EOF
+	OUT="$(STACK_DIR="$FIX/stack" MOUNTS_FILE="$FIX/mounts" python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+fix = sys.argv[2]
+golden = os.path.join(fix, "golden", "g-1")
+rows, dst, ro = b.parse_mounts(golden)
+assert (dst, ro) == ("/home/dev/repo", False), (dst, ro)
+modes = {d: m for _s, d, m in rows}
+assert modes == {"/home/dev/.npm": "rw", "/home/dev/.gradle": "cow-keep",
+                 "/home/dev/scratch": "cow", "/home/dev/sealed": "overlay",
+                 "/home/dev/.m2/repository": "ro", "/home/dev/reference": "ro"}, modes
+srcs = {d: s for s, d, _m in rows}
+assert srcs["/home/dev/.gradle"] == os.path.join(fix, "stack", "data/gradle-cache"), srcs
+assert srcs["/home/dev/reference"] == os.path.join(golden, "docs"), srcs   # golden-relative, confined
+# A cow row's per-box directory is named by the SAME rule as the overlay uppers, so what a box owns
+# is predictable from the table alone.
+assert b.overlay_key("/home/dev/.gradle") == "gradle", b.overlay_key("/home/dev/.gradle")
+assert b.overlay_key("/home/dev/.m2/repository") == "m2-repository"
+# A bad mode names the file and the LINE, and lists what is allowed.
+open(os.path.join(fix, "bad"), "w").write("./x  y  rw  sideways\n")
+b.MOUNTS_FILE = os.path.join(fix, "bad")
+try:
+    b.parse_mounts(golden)
+    raise SystemExit("a bad box mode should have been refused")
+except ValueError as e:
+    assert ":1:" in str(e) and "sideways" in str(e), e
+    assert "cow" in str(e) and "cow-keep" in str(e), e
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+	# The HUB half of the same table: cow is box-side only, and must never be quietly rendered into
+	# compose.override.yml as a plain bind mount of the ORIGINAL — that would put the hub and the boxes
+	# back on one directory, which is the deadlock the mode exists to avoid.
+	printf './data/gradle-cache  .gradle  cow-keep  cow-keep\n' > "$FIX/mounts-badhub"
+	OUT="$("$ROOT/gen-hub-mounts.sh" "$FIX/mounts-badhub" "$FIX/override.yml" 2>&1)"; RC=$?
+	notok; has "box-side only"
+}
+
+# THE COW COPY. `cp` is shimmed rather than run for real: the suite has to pass on any filesystem (a CI
+# runner's overlayfs has no reflink at all), and the shim can assert that --reflink=always is what the
+# broker asks for, which the real cp could not. Everything around the copy — staging, the keep/fresh
+# lifecycle, what a failure leaves behind — is the logic under test.
+test_broker_cow_copy() {
+	fixture
+	mkdir -p "$FIX/bin" "$FIX/src/sub" "$FIX/boxes/work1"
+	echo hub > "$FIX/src/sub/from-hub"
+	cat > "$FIX/bin/cp" <<-'EOF'
+		#!/bin/bash
+		# Stand-in for cp(1): insists on the flags the broker must pass, then does a plain copy.
+		case " $* " in *" --reflink=always "*) ;; *) echo "cp shim: no --reflink=always in: $*" >&2; exit 64 ;; esac
+		[ -n "${COW_CP_FAIL:-}" ] && { echo "cp: failed to clone: Operation not supported" >&2; exit 1; }
+		args=(); for a in "$@"; do [ "$a" = --reflink=always ] || args+=("$a"); done
+		exec /bin/cp "${args[@]}"
+	EOF
+	chmod +x "$FIX/bin/cp"
+	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+fix, src = sys.argv[2], os.path.join(sys.argv[2], "src")
+dst = "/home/dev/.gradle"
+box = os.path.join(fix, "boxes", "work1")
+
+# The name is derived from the destination, like the overlay uppers.
+path = b.make_cow_copy("work1", src, dst, keep=True)
+assert path == os.path.join(box, "cow-gradle"), path
+assert open(os.path.join(path, "sub", "from-hub")).read() == "hub\n"
+assert not os.path.exists(path + ".new"), "the staging dir must not survive a successful copy"
+
+# cow-keep is the box's WARM CACHE: a plain recreate must not throw its work away…
+open(os.path.join(path, "mine"), "w").write("box\n")
+b.make_cow_copy("work1", src, dst, keep=True)
+assert os.path.exists(os.path.join(path, "mine")), "cow-keep must survive a recreate"
+# …and nothing flows back to the hub.
+assert not os.path.exists(os.path.join(src, "mine")), "a box's copy must never touch the source"
+# --fresh is the ONE thing that re-seeds it (the same flag that discards the overlay uppers).
+b.make_cow_copy("work1", src, dst, keep=True, fresh=True)
+assert not os.path.exists(os.path.join(path, "mine")), "--fresh must re-copy a cow-keep"
+
+# Plain cow is scratch: re-copied from the hub on every spawn.
+open(os.path.join(path, "mine"), "w").write("box\n")
+b.make_cow_copy("work1", src, dst, keep=False)
+assert not os.path.exists(os.path.join(path, "mine")), "cow must be re-copied on every spawn"
+
+# A FAILING COPY IS LOUD, and leaves the previous copy alone rather than a half-written one. Silence
+# here would mean --reflink=always had quietly become a multi-GB byte copy per box.
+open(os.path.join(path, "mine"), "w").write("box\n")
+os.environ["COW_CP_FAIL"] = "1"
+try:
+    b.make_cow_copy("work1", src, dst, keep=False)
+    raise SystemExit("a failed reflink copy must not be swallowed")
+except RuntimeError as e:
+    assert src in str(e) and path in str(e), e            # both paths, so it can be checked
+    assert "reflink" in str(e) and "filesystem" in str(e), e
+assert os.path.exists(os.path.join(path, "mine")), "a failed copy must not destroy the old one"
+assert not os.path.exists(path + ".new"), "a failed copy must not leave staging behind"
+del os.environ["COW_CP_FAIL"]
+
+# The reap list: a copy is a DIRECTORY, not a docker volume, so it has its own record — kill_box would
+# otherwise run `docker volume rm /some/path`. Only mode `cow` goes on it.
+b.record_cow_dirs("work1", [os.path.join(box, "cow-scratch")])
+assert b.created_cow_dirs("work1") == [os.path.join(box, "cow-scratch")], b.created_cow_dirs("work1")
+# Rewritten on every spawn, so flipping a row cow -> cow-keep stops the reaping.
+b.record_cow_dirs("work1", [])
+assert b.created_cow_dirs("work1") == [], b.created_cow_dirs("work1")
+# It drives an rm -rf, so anything outside the box's own directory is dropped rather than executed.
+open(os.path.join(box, "cow-temp"), "w").write("/etc\n%s\n" % os.path.join(box, "cow-scratch"))
+assert b.created_cow_dirs("work1") == [os.path.join(box, "cow-scratch")], b.created_cow_dirs("work1")
+# A box that has none (no file at all) is not an error.
+assert b.created_cow_dirs("neverspawned") == []
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# --fresh REACHES EVERY UPPER LAYER THE BOX OWNS, not just the checkout's. `fresh_upper` was threaded
+# to the checkout overlay and nowhere else, so a box recreated for a clean start silently came back
+# with every `overlay` row's private writes intact — which is not what "discard upper" says, and not
+# what `golden retire`/`golden snapshot` mean when they use the flag. `docker` is shimmed because
+# _overlay_volume creates a real volume and the suite must run without docker (Jenkins has none).
+test_broker_fresh_clears_shared_uppers() {
+	fixture
+	mkdir -p "$FIX/boxes/work1" "$FIX/bin"
+	cat > "$FIX/bin/docker" <<-'EOF'
+		#!/bin/bash
+		# Stand-in for docker(1): volume create/rm always succeed, nothing else is used here.
+		[ "$1" = volume ] || { echo "docker shim: unexpected: $*" >&2; exit 64; }
+		exit 0
+	EOF
+	chmod +x "$FIX/bin/docker"
+	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" PROJECT_NAME=myapp \
+		python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+fix = sys.argv[2]
+lower = os.path.join(fix, "lower"); os.makedirs(lower, exist_ok=True)
+upper = os.path.join(fix, "boxes", "work1", "ovl-gradle", "upper")
+dst = "/home/dev/.gradle"
+
+# An ordinary recreate keeps the row's upper layer — it is the box's warm cache.
+b.make_shared_overlay_volume("work1", lower, dst)
+open(os.path.join(upper, "warm"), "w").write("cached\n")
+b.make_shared_overlay_volume("work1", lower, dst)
+assert os.path.exists(os.path.join(upper, "warm")), "a plain recreate must keep the warm cache"
+
+# --fresh discards it, exactly as it does the checkout's upper layer.
+b.make_shared_overlay_volume("work1", lower, dst, fresh_upper=True)
+assert not os.path.exists(os.path.join(upper, "warm")), "--fresh must clear an overlay row's upper"
+assert os.path.isdir(upper), "…and leave a usable (empty) upper behind"
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+	# The flag is worth nothing if create_box does not hand it on — that was the actual bug.
+	grep -q 'make_shared_overlay_volume(name, src, dst, fresh_upper)' "$BROKER_PY" \
+		|| fail "create_box must pass fresh_upper to make_shared_overlay_volume"
+}
+
 # =====================================================================  the run
 
 run "syntax: every script parses"                  test_syntax
@@ -2425,6 +2628,9 @@ run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: messages target claude's pane"        test_broker_box_target
 run "broker: a killed box frees its port slot"     test_broker_slot_reuse
+run "broker: the mounts table grammar"             test_broker_parse_mounts
+run "broker: cow — a private reflinked copy"       test_broker_cow_copy
+run "broker: --fresh clears every upper layer"     test_broker_fresh_clears_shared_uppers
 run "broker: box-env, expanded per box"            test_broker_box_env
 run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
 # THE BROWSER PROFILE IS REAPED ON EVERY HUB BOOT, and only the profile. It lives in the bind-mounted

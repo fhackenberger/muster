@@ -338,8 +338,10 @@ cbx recreate all                                    # boxes: new image + new env
   the same for boxes, keeping each box's upper layer and its claude session.
 - **No golden snapshot needed** for an image or config update — take one only when the repo *tree*
   changed (deps installed, config files edited in `/home/dev/repo`).
-- `cbx recreate all --fresh` additionally discards every box's upper layer. Only use it when you mean
-  to throw uncommitted agent work away.
+- `cbx recreate all --fresh` additionally discards every box's upper layers — the checkout's *and*
+  every `overlay` row's, so what comes back is what a new spawn would give you. Only use it when you
+  mean to throw uncommitted agent work away, and note that it drops the warm caches those rows hold
+  too (a `cow-keep` copy goes the same way; plain `cow` is re-copied on every recreate regardless).
 
 Verify what actually landed, rather than assuming:
 
@@ -1046,17 +1048,44 @@ root-owned table in the stack dir, one row per path with **a mode for each side*
 # <src>                              <dst>            <hub>  <box>
 CHECKOUT                             repo             rw
 ./data/npm-cache                     .npm             rw     rw
-./data/gradle-cache                  .gradle          rw     overlay
+./data/gradle-cache                  .gradle          rw     cow-keep
 /var/jenkins_home/.m2/repository     .m2/repository   ro     ro
 docs                                 reference        -      ro
 ```
 
 `src` is `./x` (stack-relative), `/x` (an absolute host path), or bare `x` (relative to the golden
 and confined to it — box-side only). `dst` is always relative to `/home/dev`, on both sides, which is
-what keeps hub and box paths identical. Modes are `rw`, `ro`, `overlay` (box-side: `src` as a shared
-read-only lower layer with a per-box upper on top — shared content, private writes, upper in
-`data/boxes/<box>/ovl-<key>/`) and `-` (not mounted here). `CHECKOUT <dst> <rw|ro>` is the box's
-working copy: an overlay of the current golden, or the golden itself read-only.
+what keeps hub and box paths identical. `CHECKOUT <dst> <rw|ro>` is the box's working copy: an
+overlay of the current golden, or the golden itself read-only. The modes:
+
+| mode | what the box gets |
+|---|---|
+| `rw` / `ro` | a plain bind mount of `src`, shared with the hub |
+| `overlay` | `src` as a shared read-only **lower** layer with a per-box upper on top (upper in `data/boxes/<box>/ovl-<key>/`, survives kill/recreate). **Box-side only, and only for a source nobody writes to** — see below |
+| `cow` | a **private, writable, reflinked copy** of `src` in `data/boxes/<box>/cow-<key>/`. Re-copied on every spawn/recreate, **deleted on `cbx kill`**. Box-side only |
+| `cow-keep` | the same copy, but **kept** across kill/recreate as the box's warm cache; re-copied only on a `--fresh` spawn. Box-side only. This is the mode for a toolchain cache |
+| `-` | not mounted on this side |
+
+**`overlay` needs an immutable source; a live cache is not one.** The kernel requires a `lowerdir`
+not to change while an overlay is mounted on it. A **golden** satisfies that by construction — it is
+sealed at snapshot time and never written again — which is why the checkout stays an overlay. A
+**cache the hub keeps building against does not**, and the older claim here that this was "harmless
+because artifacts are content-addressed" was simply wrong: gradle's *immutable workspaces*
+(`caches/<ver>/dependencies-accessors/<hash>`) are `rm -rf`'d and renamed over on nearly every hub
+build, and after that the box can still *list* the directory while `rm`/`mv`/`rmdir` fail with
+EIO/ENOENT and the parent reports "Directory not empty". Gradle then spends seconds per build in
+`AssignImmutableWorkspaceStep` ("Could not move inconsistent immutable workspace"). Hence `cow`.
+
+The copy is `cp -a --reflink=always`: on btrfs (`/virtual_machines` is btrfs) it shares extents, so
+it is near-instant and costs almost no disk until something is written, and it needs **no capability
+at all** — unlike a btrfs subvolume snapshot, which would need root. `always`, never `auto`, on
+purpose: if `src` and `data/boxes` ever land on different filesystems the spawn fails with a message
+naming both paths, instead of silently byte-copying a multi-GB tree once per box.
+
+Both `cow` modes are **one-way**: nothing a box writes flows back to the hub, and a long-lived
+`cow-keep` box drifts from the hub's cache until `--fresh` re-seeds it. That was equally true of an
+overlay's upper layer, and it is not to be "fixed" by making the row `rw` — that is the
+cross-container lock deadlock below, back again.
 
 **Why one file for both sides.** The hub and the boxes must agree path-for-path (installed
 dependencies bake absolute paths in), and while the two lists were maintained separately — the hub's
@@ -1129,15 +1158,24 @@ Jenkins pipeline **before** any image is built — a broken `cbx` should never r
   overlayfs checks write permission on the merged inode *before* deciding to copy up, so a
   non-writable golden makes every file unwritable inside the box instead of protecting anything.
 - **`cbx kill` keeps the box's upper layer** on disk, so `cbx box <same name>` reattaches to its
-  uncommitted work. Only `cbx golden snapshot` (and `cbx recreate --fresh`) discards it.
+  uncommitted work. Only `cbx golden snapshot` (and `cbx recreate --fresh`) discards it. The same
+  holds for a `cow-keep` copy; a plain `cow` copy is the one thing `kill` does remove, which is what
+  that mode is for.
 - **One mount table** (`mounts`) — see the section above. The bullet that matters here: `~/.gradle`
-  is shared as an **overlay**, never rw. Gradle holds its cache locks for the *whole build* — and
-  `bootRun` never finishes — handing them over only when the waiting process pings the holder on
-  **localhost**. Between containers that ping cannot arrive, so a `~/.gradle` shared rw with the hub
-  blocked every box's gradle *indefinitely* (`Owner PID: <a pid you can't see>`, waiting on
-  `caches/journal-1`), and "wait and retry" never helped. Any toolchain cache with long-lived locks
-  belongs in `overlay` mode; `~/.npm` is fine shared rw because npm's cacache is content-addressed
-  and concurrency-safe.
+  is **`cow-keep`** — a private reflinked copy per box — never `rw` and (since it is a *live* cache)
+  never `overlay` either.
+  *Never rw:* gradle holds its cache locks for the *whole build* — and `bootRun` never finishes —
+  handing them over only when the waiting process pings the holder on **localhost**. Between
+  containers that ping cannot arrive, so a `~/.gradle` shared rw with the hub blocked every box's
+  gradle *indefinitely* (`Owner PID: <a pid you can't see>`, waiting on `caches/journal-1`), and
+  "wait and retry" never helped.
+  *Never overlay:* the lower layer would be the hub's live cache, which the hub keeps mutating —
+  gradle's immutable workspaces are `rm -rf`'d and renamed over almost every build — and mutating a
+  `lowerdir` under a live overlay wedges the box's view of those directories (EIO/ENOENT on
+  `rm`/`mv`, "Directory not empty"), costing seconds per build in `AssignImmutableWorkspaceStep`.
+  Goldens legitimately stay overlays because they are sealed and never written again; caches must
+  not. Any toolchain cache with long-lived locks belongs in `cow-keep`; `~/.npm` is fine shared rw
+  because npm's cacache is content-addressed and concurrency-safe.
 - **Port forwards (pinchtab browser + own-backend dev loops):** the pinchtab server + Chrome run on
   the **hub**, but each agent runs its OWN dev services inside its box (`ng serve`, and optionally its
   own backend). pinchtab's IDPI allowlist has no wildcard and the browser is in a different netns, so

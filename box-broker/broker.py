@@ -585,8 +585,9 @@ def resolve_src(src, golden):
 
 
 def overlay_key(dst):
-	"""Stable per-entry key for an overlay row, derived from its destination: '/home/dev/.gradle' ->
-	'gradle'. Names the box's upper dir (data/boxes/<box>/ovl-<key>) and its docker volume."""
+	"""Stable per-entry key for a per-box mount row, derived from its destination:
+	'/home/dev/.gradle' -> 'gradle'. Names the box's upper dir (data/boxes/<box>/ovl-<key>) and its
+	docker volume, and the box's private copy for a cow row (data/boxes/<box>/cow-<key>)."""
 	key = dst[len(HOME_IN):].strip("/") if dst.startswith(HOME_IN) else dst.strip("/")
 	key = re.sub(r"[^a-zA-Z0-9._-]", "-", key.replace("/", "-")).lstrip(".-")
 	return key or "root"
@@ -602,6 +603,12 @@ def parse_mounts(golden):
 	                                        rw / ro   plain bind mount
 	                                        overlay   <src> as a read-only LOWER layer with a per-box
 	                                                  upper on top: shared content, private writes.
+	                                                  Box side only. Only for a SEALED lower layer.
+	                                        cow       a private reflinked copy of <src> for this box,
+	                                                  writable, thrown away when the box is killed.
+	                                                  Box side only.
+	                                        cow-keep  the same copy, but kept across kill/recreate as
+	                                                  the box's warm cache; re-copied only on --fresh.
 	                                                  Box side only.
 	                                        -         not mounted on that side
 	This function reads the BOX column; gen-hub-mounts.sh renders the hub column into
@@ -626,8 +633,8 @@ def parse_mounts(golden):
 				src, dst, box_mode = parts[0], parts[1], parts[3]
 				if box_mode == "-":
 					continue
-				if box_mode not in ("rw", "ro", "overlay"):
-					raise ValueError(f"bad box mode {box_mode!r} (rw|ro|overlay|-)")
+				if box_mode not in ("rw", "ro", "overlay", "cow", "cow-keep"):
+					raise ValueError(f"bad box mode {box_mode!r} (rw|ro|overlay|cow|cow-keep|-)")
 				rows.append((resolve_src(src, golden), safe_dst(dst), box_mode))
 			except ValueError as exc:
 				raise ValueError(f"{MOUNTS_FILE}:{lineno}: {exc}") from None
@@ -665,28 +672,112 @@ def make_overlay_volume(name, golden, fresh_upper=False):
 	                       os.path.join(box_dir, "upper"), os.path.join(box_dir, "work"), fresh_upper)
 
 
-def make_shared_overlay_volume(name, lower, dst):
+def make_shared_overlay_volume(name, lower, dst, fresh_upper=False):
 	"""An `overlay` row from the mounts table: `lower` shared read-only underneath, this box's own
-	upper layer on top — shared content, private writes.
+	upper layer on top — shared content, private writes. The upper layer SURVIVES kill/recreate (it is
+	the box's warm cache) and dies with the box dir; `--fresh` discards it, the same flag with the same
+	meaning as for the checkout's upper layer.
 
-	This is how a per-toolchain cache is given to a box (`~/.gradle` is the case that forced it).
-	Gradle guards its caches with cross-process locks that are held for the WHOLE build — and
-	`bootRun` never finishes — and are only handed over when the waiting process pings the holder on
-	LOCALHOST. Between containers that ping cannot arrive, so a `~/.gradle` shared rw with the hub let
-	one long-running build block every box's gradle forever ("Owner PID: <a pid in another
-	namespace>", waiting on caches/journal-1). With the overlay the artifacts are still shared (read
-	straight out of the lower layer, never copied), while every lock file, journal entry and daemon
-	registry write is copied up into the box's own upper layer.
+	IT USED TO SURVIVE --fresh TOO, because fresh_upper reached the checkout overlay and nothing else.
+	Nothing said so — `cbx recreate --fresh` documents itself as "discard upper", and a box brought
+	back for a clean start silently kept every mounts row's private writes. What --fresh promises is a
+	box in the state a new spawn would give you, so it has to reach every upper layer the box owns.
 
-	The upper layer SURVIVES kill/recreate (it is the box's warm cache) and dies with the box dir. The
-	lower layer is the hub's live cache, which the hub keeps writing to; overlayfs wants a stable lower
-	layer, but a cache is the one case where that is harmless — artifacts are content-addressed and
-	written by rename, and anything a box finds inconsistent it re-fetches into its own upper."""
+	ONLY FOR A LOWER LAYER NOBODY WRITES TO. The kernel requires a lowerdir to be immutable while an
+	overlay is mounted on it; if it is mutated the merged view is undefined. A golden qualifies —
+	it is sealed at snapshot time and never touched again. A LIVE CACHE DOES NOT: see
+	make_cow_copy() for what that cost us, and use `cow`/`cow-keep` for anything the hub keeps
+	writing to."""
 	box_dir = os.path.join(BOXROOT, name)
 	key = overlay_key(dst)
 	return _overlay_volume(f"{box_volume(name)}-{key}", lower,
 	                       os.path.join(box_dir, f"ovl-{key}", "upper"),
-	                       os.path.join(box_dir, f"ovl-{key}", "work"))
+	                       os.path.join(box_dir, f"ovl-{key}", "work"), fresh_upper)
+
+
+def cow_dir(name, dst):
+	"""Where a `cow`/`cow-keep` row's private copy lives: data/boxes/<box>/cow-<key>. Same naming rule
+	as the overlay uppers (overlay_key), so what a box owns is predictable from the mounts table."""
+	return os.path.join(BOXROOT, name, f"cow-{overlay_key(dst)}")
+
+
+def make_cow_copy(name, src, dst, keep, fresh=False):
+	"""A `cow` / `cow-keep` row: give this box a PRIVATE, WRITABLE, reflinked copy of `src` instead of
+	an overlay on top of it. Returns the host path to bind-mount at `dst`.
+
+	WHY, and why not an overlay. `overlay` was how toolchain caches were shared (see
+	make_shared_overlay_volume — gradle takes cache locks for the whole build and hands them over only
+	over localhost, so a cache shared `rw` between containers wedges forever). But the lower layer of
+	such a row is the hub's LIVE cache, and the hub keeps building. overlayfs requires an immutable
+	lowerdir while an overlay is mounted; the old rationale here — "a cache is content-addressed and
+	written by rename, so mutating it is harmless" — is wrong for gradle's IMMUTABLE WORKSPACES.
+	caches/<ver>/dependencies-accessors/<hash> (DefaultDependenciesAccessors) is rm -rf'd and renamed
+	over on essentially every hub build, and once that happens under a live overlay the box can still
+	list the directory but rm/mv/rmdir on it fail with EIO/ENOENT while the parent reports "Directory
+	not empty". Gradle then spends ~5s per build in AssignImmutableWorkspaceStep ("Could not move
+	inconsistent immutable workspace"). A private copy has no lower layer to be mutated underneath it.
+
+	WHY REFLINK. /virtual_machines is btrfs, so `cp -a --reflink=always` shares extents: the copy is
+	near-instant and costs almost no disk until one side writes. It needs no capability at all — an
+	ordinary FICLONE ioctl any uid can issue — whereas the other obvious mechanism, a btrfs subvolume
+	snapshot, needs root (or an unprivileged-snapshot mount option) and a subvolume to begin with.
+	`--reflink=always` deliberately, never `auto`: a silent fallback to a byte copy would be a
+	multi-GB copy per box across up to PORT_FORWARD_SLOTS boxes, and the point is to hear about it.
+
+	LIFECYCLE, mirroring the overlay uppers:
+	  keep=False (`cow`)       re-copied from the hub on every spawn/recreate, removed by kill_box.
+	  keep=True  (`cow-keep`)  copied once, then kept across kill/recreate as the box's warm cache;
+	                           only a --fresh spawn (fresh=True, same flag that discards the upper
+	                           layers) throws it away and copies again.
+
+	NOTHING FLOWS BACK. The box writes only into its own copy; the hub never sees it, and a long-lived
+	`cow-keep` box drifts from the hub's cache until it is refreshed with --fresh. That was equally
+	true of the overlay's upper layer. It is not a bug to be fixed by making the row `rw` — that is
+	the cross-container lock deadlock, back again."""
+	path = cow_dir(name, dst)
+	if keep and not fresh and os.path.isdir(path):
+		return path                       # the box's warm cache; only --fresh re-copies it
+	staging = path + ".new"
+	shutil.rmtree(staging, ignore_errors=True)
+	os.makedirs(staging, exist_ok=True)
+	# `src/.` so the CONTENTS land in staging (an existing dst would otherwise get src nested inside).
+	r = subprocess.run(["cp", "-a", "--reflink=always", os.path.join(src, "."), staging],
+	                   capture_output=True, text=True)
+	if r.returncode != 0:
+		shutil.rmtree(staging, ignore_errors=True)
+		raise RuntimeError(
+			f"reflink copy for box {name!r} failed: cp -a --reflink=always {src}/. -> {path}: "
+			f"{r.stderr.strip() or r.stdout.strip()}. Most likely {src} and {os.path.dirname(path)} "
+			f"are not on the same reflink-capable filesystem (btrfs/xfs with reflink), or {src} does "
+			f"not exist. Not falling back to a full copy on purpose — that would copy the whole tree "
+			f"once per box.")
+	shutil.rmtree(path, ignore_errors=True)
+	os.rename(staging, path)              # only now is the copy complete; a crash leaves .new, not path
+	try:
+		os.chown(path, int(BOX_UID), int(BOX_GID))
+	except OSError:
+		pass                              # best-effort, exactly like the golden/anchor chowns
+	return path
+
+
+def record_cow_dirs(name, dirs):
+	"""Remember this box's DELETE-ON-KILL copies (mode `cow`). A copy is a plain directory, not a
+	docker volume, so it cannot ride along in `volumes` — kill_box would try `docker volume rm` on a
+	path. Rewritten on every spawn, so flipping a row cow -> cow-keep stops it being reaped."""
+	with open(os.path.join(BOXROOT, name, "cow-temp"), "w") as fh:
+		fh.write("".join(d + "\n" for d in dirs))
+
+
+def created_cow_dirs(name):
+	"""The delete-on-kill copies recorded for this box. Confined to the box's own directory: this list
+	drives an rm -rf, and the file is written by us, but a path outside data/boxes/<name> is a bug we
+	would rather skip than execute."""
+	path = os.path.join(BOXROOT, name, "cow-temp")
+	if not os.path.exists(path):
+		return []
+	root = os.path.join(BOXROOT, name) + os.sep
+	with open(path) as fh:
+		return [ln.strip() for ln in fh if ln.strip() and ln.strip().startswith(root)]
 
 
 def record_volumes(name, vols):
@@ -1021,7 +1112,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		"MUSTER_WORKDIR": checkout_dst,
 		"MUSTER_GOLDEN": os.path.basename(golden),
 	})
-	mounts, vols = [], []
+	mounts, vols, cow_temp = [], [], []
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
 	if checkout_ro:
 		mounts.append(f"{golden}:{checkout_dst}:ro")
@@ -1040,11 +1131,19 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 			os.makedirs(src, exist_ok=True)
 			os.chown(src, int(BOX_UID), int(BOX_GID))
 		if mode == "overlay":
-			vols.append(make_shared_overlay_volume(name, src, dst))
+			vols.append(make_shared_overlay_volume(name, src, dst, fresh_upper))
 			mounts.append(f"{vols[-1]}:{dst}")
+		elif mode in ("cow", "cow-keep"):
+			# A private reflinked copy, bind-mounted rw. `cow` is re-copied here on every spawn and
+			# reaped by kill_box; `cow-keep` is the box's warm cache and only --fresh re-copies it.
+			path = make_cow_copy(name, src, dst, keep=(mode == "cow-keep"), fresh=fresh_upper)
+			if mode == "cow":
+				cow_temp.append(path)
+			mounts.append(f"{path}:{dst}")
 		else:
 			mounts.append(f"{src}:{dst}" + (":ro" if mode == "ro" else ""))
 	record_volumes(name, vols)
+	record_cow_dirs(name, cow_temp)
 	env = dict(os.environ)
 	env.update(
 		MUSTER_HEADLESS="1",
@@ -1126,11 +1225,15 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 def kill_box(name):
 	"""Remove the box + its forwarders + every overlay volume it was given. The upper layers are
 	deliberately LEFT on disk: they hold any work the agent had not pushed plus its warm caches, and
-	`cbx box <same name>` reattaches to them."""
+	`cbx box <same name>` reattaches to them. The one thing that does go is a `cow` row's private
+	copy — that mode exists to say "this is scratch, throw it away"; `cow-keep` stays, like an upper
+	layer, and is only rebuilt by a --fresh spawn."""
 	stop_forwarders(name)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True, check=True)
 	for vol in created_volumes(name):
 		subprocess.run(["docker", "volume", "rm", vol], capture_output=True, text=True)
+	for d in created_cow_dirs(name):
+		shutil.rmtree(d, ignore_errors=True)
 	return {"killed": name}
 
 

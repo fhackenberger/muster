@@ -23,7 +23,8 @@ set -euo pipefail
 #   $SELF kill <name>                         # remove an agent box (its upper layer is kept)
 #   $SELF purge <name> [--force]              # …and remove it FOR GOOD: upper layer, caches, session.
 #                                           #   Refuses while its handoff is still unreviewed.
-#   $SELF recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = discard upper)
+#   $SELF recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = drop its
+#                                             # upper layers: the checkout AND every overlay row)
 #   $SELF ls                                  # list services + boxes (broker)
 #   $SELF forwards [box]                      # re-establish the hub-loopback socat forwards
 #

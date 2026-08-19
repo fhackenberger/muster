@@ -46,6 +46,7 @@ while read -r src dst hub _box _rest || [ -n "${src:-}" ]; do
 		rw) suffix="" ;;
 		ro) suffix=":ro" ;;
 		overlay) echo "gen-hub-mounts: $MOUNTS:$lineno: 'overlay' is box-side only (the hub owns the lower layer)" >&2; exit 1 ;;
+		cow|cow-keep) echo "gen-hub-mounts: $MOUNTS:$lineno: '$hub' is box-side only (the hub owns the original the boxes copy)" >&2; exit 1 ;;
 		*) echo "gen-hub-mounts: $MOUNTS:$lineno: bad hub mode '$hub' (rw|ro|-)" >&2; exit 1 ;;
 	esac
 	case "$src" in

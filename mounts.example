@@ -31,10 +31,29 @@
 #     mode  rw       plain bind mount, writable
 #           ro       plain bind mount, read-only
 #           overlay  <src> as a shared read-only LOWER layer with a per-box upper layer on top:
-#                    shared content, private writes. BOX SIDE ONLY. Use it for any toolchain cache
-#                    whose tool takes long-lived locks — see the gradle note below. The upper layer
-#                    lives in data/boxes/<box>/ovl-<key>/ and survives kill/recreate.
+#                    shared content, private writes. BOX SIDE ONLY. The upper layer lives in
+#                    data/boxes/<box>/ovl-<key>/ and survives kill/recreate.
+#                    ONLY FOR A SOURCE NOBODY WRITES TO while boxes are up: the kernel requires an
+#                    immutable lowerdir, and a golden (sealed at snapshot time) is the case that
+#                    qualifies. For a LIVE cache the hub keeps writing to, use cow-keep — see the
+#                    gradle note below.
+#           cow      a PRIVATE, WRITABLE copy of <src> for this box, made with
+#                    `cp -a --reflink=always` (btrfs/xfs: shared extents, so near-instant and near-
+#                    zero disk until something is written). BOX SIDE ONLY. Lives in
+#                    data/boxes/<box>/cow-<key>/, is re-copied from <src> on every spawn/recreate,
+#                    and is DELETED when the box is killed. Scratch space that starts from the hub's
+#                    current state.
+#           cow-keep the same private copy, KEPT across kill/recreate as the box's warm cache (like
+#                    an overlay upper layer). It is re-copied from <src> only on a --fresh spawn.
+#                    BOX SIDE ONLY. This is the right mode for a toolchain cache.
 #           -        not mounted on this side
+#
+#   Both cow modes are one-way: nothing a box writes ever flows back to the hub, and a long-lived
+#   cow-keep box drifts from the hub's cache until it is refreshed with --fresh. That was equally
+#   true of `overlay`'s upper layer. Do NOT "fix" it by making the row rw — that is the
+#   cross-container lock deadlock below, back again.
+#   `--reflink=always`, never `auto`: if <src> and data/boxes are not on the same reflink-capable
+#   filesystem the spawn FAILS loudly instead of quietly byte-copying multi-GB trees once per box.
 #
 # Default (this file absent or empty): just the overlay checkout at /home/dev/repo.
 
@@ -44,12 +63,21 @@ CHECKOUT                             repo             rw
 # npm cache: genuinely shared rw. npm's cacache is content-addressed and safe for concurrent writers.
 ./data/npm-cache                     .npm             rw     rw
 
-# Gradle home: shared as an OVERLAY, never rw. Gradle holds its cache locks for the whole build —
-# and `bootRun` never finishes — handing them over only when the waiting process pings the holder on
-# LOCALHOST. Between containers that ping cannot arrive, so a shared rw ~/.gradle made one long build
-# block every box's gradle forever ("Owner PID: <a pid you can't see>", waiting on caches/journal-1).
-# The overlay keeps the downloads shared and makes locks/journal/daemon-registry per box.
-./data/gradle-cache                  .gradle          rw     overlay
+# Gradle home: a private reflinked COPY per box (cow-keep), never rw and never overlay.
+#   never rw:      gradle holds its cache locks for the whole build — and `bootRun` never finishes —
+#                  handing them over only when the waiting process pings the holder on LOCALHOST.
+#                  Between containers that ping cannot arrive, so a shared rw ~/.gradle made one long
+#                  build block every box's gradle forever ("Owner PID: <a pid you can't see>",
+#                  waiting on caches/journal-1).
+#   never overlay: the lower layer would be the hub's LIVE cache, and overlayfs requires an immutable
+#                  lowerdir. Gradle's immutable workspaces (caches/<ver>/dependencies-accessors/<hash>)
+#                  are rm -rf'd and renamed over on nearly every hub build; once that happens under a
+#                  live overlay the box can list the directory but rm/mv/rmdir fail with EIO/ENOENT
+#                  ("Directory not empty"), and every build then burns seconds in
+#                  AssignImmutableWorkspaceStep "Could not move inconsistent immutable workspace".
+# cow-keep gives each box its own writable copy — free on btrfs (reflink shares the extents), warm
+# across kill/recreate, re-seeded from the hub only on a --fresh spawn.
+./data/gradle-cache                  .gradle          rw     cow-keep
 
 # Jenkins' pre-populated Maven repository, read-only on both sides so no build can ever mutate it.
 # This is the one source OUTSIDE the stack dir: the broker cannot see it, docker resolves it on the
@@ -63,3 +91,7 @@ CHECKOUT                             repo             rw
 
 # A read-only box that can look at the code but never change it
 #   CHECKOUT  repo  ro
+
+# Scratch that starts from the hub's current state and dies with the box (re-copied on every spawn,
+# removed by `cbx kill`)
+#   ./data/testdata  testdata  rw  cow
