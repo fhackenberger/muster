@@ -877,6 +877,52 @@ conflicts_between() {
 	printf '%s' "$out" | tail -n +2 | tr '\n' ' '
 }
 
+# Paths a merge would CHANGE IN THE WORKTREE, computed in the object store — nothing is touched.
+# Empty when the merge is a no-op, and when it would conflict (merge-tree exits non-zero then, which
+# is conflicts_between's question, not this one).
+merge_touches() {
+	local tree
+	tree="$(git_ merge-tree --write-tree "$1" "$2" 2>/dev/null)" || return 0
+	git_ diff --name-only HEAD "$tree" 2>/dev/null || true
+}
+
+# WHAT GIT WILL REFUSE TO OVERWRITE: paths that are dirty here AND changed by the merge.
+#
+# conflicts_between answers "do these two branches disagree" — merge-tree, committed tree vs committed
+# tree, blind to the worktree. But git also refuses to START a merge that would write over local
+# changes ("Your local changes to the following files would be overwritten by merge"), and the hub
+# tree is dirty by design: it is what goldens are snapshotted from. So a merge that is perfectly clean
+# branch-to-branch still stops dead, after the preflight has just said nothing about it.
+#
+# Both halves are plumbing, so no porcelain parsing (and no quotePath surprises): `diff --name-only
+# HEAD` covers index AND worktree changes, which is what git compares, so a staged add counts exactly
+# like a modification; untracked files matter too, because a merge that ADDS one is refused as well.
+merge_blockers() {
+	local touched
+	touched="$(merge_touches "$1" "$2")"
+	[ -n "$touched" ] || return 0
+	comm -12 <(printf '%s\n' "$touched" | sort -u) \
+	         <({ git_ diff --name-only HEAD; git_ ls-files --others --exclude-standard; } | sort -u)
+}
+
+# WHY A FAILED `git merge` IS NOT AUTOMATICALLY A CONFLICT. Both of merge()'s merge paths used to
+# answer any non-zero exit with "merge conflicts — resolve them, then --landed". That is wrong for the
+# case git refuses OUTRIGHT (a merge that would overwrite local changes, a broken index): nothing was
+# merged, there is nothing to resolve, and `--landed` would retire the branch and tell the box its
+# work had landed when none of it had. Unmerged index entries are the fact that tells the two apart —
+# they exist after a real conflict, in a plain merge and a --squash alike, never after a refusal.
+# $1 = box, $2 = the flags to repeat once the conflict is committed.
+merge_failed() {
+	if [ -n "$(git_ ls-files --unmerged)" ]; then
+		die "merge conflicts — resolve them in $REPO and commit, then run: $SELF merge '$1'${2:+ $2}   (to retire the branch and tell the box)"
+	fi
+	echo "$SELF: git refused the merge and NOTHING was merged — $DEV is untouched and there is" >&2
+	echo "$SELF: nothing to resolve and nothing to close out. Read git's message above; if it" >&2
+	echo "$SELF: names files, commit those paths yourself (not 'git add -A', not 'git stash')" >&2
+	echo "$SELF: and run $SELF merge again." >&2
+	die "the merge did not start"
+}
+
 # Review state per box: "<agent-ref sha> <dev sha>", both as of your last review. The dev sha is what
 # lets us tell a REBASE apart from new work — after a rebase every commit gets a new sha, so the ref
 # alone always looks changed even when the agent did nothing.
@@ -2202,11 +2248,27 @@ merge() {
 		return 0
 	fi
 	# The hub tree is EXPECTED to carry local setup work (it's what goldens are snapshotted from), so a
-	# dirty tree is not an error here. Just show it and let git decide: it refuses precisely when the
-	# merge would overwrite a file you've modified, which is the only case that actually matters.
+	# dirty tree is not an error here. Show it, and then say whether it is actually in the way — the
+	# note used to promise "the merge aborts only if it would overwrite one" and leave you to find out
+	# which way it went by running it.
 	if [ -n "$(git_ status --porcelain)" ]; then
 		echo "$SELF: note — local changes in $REPO (kept; the merge aborts only if it would overwrite one):" >&2
 		git_ status --short | sed 's/^/  /' >&2
+	fi
+	# …AND HERE IS WHERE IT WOULD. git refuses to start a merge that writes over local changes, so this
+	# is a hard stop, not a prompt: there is no "merge anyway", and finding out from git means reading
+	# an error that says nothing about which of the two trees to fix. Checked BEFORE the conflict
+	# preflight, so we never offer a choice whose every answer is blocked by this.
+	local blockers
+	blockers="$(merge_blockers "$DEV" "$mref_probe")"
+	if [ -n "$blockers" ]; then
+		echo "$SELF: '$box' changes files you have uncommitted changes to, so git will refuse to merge:" >&2
+		printf '  %s\n' $blockers >&2
+		echo "$SELF: nothing has been touched. Commit YOUR OWN work first — 'git add' those specific" >&2
+		echo "$SELF: paths and commit them normally. Do NOT use 'git add -A' (it sweeps up files this" >&2
+		echo "$SELF: project keeps untracked on purpose) and do NOT use 'git stash' (a conflict can" >&2
+		echo "$SELF: then drop it on the floor). Then run: $SELF merge '$box'${squash:+ --squash}${edit:+ --edit}${reword:+ --reword}" >&2
+		die "refusing to merge over uncommitted changes"
 	fi
 	# WOULD IT CONFLICT? Ask before touching anything, because the alternative is finding out by being
 	# left in a half-merged worktree — and the usual answer at that point is "abort and rebase first",
@@ -2292,7 +2354,7 @@ merge() {
 	local -a ed=()
 	[ -n "$edit" ] && ed=(env GIT_EDITOR="${EDITOR:-${VISUAL:-vim}}")
 	if [ -n "$squash" ]; then
-		git_ merge --squash "$ref" || die "merge conflicts — resolve them in $REPO and commit, then run: $SELF merge '$box' --landed   (to retire the branch and tell the box)"
+		git_ merge --squash "$ref" || merge_failed "$box" --landed
 		if [ -n "$edit" ]; then
 			if [ -n "$single" ]; then
 				# One commit: SQUASH_MSG's "Squashed commit of the following:" preamble is noise, so
@@ -2333,7 +2395,7 @@ merge() {
 		# $mref, not $ref: with --reword this is the rewritten chain (same trees, new messages).
 		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$mref" \
 			-m "$msg" -m "Cbx-Box: $box" \
-			|| die "merge conflicts — resolve them in $REPO and 'git commit', then run: $SELF merge '$box'   (to retire the branch and tell the box)"
+			|| merge_failed "$box"
 	fi
 	after="$(git_ rev-parse HEAD)"
 	[ "$before" != "$after" ] || die "nothing was merged — $DEV is unchanged (already up to date?)"

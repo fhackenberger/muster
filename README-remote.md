@@ -786,6 +786,15 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   merged" every time. If you resolved it as a **squash or a hand-written commit** the agent's commits
   are not ancestors of `dev` and nothing can prove it landed — say so with **`cbx merge <box>
   --landed`**. Re-running while conflicts are still unresolved is refused, with both ways out named.
+- **A merge that would write over your own uncommitted changes is refused up front.** The hub's tree
+  is dirty by design, and the conflict preflight is blind to it: `merge-tree` compares committed trees,
+  so a merge can be perfectly clean branch-to-branch and still be refused by git ("Your local changes
+  to the following files would be overwritten by merge"). `cbx merge` now names those files before
+  touching anything. Commit *your own* work by path first — not `git add -A`, which sweeps up the files
+  a project keeps untracked on purpose, and not `git stash`, where a later conflict can drop it. And
+  when a merge does fail, cbx checks for unmerged index entries before calling it a conflict: a merge
+  that never started leaves nothing to resolve, and `--landed` there would retire the branch and tell
+  the box its work had landed when none of it had.
 - **Conflicts surface at push time, not merge time.** Every push is test-merged against `dev` *and*
   against every other live agent branch (`git merge-tree`, no worktree touched), so you learn that
   two agents hit the same lines while you can still tell one of them to rebase.

@@ -646,6 +646,67 @@ test_merge_conflict_leaves_a_way_out() {
 	git_ merge --abort 2>/dev/null
 }
 
+# A DIRTY HUB TREE THE MERGE WOULD WRITE OVER. The hub's checkout is dirty by design — it is what
+# goldens are snapshotted from — and merge-tree's preflight is blind to it: branch-to-branch the merge
+# is clean, and then git refuses to start ("Your local changes to the following files would be
+# overwritten by merge"). The old code printed a note promising it would abort "only if it would
+# overwrite one" and left you to find out which way it went by running it, then reported the refusal
+# as conflicts and pointed at --landed — which would have retired the branch with nothing merged.
+test_merge_refuses_over_dirty_files() {
+	local before
+	commit_on dev refs/agents/work1 "agent: a" a.txt "agent version" >/dev/null
+	before="$(at dev)"
+	printf 'work in progress\n' > "$FIX/repo/a.txt"         # tracked, modified, and in the merge's way
+	cbx merge work1
+	notok
+	has "uncommitted changes"
+	has "a.txt"
+	has "nothing has been touched"
+	hasnt "--landed"                                        # nothing landed, so never suggest it
+	hasnt "merge conflicts"                                 # and it is not a conflict
+	eq "$(at dev)" "$before" "dev must not move"
+	ne "$(at refs/agents/work1)" "" "the branch must stay in the queue"
+	# An UNTRACKED file the merge would ADD is refused by git just the same, so it counts too.
+	git_ checkout -q -- a.txt
+	printf 'mine\n' > "$FIX/repo/new.txt"
+	commit_on "$(at refs/agents/work1)" refs/agents/work1 "agent: new" new.txt "theirs" >/dev/null
+	cbx merge work1
+	notok; has "new.txt"; has "uncommitted changes"
+	eq "$(at dev)" "$before" "dev must not move for an untracked collision either"
+	# A dirty file the merge does NOT touch is none of its business: the merge goes through and the
+	# local change survives it. That is the everyday state of the hub's tree.
+	rm -f "$FIX/repo/new.txt"
+	printf 'unrelated wip\n' > "$FIX/repo/b.txt"
+	box_up work1
+	cbx merge work1
+	ok
+	ne "$(at dev)" "$before" "an unrelated dirty file must not block the merge"
+	eq "$(cat "$FIX/repo/b.txt")" "unrelated wip" "the local change must survive the merge"
+}
+
+# A MERGE THAT FAILS TO START IS NOT A CONFLICT. Still reachable with the preflight above, because
+# that only speaks for merges merge-tree can compute: when the branches themselves conflict there is
+# no merged tree to compare the dirty files against, so a non-terminal run says "merging anyway" and
+# git refuses over the local change instead. Nothing is merged and nothing is left half-done — which
+# is what the old "resolve them, then --landed" advice was most wrong about, since --landed would have
+# retired the branch and told the box its work had landed.
+test_merge_failure_is_not_always_a_conflict() {
+	local before sha
+	sha="$(commit_on dev - "agent: b" b.txt "agent version")"
+	git_ update-ref refs/agents/work1 "$sha"
+	commit_on dev refs/heads/dev "dev: b" b.txt "dev version" >/dev/null
+	before="$(at dev)"
+	printf 'and mine too\n' > "$FIX/repo/b.txt"             # dirty, and both sides changed it
+	cbx merge work1
+	notok
+	has "would CONFLICT in"                                 # the preflight still says its piece…
+	has "NOTHING was merged"                                # …and the failure is reported honestly
+	hasnt "merge conflicts"
+	hasnt "--landed"
+	eq "$(at dev)" "$before" "dev must not move"
+	eq "$(git_ ls-files --unmerged)" "" "nothing may be left half-merged"
+}
+
 # ASK BEFORE THE MESS. A merge that will conflict is worth knowing about while dev is still untouched:
 # the usual answer is "stop and rebase the agent first", and that decision is much cheaper before a
 # half-merged worktree than after one.
@@ -2550,6 +2611,8 @@ run "merge: --undo after a squash says why not"    test_merge_undo_after_squash
 run "merge: refuses a stale dev"                   test_merge_refuses_stale_dev
 run "merge: already-contained closes out"          test_merge_already_contained_closes_out
 run "merge: a conflict leaves a way out"           test_merge_conflict_leaves_a_way_out
+run "merge: refuses over dirty files it would overwrite" test_merge_refuses_over_dirty_files
+run "merge: a failed merge is not always a conflict" test_merge_failure_is_not_always_a_conflict
 run "merge: a conflict asks before touching dev"   test_merge_conflict_asks_first
 run "merge: --reword rewrites messages only"       test_merge_reword_rewrites_messages_only
 run "merge: --reword keeps edits when you quit"    test_merge_reword_keeps_edits_when_you_quit
