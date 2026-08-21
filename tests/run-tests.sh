@@ -2475,7 +2475,13 @@ test_broker_fresh_clears_shared_uppers() {
 		exit 0
 	EOF
 	chmod +x "$FIX/bin/docker"
+	# BOX_UID/BOX_GID are the RUNNING user's here. _overlay_volume hands the upper layer to the box uid
+	# and does NOT swallow the failure — in production the broker is root and an upper the box cannot
+	# write is a broken box, so that is right. But the suite is not root: with the default 1000:1000
+	# this passes only on a machine whose uid happens to be 1000, and fails everywhere else (EPERM on a
+	# CI runner at uid 1001, EINVAL in a user namespace). Same trap as the activity-hooks test below.
 	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" PROJECT_NAME=myapp \
+		BOX_UID="$(id -u)" BOX_GID="$(id -g)" \
 		python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
 import importlib.util, os, sys
 os.environ.setdefault("BROKER_TOKEN", "t")
