@@ -75,11 +75,27 @@ class H(BaseHTTPRequestHandler):
             # RETIRED: a box directory with no container. The real broker derives them from BOXROOT;
             # here they are whatever the test put in RETIRED, which is enough to exercise the listing
             # and `purge`.
+            #
+            # ?sizes=1 IS HONOURED HERE TOO, because the whole point of the flag is that measuring
+            # costs seconds: the real broker walks every file under every retired box. A stub that
+            # always sent a size would let a hub that had stopped asking still print one, and the
+            # regression this guards against — the dashboard quietly going back to paying for sizes
+            # it never displays — would sail through the suite.
+            # A BROKER THAT DOES NOT ANSWER THE QUESTION — an older one from before the flag, or a
+            # newer one that dropped it — is `touch $STUB_LOG.ignore-sizes`. A FILE, not an env var:
+            # the stub is started once for the whole suite, so a variable set on the cbx call under
+            # test could never reach it. The hub must then print what it knows ('?'), not a 0.
+            deaf = os.path.exists(LOG + ".ignore-sizes")
+            retired = []
+            for n, g in sorted(RETIRED.items()):
+                r = {"box": n, "golden": g}
+                if self._param("sizes") and not deaf:
+                    r["size"] = 12345678
+                retired.append(r)
             return self._reply(200, {"boxes": [
                 {"box": n, "container": f"box-test-{n}", "status": "Up 3 minutes",
                  "golden": b["golden"]} for n, b in sorted(BOXES.items())],
-                "retired": [{"box": n, "golden": g, "size": 12345678}
-                            for n, g in sorted(RETIRED.items())]})
+                "retired": retired})
         if path.startswith("/box/") and path.endswith("/dirty"):
             n = path[len("/box/"):-len("/dirty")]
             return self._reply(200, {"dirty": BOXES.get(n, {}).get("dirty", [])})

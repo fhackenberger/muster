@@ -1237,7 +1237,15 @@ def kill_box(name):
 	return {"killed": name}
 
 
-def list_boxes():
+def list_boxes(sizes=False):
+	"""The boxes, live and retired. `sizes` MEASURES the retired ones, and is off by default.
+
+	WHY IT IS OPT-IN. dir_size walks a box directory file by file, and a retired box's upper layer is
+	a checkout plus node_modules plus gradle caches plus build output — on the stack this was written
+	for, 34 retired boxes came to 347,200 files, which is 2.4 SECONDS per request. This endpoint is
+	what `cbx q`'s dashboard polls, twice per repaint, on a 5-second timer — and the dashboard does
+	not display a size at all. `cbx ls` is the only caller that prints them, and it is typed by a
+	person who can wait, so it asks for them with ?sizes=1 and everyone else stops paying."""
 	out = subprocess.run(
 		["docker", "ps", "-a", "--filter", f"name=^box-{PROJECT}-", "--format", "{{.Names}}\t{{.Status}}"],
 		capture_output=True, text=True, check=True,
@@ -1261,9 +1269,13 @@ def list_boxes():
 			if d in live or not os.path.isdir(os.path.join(BOXROOT, d)):
 				continue
 			gf = os.path.join(BOXROOT, d, "golden")
-			retired.append({"box": d,
-			                "golden": open(gf).read().strip() if os.path.exists(gf) else "",
-			                "size": dir_size(os.path.join(BOXROOT, d))})
+			# `size` is absent, not 0, when it was not asked for: a caller that prints it gets a visible
+			# "null" it can fall back on, where a plausible-looking 0 would read as "this box is empty,
+			# nothing to lose" about a directory holding unpushed work.
+			row = {"box": d, "golden": open(gf).read().strip() if os.path.exists(gf) else ""}
+			if sizes:
+				row["size"] = dir_size(os.path.join(BOXROOT, d))
+			retired.append(row)
 	return {"boxes": rows, "retired": retired}
 
 
@@ -1505,7 +1517,9 @@ class Handler(BaseHTTPRequestHandler):
 				                         "box_image": box_image_version(),
 				                         "box_image_ref": BOX_IMAGE})
 			if path == "/box":
-				return self._reply(200, list_boxes())
+				# ?sizes=1 measures the retired boxes' disk (seconds — see list_boxes). `cbx ls` asks;
+				# the dashboard, which polls this, does not.
+				return self._reply(200, list_boxes(sizes=self._flag("sizes")))
 			if path == "/golden":
 				return self._reply(200, list_goldens())
 			if path.startswith("/box/") and path.endswith("/dirty"):

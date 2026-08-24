@@ -956,6 +956,86 @@ test_box_retired_and_purge() {
 	git_ update-ref -d refs/agents/gone2 2>/dev/null || true
 }
 
+# MEASURING RETIRED BOXES COSTS SECONDS, so only the command that prints the number asks for it.
+# dir_size walks a retired box's whole upper layer — checkout + node_modules + gradle caches + build
+# output. On the stack this was written for that came to 347,200 files across 34 retired boxes: 2.4s
+# per request, on the endpoint the live dashboard polls twice per 5-second repaint, for a number the
+# dashboard does not display. `cbx ls` prints it and is typed by a person who can wait; nothing else.
+test_retired_sizes_only_ls_pays_for_them() {
+	cbx box sizebox; ok
+	cbx kill sizebox; ok
+	: > "$STUB_LOG"
+	cbx ls; ok
+	has "retired"; has "on disk: 11M"          # the stub's 12345678 bytes, so a size really arrived
+	stub_saw GET "/box?sizes=1" || fail "ls must ask for the retired sizes — it is what prints them"
+	# The dashboard: same listing, no sizes. Assert on the REQUEST, not the output — a hub that asks
+	# and then ignores the answer has not stopped paying for it.
+	: > "$STUB_LOG"
+	cbx status --no-fetch; ok
+	stub_saw GET "/box" || fail "the dashboard still needs the box listing"
+	if grep -q sizes "$STUB_LOG"; then
+		fail "the dashboard must not ask for retired sizes" "it walks every file of every retired box"
+	fi
+}
+
+# A size the broker did not send must not print as '0B'. An older broker, or a newer one that ignored
+# ?sizes=1, leaves the field absent — and "0B" reads as "empty, nothing to lose" about a directory
+# that may be holding an agent's unpushed work. '?' says only what we know.
+test_retired_size_unknown_prints_a_question_mark() {
+	cbx box nosize; ok
+	cbx kill nosize; ok
+	: > "$STUB_LOG.ignore-sizes"                # the stub now answers as a broker that has no sizes
+	cbx ls; RC_SAVED=$RC
+	rm -f "$STUB_LOG.ignore-sizes"
+	RC=$RC_SAVED; ok
+	has "nosize"; has "on disk: ?"
+	hasnt "on disk: 0B"
+}
+
+# ONE BOX LISTING PER DASHBOARD FRAME. A frame needs it twice (activity_snapshot for the bell,
+# status_overview for the table) and each runs in its own subshell, so the watch loop fetches it into
+# BOX_LIST_CACHE and both read that. Set = "a frame is in progress"; unset = "go and ask".
+test_box_list_is_fetched_once_per_frame() {
+	box_up work1
+	: > "$STUB_LOG"
+	BOX_LIST_CACHE='{"boxes":[],"retired":[]}' cbx status --no-fetch; ok
+	if grep -q '"path": "/box"' "$STUB_LOG"; then
+		fail "status_overview must reuse the frame's listing, not request its own"
+	fi
+	# …and with no frame in progress it still asks, exactly once, so one-shot commands are unaffected.
+	# The unset is not decoration: a var assignment prefixed to a FUNCTION call outlives it in bash.
+	unset BOX_LIST_CACHE
+	: > "$STUB_LOG"
+	cbx status --no-fetch; ok
+	eq "$(grep -c '"path": "/box"' "$STUB_LOG")" "1" "a one-shot status should make one /box request"
+}
+
+# The same property end to end, through the live dashboard that actually fills the cache: one frame,
+# one request. Before this, every repaint asked twice.
+test_q_frame_makes_one_box_request() {
+	command -v script >/dev/null || { skip "no 'script' to give q a terminal"; return 0; }
+	box_up work1
+	: > "$STUB_LOG"
+	# -n 9 so the 2s window holds exactly one frame however slow the machine is; q dies mid-wait.
+	timeout 2 script -qec "bash '$MUSTER_BIN' q -n 9 --no-bell" /dev/null >/dev/null 2>&1 || true
+	eq "$(grep -c '"path": "/box"' "$STUB_LOG")" "1" "one dashboard frame should make one /box request"
+}
+
+# THE FIRST FRAME MUST NOT FETCH. `git fetch` is the one network call in a frame and it runs before
+# anything is printed, so paying it on frame one is 1-2 seconds of blank screen between typing `q`
+# and seeing anything — the worst moment to spend them, for the least urgent numbers on the screen.
+# FETCH_HEAD is the evidence: git writes it on every fetch and on nothing else.
+test_q_first_frame_does_not_fetch() {
+	command -v script >/dev/null || { skip "no 'script' to give q a terminal"; return 0; }
+	rm -f "$FIX/repo/.git/FETCH_HEAD"
+	timeout 2 script -qec "bash '$MUSTER_BIN' q -n 9 --no-bell" /dev/null >/dev/null 2>&1 || true
+	absent "$FIX/repo/.git/FETCH_HEAD"
+	# TEETH: the same overview fetches when it is NOT frame one of the dashboard, so the assertion
+	# above is about when we fetch, not about a fetch that could never have happened here.
+	cbx status; ok
+	exists "$FIX/repo/.git/FETCH_HEAD"
+}
+
 test_forwards() {
 	box_up work1
 	cbx forwards
@@ -1863,6 +1943,40 @@ test_box_init_ordinary_box() {
 
 # =====================================================================  broker.py units
 
+# THE REBASE VERDICT IS CACHED, because it is the expensive question on the dashboard: two
+# `git log -p | git patch-id` runs over whole branches (~0.5s each on a real project), asked again
+# for every box on every 5-second repaint, where the answer cannot have changed unless one of four
+# shas did. Those four shas ARE the key, so any handoff, rebase, review or move of the base
+# invalidates it by construction and nothing else can.
+test_rebase_verdict_is_cached() {
+	local sha
+	sha="$(handoff work1 2)"
+	# Reviewed at an earlier ref, so box_status has to tell 'rebased' from 're-review' — the only
+	# path that runs the patch-id comparison at all.
+	mkdir -p "$FIX/repo/.git/cbx"
+	printf '%s %s' "$(at dev)" "$(at dev)" > "$FIX/repo/.git/cbx/work1.reviewed"
+	cbx status --no-fetch; ok
+	has "re-review"
+	exists "$FIX/repo/.git/cbx/work1.rebase"
+	# The NEGATIVE is cached too — 're-review' is the common verdict, so caching only the hits would
+	# leave the busy dashboard recomputing every miss forever.
+	OUT="$(cat "$FIX/repo/.git/cbx/work1.rebase")"; has " no"
+	# Now prove the cache is READ rather than merely written: flip the stored verdict, leaving the key
+	# alone, and the dashboard must believe it. (Only a test may do this; nothing else writes it.)
+	local key; key="$(awk '{print $1, $2, $3, $4}' "$FIX/repo/.git/cbx/work1.rebase")"
+	printf '%s yes\n' "$key" > "$FIX/repo/.git/cbx/work1.rebase"
+	cbx status --no-fetch; ok
+	has "rebased"
+	# And that a moved branch invalidates it: same box, new sha, so the poisoned entry is ignored and
+	# the real comparison runs again.
+	handoff work1 3 >/dev/null
+	cbx status --no-fetch; ok
+	has "re-review"
+	OUT="$(cat "$FIX/repo/.git/cbx/work1.rebase")"; has " no"
+	# The key really is the four shas, not the box name.
+	ne "$(awk '{print $4}' "$FIX/repo/.git/cbx/work1.rebase")" "$sha" "the cache key must follow the ref"
+}
+
 test_broker_branch_validation() {
 	OUT="$(python3 - "$BROKER_PY" <<'PY' 2>&1
 import importlib.util, os, sys
@@ -1875,6 +1989,42 @@ for n in good:
     assert b.valid_branch(n), f"should accept {n!r}"
 for n in bad:
     assert not b.valid_branch(n), f"should reject {n!r}"
+print("ok")
+PY
+)"; RC=$?
+	ok; has ok
+}
+
+# The broker half of the same fix: dir_size runs only when the caller asked for it.
+test_broker_retired_sizes_are_opt_in() {
+	OUT="$(python3 - "$BROKER_PY" "$FIX" <<'PY' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+root = os.path.join(sys.argv[2], "boxroot")
+os.makedirs(os.path.join(root, "retired1"), exist_ok=True)
+open(os.path.join(root, "retired1", "big"), "w").write("x" * 1000)
+os.environ["BOXROOT"] = root
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+
+# No containers, so the one directory is retired.
+class R:
+    stdout = ""
+b.subprocess.run = lambda *a, **k: R()
+
+# THE POINT: dir_size is not merely absent from the output, it is not CALLED. That is the cost —
+# a walk of every file under every retired box, on an endpoint the dashboard polls twice a frame.
+calls = []
+real = b.dir_size
+b.dir_size = lambda p: (calls.append(p), real(p))[1]
+
+out = b.list_boxes()
+assert out["retired"] == [{"box": "retired1", "golden": ""}], out
+assert calls == [], f"dir_size must not run unless asked: {calls}"
+
+out = b.list_boxes(sizes=True)
+assert out["retired"][0]["size"] >= 1000, out
+assert len(calls) == 1, calls
 print("ok")
 PY
 )"; RC=$?
@@ -2635,6 +2785,12 @@ run "import: replaces the agent's branch"          test_import_replaces_the_bran
 
 run "box: spawn / ls / recreate / kill"            test_box_lifecycle
 run "box: retired boxes are listed and purgeable" test_box_retired_and_purge
+run "ls: only ls pays for the retired sizes"       test_retired_sizes_only_ls_pays_for_them
+run "ls: an unknown size prints '?', never 0B"     test_retired_size_unknown_prints_a_question_mark
+run "q: one box listing per frame"                 test_box_list_is_fetched_once_per_frame
+run "q: a live frame makes one /box request"       test_q_frame_makes_one_box_request
+run "q: the first frame does not fetch"            test_q_first_frame_does_not_fetch
+run "q: the rebase verdict is cached"              test_rebase_verdict_is_cached
 run "forwards: re-establishes them"                test_forwards
 run "broker: unreachable is reported, not fatal"   test_broker_unreachable_is_reported_not_fatal
 run "version: drift between hub and broker warns"  test_version_drift
@@ -2687,6 +2843,7 @@ run "box-init: a minto box opens on the conflict"  test_box_init_minto_sets_up_t
 run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 
 run "broker: branch-name validation"               test_broker_branch_validation
+run "broker: retired sizes are opt-in"             test_broker_retired_sizes_are_opt_in
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
 run "broker: a killed box resumes its session"      test_broker_session_resume

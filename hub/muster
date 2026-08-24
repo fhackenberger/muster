@@ -678,6 +678,19 @@ broker() {
 
 jqr() { jq -r "$1" 2>/dev/null || true; }
 
+# The box listing, ONCE PER DASHBOARD FRAME. A frame needs it twice — activity_snapshot compares each
+# box's state against the last frame's, status_overview renders the table — and both run in their own
+# subshell (a command substitution and a process substitution), so neither can memoise for the other.
+# The watch loop therefore fetches it into BOX_LIST_CACHE before rendering, and both inherit it.
+#
+# Unset (not empty) means "no frame is in progress, go and ask": that keeps every one-shot caller —
+# `$SELF status`, a bare `$SELF ls` — making its own single request, while an EMPTY cache still means
+# "asked this frame, the broker said nothing" rather than triggering a second doomed request.
+box_list() {
+	if [ -n "${BOX_LIST_CACHE+x}" ]; then printf '%s' "$BOX_LIST_CACHE"; return 0; fi
+	broker GET /box 2>/dev/null || true
+}
+
 # THE VERSION HANDSHAKE. The hub, the broker and the box image are three images produced by up to
 # three different build paths — muster publishes the first two, a project builds its own box add-on —
 # and nothing in the stack forces them to move together. When they don't, the failures are silent
@@ -771,7 +784,10 @@ box_ls() {
 	svc_list
 	echo "== boxes (broker) =="
 	local resp box st age
-	if resp="$(broker GET "/box" 2>/dev/null)"; then
+	# ?sizes=1: the ONE caller that prints the retired boxes' disk usage, and the only one that pays
+	# for it — the broker measures them by walking every file, which is seconds once a few boxes have
+	# been retired. Everything else (the dashboard above all) takes the listing without sizes.
+	if resp="$(broker GET "/box?sizes=1" 2>/dev/null)"; then
 		while IFS=$'\t' read -r box status golden; do
 			[ -n "$box" ] || continue
 			read -r st age <<< "$(box_activity "$box")"
@@ -780,11 +796,15 @@ box_ls() {
 		# Boxes with a directory but no container. `kill` keeps that directory on purpose (unpushed work
 		# + warm caches, and `box <same name>` reattaches to it), so they pile up unseen — one of these
 		# is what "out of port-forward slots with two boxes running" used to be about.
-		local rbox rgold rsize any=0
+		local rbox rgold rsize rdisk any=0
 		while IFS=$'\t' read -r rbox rgold rsize; do
 			[ -n "$rbox" ] || continue
 			[ "$any" = 1 ] || { echo "== retired (kept for '$SELF box <name>' to reattach) =="; any=1; }
-			printf '  %-12s %-10s %-22s %s\n' "$rbox" "-" "on disk: $(human_size "${rsize:-0}")" "golden=$rgold"
+			# '?' rather than '0 B' when the broker sent no size — an older one that predates ?sizes=1,
+			# or a newer one that ignored it. "0 B" would read as "empty, safe to purge" about a
+			# directory that may hold an agent's unpushed work.
+			if [ -n "$rsize" ] && [ "$rsize" != null ]; then rdisk="$(human_size "$rsize")"; else rdisk="?"; fi
+			printf '  %-12s %-10s %-22s %s\n' "$rbox" "-" "on disk: $rdisk" "golden=$rgold"
 		done < <(printf '%s' "$resp" | jq -r '.retired[]? | "\(.box)\t\(.golden)\t\(.size)"' 2>/dev/null)
 		[ "$any" = 0 ] || echo "  ($SELF purge <name> removes one for good)"
 	else
@@ -821,7 +841,7 @@ box_purge() {
 		case "$answer" in y|Y|yes|YES) ;; *) die "not purged" ;; esac
 	fi
 	resp="$(broker DELETE "/box/$box/purge")" || die "purging '$box' failed: $resp"
-	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.mergeinto"
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.rebase" "$STATE/$box.mergeinto"
 	rm -rf "$(reword_dir "$box")"
 	echo "$SELF: purged '$box' — freed $(human_size "$(printf '%s' "$resp" | jqr '.freed // 0')")"
 }
@@ -941,16 +961,37 @@ patch_ids() {
 
 # True when the branch changed only because it was rebased: same patches, different shas. Needs a
 # recorded dev sha, so state written before this existed just falls through to "re-review".
+#
+# MEMOISED, because this is the expensive question on the screen: two `git log -p | patch-id` runs
+# over whole branches, ~0.5s each on a real project — and `$SELF q` asks it again for every box on
+# every 5-second repaint, where the answer cannot have changed unless one of the four shas below did.
+# The verdict is a pure function of exactly those four, so they ARE the cache key: any handoff,
+# rebase, review or move of the base invalidates it by construction, and nothing else can.
 rebase_only() {
-	local box="$1" pdev pref old new base
+	local box="$1" pdev pref old new base sha key f
 	base="$(base_of "$box")"
 	pdev="$(reviewed_dev "$box")"; pref="$(reviewed_ref "$box")"
 	[ -n "$pdev" ] && [ -n "$pref" ] || return 1
 	git_ rev-parse --verify -q "${pdev}^{commit}" >/dev/null || return 1
+	# Resolved shas, never branch NAMES: `$DEV` reads the same after every commit to it, and a stale
+	# "rebased" would hide new work behind "nothing new to read, just merge it".
+	sha="$(git_ rev-parse "refs/agents/$box" 2>/dev/null || true)"
+	base="$(git_ rev-parse "$base" 2>/dev/null || printf '%s' "$base")"
+	key="$pdev $pref $base $sha"
+	f="$STATE/$box.rebase"
+	if [ "$(cat "$f" 2>/dev/null || true)" = "$key yes" ]; then return 0; fi
+	if [ "$(cat "$f" 2>/dev/null || true)" = "$key no" ]; then return 1; fi
 	old="$(patch_ids "$pdev" "$pref")"
 	new="$(patch_ids "$base" "refs/agents/$box")"
 	# Two empty sets are not evidence of a rebase — they mean we failed to read patches at all.
-	[ -n "$old" ] && [ "$old" = "$new" ]
+	if [ -n "$old" ] && [ "$old" = "$new" ]; then
+		printf '%s yes\n' "$key" > "$f" 2>/dev/null || true
+		return 0
+	fi
+	# A NEGATIVE IS CACHED TOO, and it is the one that pays: 're-review' is the common verdict, so
+	# caching only the hits would leave the busy dashboard recomputing every miss forever.
+	printf '%s no\n' "$key" > "$f" 2>/dev/null || true
+	return 1
 }
 
 # merged | new | reviewed | rebased | re-review
@@ -1031,7 +1072,7 @@ status_overview() {
 	# from "who handed off" to "who is still running". That needs the broker list before the queue is
 	# printed, which is why the call sits up here rather than in the boxes section below.
 	list="$(agent_refs)"
-	running="$(broker GET /box 2>/dev/null || true)"
+	running="$(box_list)"
 	if [ -n "$running" ]; then
 		while IFS=$'\t' read -r bname bstatus bgolden; do
 			[ -n "$bname" ] || continue
@@ -1317,7 +1358,7 @@ watch_event() {
 # "<box> <state>" per running box — what status_overview reads, without the rendering.
 activity_snapshot() {
 	local resp box st age
-	resp="$(broker GET /box 2>/dev/null || true)"
+	resp="$(box_list)"
 	[ -n "$resp" ] || return 0
 	for box in $(printf '%s' "$resp" | jqr '.boxes[]?.box'); do
 		read -r st age <<< "$(box_activity "$box")"
@@ -1366,6 +1407,10 @@ watch_queue() {
 		MUSTER_COLS="$(tput cols 2>/dev/null || echo 100)"
 		case "$MUSTER_COLS" in ''|*[!0-9]*) MUSTER_COLS=100 ;; esac
 		[ "$MUSTER_COLS" -ge 60 ] || MUSTER_COLS=100
+		# ONE box listing for the whole frame — activity_snapshot and status_overview both read it from
+		# here (see box_list). Fetched in the loop body rather than inside either of them because both
+		# run in a subshell, where a cache would die with the subshell that filled it.
+		BOX_LIST_CACHE="$(broker GET /box 2>/dev/null || true)"
 		now_act=(); now_ref=()
 		while read -r box st;  do [ -n "$box" ] && now_act["$box"]="$st"; done < <(activity_snapshot)
 		while read -r box sha; do [ -n "$box" ] && now_ref["$box"]="$sha"; done < <(ref_snapshot)
@@ -1398,7 +1443,14 @@ watch_queue() {
 		for box in "${!now_ref[@]}"; do ref["$box"]="${now_ref[$box]}"; done
 
 		now="$(date +%s)"
-		if [ "$((now - fetched))" -ge "$WATCH_FETCH" ]; then fetched="$now"; fa=""; else fa=--no-fetch; fi
+		# THE FIRST FRAME NEVER FETCHES. `git fetch` is the one network call in a frame and it is
+		# serialised ahead of everything else, so paying it here is 1-2 seconds of BLANK SCREEN between
+		# typing `q` and seeing anything — the single worst moment to spend them. The counts it refreshes
+		# (behind/ahead of origin) are the least urgent thing on the screen and they are at most one
+		# interval stale, because `fetched` stays 0 and the next frame fetches for real.
+		if [ "$first" = 1 ]; then fa=--no-fetch
+		elif [ "$((now - fetched))" -ge "$WATCH_FETCH" ]; then fetched="$now"; fa=""
+		else fa=--no-fetch; fi
 		# Render into a variable first, then clear + print in one go: a frame built directly onto the
 		# screen flickers for as long as the git plumbing takes, which is most of the interval.
 		frame="$(status_overview ${fa:+"$fa"} 2>&1)" || true
@@ -1985,7 +2037,7 @@ merge_finish() {
 	git_ update-ref -d "$ref" 2>/dev/null || true
 	# .sent goes with it: the branch this box will push next is a new review from scratch. Same for any
 	# --reword messages: they are keyed to commits that have now landed.
-	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent"
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.rebase"
 	rm -rf "$(reword_dir "$box")"
 	echo "$SELF: dropped refs/agents/$box (merged)"
 	# The agent is still sitting on the now-merged branch; move it onto the new dev so its next piece
@@ -2477,7 +2529,7 @@ drop() {
 	# .sent goes with it: the branch this box will push next is a new review from scratch.
 	# .mergeinto too — without it a dropped minto box would keep being measured against a target it is
 	# no longer resolving, and `$SELF merge` would go on refusing it.
-	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.mergeinto"
+	rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.rebase" "$STATE/$box.mergeinto"
 	rm -rf "$(reword_dir "$box")"
 	say_to_box "$box" "I dropped your handoff — that approach is not going in. Do not re-push it; wait for new instructions." 2>/dev/null || true
 	echo "$SELF: dropped refs/agents/$box (the box still has the commits locally until it rebases)"
@@ -2730,7 +2782,7 @@ minto_land() {
 	# cbx note is attached to the commit, not to the ref — deleting the ref leaves the summary in place
 	# (`git log --notes=cbx $target`).
 	git_ update-ref -d "$ref" 2>/dev/null || true
-	rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent"
+	rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.rebase"
 	echo "$SELF: $target is now $(git_ rev-parse --short "$target")"
 	git_ --no-pager diff --shortstat "$tsha" "refs/heads/$target" | sed 's/^/  /'
 	# A minto box has exactly one job and it is done. Unlike an agent box there is no ongoing task to
@@ -2780,7 +2832,7 @@ minto_abort() {
 	box="$(minto_box_for "$target")"
 	if [ -n "$box" ]; then
 		git_ update-ref -d "refs/agents/$box" 2>/dev/null || true
-		rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent"
+		rm -f "$STATE/$box.mergeinto" "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.rebase"
 		broker DELETE "/box/$box" >/dev/null 2>&1 || true
 		echo "$SELF: dropped box $box and its resolution ($target was never moved)"
 		n=$((n + 1))
