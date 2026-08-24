@@ -122,6 +122,17 @@ test_skills_ship() {
 	OUT="$(head -1 "$f")"; has "---"
 	OUT="$(cat "$f")"
 	has "name: muster-pinchtab"
+	# Every skill under skills/ ships the same way, so every skill must be shaped the same way — a
+	# missing front-matter name is a file claude silently ignores.
+	local s
+	for s in "$ROOT"/skills/*/SKILL.md; do
+		[ -f "$s" ] || continue
+		OUT="$(head -1 "$s")"; has "---"
+		OUT="$(cat "$s")"
+		has "name: $(basename "$(dirname "$s")")"
+		has "description:"
+	done
+	OUT="$(cat "$ROOT/skills/muster-pinchtab/SKILL.md")"
 	# It ADDS to upstream's pinchtab skill rather than replacing it — a different name, and it says so.
 	has "pinchtab"
 	hasnt "name: pinchtab\n"
@@ -2029,6 +2040,42 @@ PY
 	ok; has ok
 }
 
+# THE ONE DIRECTORY A BOX KEEPS. Everything else an agent writes is in the repo (reviewed, or gone
+# with the branch) or in a layer a recreate discards — so scratch notes had nowhere to live, and the
+# workaround was committing them to the branch, which is what review exists to catch.
+test_broker_box_keeps_a_durable_dir() {
+	OUT="$(python3 - "$BROKER_PY" "$FIX" <<'PY' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+os.environ["BOXROOT"] = os.path.join(sys.argv[2], "boxroot2")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+
+# It is under the HOME, so `cd ~/keep` needs no explanation and `ls ~` shows it.
+assert b.KEEP_DST == "/home/dev/keep", b.KEEP_DST
+# …and it is named in the environment, so a script never has to hard-code the path.
+assert "MUSTER_KEEP" in open(sys.argv[1]).read()
+print("ok")
+PY
+)"; RC=$?
+	ok; has ok
+	# The lifetime is the BOX's, not the container's: kill keeps the box dir, and nothing but purge
+	# removes it. Asserted on the code paths that delete things, so a future cleanup cannot quietly
+	# start taking it with them.
+	OUT="$(sed -n '/^def kill_box/,/^def /p' "$BROKER_PY")"
+	hasnt '"keep"'
+	OUT="$(sed -n '/^def purge_box/,/^def /p' "$BROKER_PY")"
+	has "rmtree"                      # purge takes the whole box dir, keep included — the one way out
+	# It is created, chowned to the box user, and mounted — every spawn, whatever else the spawn does.
+	OUT="$(sed -n '/^def create_box/,/^def [a-z_]/p' "$BROKER_PY")"
+	has 'keep = os.path.join(box_dir, "keep")'
+	has "os.makedirs(keep, exist_ok=True)"
+	has "{keep}:{KEEP_DST}"
+	# --fresh means "a clean tree", not "forget what you learned", so NOTHING may delete it: the whole
+	# broker names that directory exactly once, and it is the line above that creates it.
+	eq "$(grep -c 'box_dir, "keep"' "$BROKER_PY")" "1" "only create_box may name the keep dir"
+}
+
 # The broker half of the same fix: dir_size runs only when the caller asked for it.
 test_broker_retired_sizes_are_opt_in() {
 	OUT="$(python3 - "$BROKER_PY" "$FIX" <<'PY' 2>&1
@@ -2879,6 +2926,7 @@ run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: retired sizes are opt-in"             test_broker_retired_sizes_are_opt_in
 run "broker: home mount parents are pre-created"   test_broker_creates_home_mount_parents
+run "box: ~/keep survives a recreate"              test_broker_box_keeps_a_durable_dir
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
 run "broker: a killed box resumes its session"      test_broker_session_resume

@@ -1127,6 +1127,35 @@ The stack's own plumbing (`data/repo`, the goldens, `data/boxes`, `hub-services`
 pinchtab, `git-identity`) stays in `compose.yml` — that's the stack's definition, not this project's
 environment.
 
+**A nested destination leaves root-owned parents.** Docker creates a missing mount destination — and
+every missing parent — as root, so a row at `.local/share/x` leaves `~/.local` and `~/.local/share`
+root-owned inside a home that must be uid 1000 throughout. The next tool that wants its own directory
+there fails with a bare "Permission denied" about a path this table never mentions. The broker
+pre-creates those parents for boxes (and re-owns existing ones, so `cbx recreate` repairs a box), the
+hub image ships the XDG bases, and the hub warns at boot about any parent it cannot write.
+
+
+## What a box keeps (`~/keep`)
+
+Every box gets one directory whose lifetime is the **box's**, not the container's:
+
+| | |
+|---|---|
+| in the box | `~/keep`, and `$MUSTER_KEEP` for scripts |
+| on the host | `data/boxes/<box>/keep` |
+| survives | `cbx recreate`, `cbx kill` + re-`box`, and `--fresh` |
+| removed by | `cbx purge` only — the one irreversible command, and it asks first |
+
+Everything else an agent writes is either in the repo (reviewed, or gone with the branch) or in a
+layer a recreate replaces. Without this, an agent wanting to keep a note, a scratch dump or a
+downloaded fixture had one option: commit it to the branch — which is precisely what review exists to
+catch. `~/keep` is per box, invisible to the reviewer and to every other box, and not a place for
+secrets: it sits in the stack's data directory on the host.
+
+Agents are told twice: the box memo in the shared `~/.claude/CLAUDE.md` carries the rule, and the
+`muster-box` skill carries the detail — what belongs there, what does not, and how to hand something
+to a reviewer instead.
+
 
 ## Tests
 

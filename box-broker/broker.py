@@ -182,6 +182,9 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$")
 def valid_branch(name):
 	return bool(name) and bool(BRANCH_RE.match(name)) and ".." not in name and not name.endswith(".lock")
 HOME_IN = "/home/dev"
+# Where a box's own durable directory appears inside it. Under the home rather than off in /work so
+# that `cd ~/keep` needs no explanation and `ls ~` shows it; the host side is data/boxes/<box>/keep.
+KEEP_DST = f"{HOME_IN}/keep"
 
 # Serializes the background `docker pull` of BOX_IMAGE so concurrent spawns don't each start one.
 _pull_lock = threading.Lock()
@@ -916,7 +919,15 @@ def box_memo():
 	         "- The hub answers to `$MUSTER_HUB_HOST` on the network. A service the HUB runs on port P",
 	         "  is `http://$MUSTER_HUB_HOST:P`.",
 	         "- Services YOU run bind inside this box and are published on the hub's loopback so the",
-	         "  reviewer's browser can reach them; that hub-side port is not reachable from here."]
+	         "  reviewer's browser can reach them; that hub-side port is not reachable from here.",
+	         "",
+	         "## Anything you want to keep goes in `~/keep` (`$MUSTER_KEEP`)",
+	         "",
+	         "It is the ONLY directory that outlives this container. Your checkout is an overlay that a",
+	         "recreate replaces, and the rest of your home goes with the box — so notes to yourself,",
+	         "scratch output, a fixture you downloaded, the write-up of an approach that did not work,",
+	         "all belong there. **Do not commit them to your branch instead**: your branch is what your",
+	         "reviewer reads, and junk in it is what review exists to catch. See the `muster-box` skill."]
 	fwds = []
 	try:
 		fwds = parse_port_forwards()
@@ -1147,6 +1158,20 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		"MUSTER_GOLDEN": os.path.basename(golden),
 	})
 	mounts, vols, cow_temp = [], [], []
+	# THE ONE PLACE A BOX MAY KEEP SOMETHING. Everything else an agent writes is either in the repo
+	# (reviewed, or thrown away when the branch is) or in a layer that a recreate or --fresh discards —
+	# so notes, a scratch dump, a downloaded fixture, the reasoning behind an approach that did not
+	# work, all had nowhere to live that would still be there tomorrow. Agents worked around it by
+	# committing junk to the branch, which is exactly what review is for stopping.
+	#
+	# It lives in the box dir, beside the upper layers, so its lifetime is the BOX's, not the
+	# container's: kill and recreate keep it, and --fresh deliberately does NOT clear it (that flag
+	# means "a clean tree", not "forget what you learned"). `cbx purge` is the only thing that removes
+	# it — which is already documented as the irreversible one, and already asks first.
+	keep = os.path.join(box_dir, "keep")
+	os.makedirs(keep, exist_ok=True)
+	os.chown(keep, int(BOX_UID), int(BOX_GID))
+	mounts.append(f"{keep}:{KEEP_DST}")
 	# The checkout itself: an overlay volume (rw, the normal case) or the golden bind-mounted read-only.
 	if checkout_ro:
 		mounts.append(f"{golden}:{checkout_dst}:ro")
@@ -1234,6 +1259,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	             MUSTER_BOX=name, MUSTER_BRANCH=f"agent/{name}", MUSTER_DEV_BRANCH=DEV_BRANCH,
 	             MUSTER_PROJECT=PROJECT, MUSTER_WORKDIR=checkout_dst,
 	             MUSTER_GOLDEN=os.path.basename(golden),
+	             MUSTER_KEEP=KEEP_DST,
 	             MUSTER_SLOT="" if slot is None else str(slot))
 	facts["PORT_FORWARDS"] = env.get("PORT_FORWARDS", "")
 	for fwd_name, hub_port in forward_ports.items():
@@ -1244,6 +1270,9 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		k, v = e.split("=", 1)
 		facts.setdefault(k, v)
 	svc_env.append(f"MUSTER_HUB_HOST={facts['MUSTER_HUB_HOST']}")
+	# Named, not guessed: a script that writes here should say $MUSTER_KEEP, so the day the path moves
+	# it keeps working — and so an agent reading the environment can find the durable directory at all.
+	svc_env.append(f"MUSTER_KEEP={KEEP_DST}")
 	svc_env.extend(expand_box_env(parse_box_env(), facts))
 	env["MUSTER_EXTRA_ENV"] = "\n".join(last_wins(svc_env))
 	proc = subprocess.run([MUSTER_SCRIPT], env=env, capture_output=True, text=True)
