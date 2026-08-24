@@ -464,6 +464,123 @@ _muster_exec() {
 	ssh -T "$MUSTER_SERVER" "$ex sh -c \"\$(printf %s $b64 | base64 -d)\""
 }
 
+# cbxpaste <box> — put the image on your clipboard in front of an agent.
+#
+# The gap this closes: a screenshot is the fastest way to tell an agent what is wrong with a page,
+# and it was the one thing you could not hand over. Saving it, remembering where, `cbxcp`-ing it, then
+# typing the path into the box is four steps with three chances to fumble a path — so in practice you
+# described the screenshot in words instead, which is exactly the lossy channel the browser tooling
+# exists to avoid.
+#
+# It reuses what is already here rather than adding a second way to do any of it: the transfer is
+# _muster_cp's (one tar over `docker exec -i`, no temp copy on the server), and the attach is
+# _muster_box_attach's. What is new is only the clipboard read and the decision at the end.
+#
+# THE PATH IS TYPED, NOT SENT. `tmux send-keys -l` types it literally and stops there, leaving the
+# cursor after it so you add "…this button is misaligned" and press Enter yourself. Sending it would
+# make claude act on a bare path, which is a prompt with no question in it.
+_MUSTER_CLIP_EXT=""
+# Writes the clipboard image to $1 and sets _MUSTER_CLIP_EXT. 0 = got one, 1 = the clipboard holds no
+# image, 2 = there is nothing here that can read a clipboard (a different message entirely: one is
+# "copy something", the other is "install a tool").
+_muster_clip_image() {
+	local out="$1" t=""
+	if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null 2>&1; then
+		t="$(wl-paste --list-types 2>/dev/null | grep -m1 '^image/')"
+		[ -n "$t" ] || return 1
+		wl-paste -t "$t" > "$out" 2>/dev/null || return 1
+	elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+		# TARGETS is what the owning application offers; asking for image/png when it has none makes
+		# xclip hang waiting for a conversion that never comes, so pick from the list.
+		t="$(xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -m1 '^image/')"
+		[ -n "$t" ] || return 1
+		xclip -selection clipboard -t "$t" -o > "$out" 2>/dev/null || return 1
+	elif [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+		t=image/png
+		if command -v pngpaste >/dev/null 2>&1; then
+			pngpaste "$out" >/dev/null 2>&1 || return 1
+		else
+			# No extra install needed: AppleScript can read the PNG flavour and write it out. The
+			# `try` makes "the clipboard is text" a clean failure rather than a dialog-worthy error.
+			osascript >/dev/null 2>&1 <<-OSA || return 1
+				try
+					set png to (the clipboard as «class PNGf»)
+					set f to (open for access POSIX file "$out" with write permission)
+					write png to f
+					close access f
+				on error
+					try
+						close access f
+					end try
+					error "no image"
+				end try
+			OSA
+		fi
+	else
+		return 2
+	fi
+	[ -s "$out" ] || return 1
+	case "$t" in
+		*jpeg|*jpg) _MUSTER_CLIP_EXT=jpg ;;
+		*gif)       _MUSTER_CLIP_EXT=gif ;;
+		*webp)      _MUSTER_CLIP_EXT=webp ;;
+		*)          _MUSTER_CLIP_EXT=png ;;
+	esac
+	return 0
+}
+
+_muster_paste() {
+	_muster_need_server || return 1
+	local box="${1:-}"
+	[ -n "$box" ] || {
+		echo "usage: ${_MUSTER_SELF} <box>   — copy an image, then this puts it in front of that agent" >&2
+		return 2
+	}
+	local tmp rc tries=0
+	tmp="$(mktemp "${TMPDIR:-/tmp}/muster-paste.XXXXXX")" || return 1
+	while :; do
+		_muster_clip_image "$tmp"; rc=$?
+		[ "$rc" = 0 ] && break
+		if [ "$rc" = 2 ]; then
+			echo "${_MUSTER_SELF}: no clipboard reader here — install wl-clipboard (wayland), xclip (x11)" >&2
+			echo "${_MUSTER_SELF}: or pngpaste (macOS; osascript is used automatically if it is absent)" >&2
+			rm -f "$tmp"; return 1
+		fi
+		tries=$((tries + 1))
+		if [ "$tries" -gt 10 ]; then
+			echo "${_MUSTER_SELF}: still no image on the clipboard — nothing sent." >&2
+			rm -f "$tmp"; return 1
+		fi
+		[ "$tries" -gt 1 ] || echo "${_MUSTER_SELF}: copy an image (screenshot tool, or Ctrl-C on it), then press Enter — Ctrl-D aborts" >&2
+		read -r _ </dev/tty || { echo >&2; rm -f "$tmp"; return 1; }
+	done
+
+	# The name is ours, so it stays inside [A-Za-z0-9/._-] and survives the two shells between here and
+	# the box without any quoting cleverness. ~/keep because a recreate mid-task must not take it: it
+	# is the one directory a box keeps (older boxes have no such mount yet, and simply get an ordinary
+	# directory that goes with the container — the transfer still works).
+	local stamp path
+	stamp="$(date +%Y%m%d-%H%M%S)"
+	path="/home/dev/keep/pasted/${stamp}.${_MUSTER_CLIP_EXT}"
+	_muster_cp "$tmp" "${box}:${path}" || { rm -f "$tmp"; return 1; }
+	rm -f "$tmp"
+
+	# ONE round trip for both halves: type the path, then report whether anyone is looking at that
+	# session. `list-clients` is the whole "is a terminal already open" question — it is empty exactly
+	# when nobody has `cbxbox` attached.
+	local attached
+	attached="$(ssh "$MUSTER_SERVER" \
+		"docker exec -u dev box-${MUSTER_PROJECT}-${box} sh -c 'tmux send-keys -t main -l \"$path\" 2>/dev/null; tmux list-clients -t main 2>/dev/null | wc -l'" \
+		2>/dev/null | tr -dc '0-9')"
+	if [ "${attached:-0}" -gt 0 ] 2>/dev/null; then
+		echo "${_MUSTER_SELF}: typed the path into $box — it is waiting in the session you have open." >&2
+		echo "${_MUSTER_SELF}: $path" >&2
+	else
+		echo "${_MUSTER_SELF}: $path — attaching (Ctrl-b d to detach)" >&2
+		_muster_box_attach "$box"
+	fi
+}
+
 # ---------------------------------------------------------------------------------------------
 # BUILDING BLOCKS FOR PROJECT HELPERS
 #
@@ -929,13 +1046,13 @@ declare -A _MUSTER_COMP_PREFIX=() _MUSTER_COMP_FN=()
 _MUSTER_FAMILY=(
 	-:_muster_run  hub:_muster_hub_attach  box:_muster_box_attach  tun:_muster_tun  sync:_muster_sync
 	export:_muster_export  import:_muster_import  cp:_muster_cp  exec:_muster_exec  refresh:_muster_refresh
-	peek:_muster_peek
+	peek:_muster_peek  paste:_muster_paste
 )
 # suffix:completion-function, for the ones that complete more than nothing.
 _MUSTER_FAMILY_COMP=(
 	-:_muster_complete  box:_muster_complete_boxonly  export:_muster_complete_boxonly
 	import:_muster_complete_import  tun:_muster_complete_tun  cp:_muster_complete_cp  exec:_muster_complete_exec
-	peek:_muster_complete_boxonly
+	peek:_muster_complete_boxonly  paste:_muster_complete_boxonly
 )
 
 # muster_define <prefix> <suffix> <implementation> — generate ONE command for a stack. Project helper

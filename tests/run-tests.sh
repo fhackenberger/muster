@@ -1534,6 +1534,77 @@ test_aliases_tunnel_specs() {
 	ssh_has "-L 127.0.0.1:4300:10.0.0."
 }
 
+# cbxpaste: a screenshot is the fastest way to say what is wrong with a page, and it was the one
+# thing that could not be handed to an agent without saving it, copying it and typing a path.
+test_aliases_paste_an_image() {
+	alias_fixture
+	# A Wayland clipboard holding a PNG. The stub answers both calls cbxpaste makes: what types are
+	# offered, and the bytes for the one it picked.
+	cat > "$FIX/bin/wl-paste" <<'EOF'
+#!/bin/bash
+[ "$1" = "--list-types" ] && { printf 'text/html\nimage/png\n'; exit 0; }
+printf 'PNGDATA'
+EOF
+	chmod +x "$FIX/bin/wl-paste"
+	WAYLAND_DISPLAY=wl-0 al 'cbxpaste work1'
+	ok
+	# The transfer goes through cbxcp's pipe — one tar into `docker exec -i`, no temp copy on the host.
+	ssh_has "docker exec -i box-proj-work1"
+	# TYPED, not sent: send-keys -l leaves the cursor after the path so you can say what is wrong with
+	# the image. An Enter here would make claude act on a bare path, which asks nothing.
+	ssh_has "tmux send-keys -t main -l"
+	ssh_has "/home/dev/keep/pasted/"
+	ssh_hasnt "send-keys -t main Enter"
+	# Nobody is attached (the ssh stub prints nothing), so it drops you into the box.
+	ssh_has "tmux attach -t main"
+	has "attaching"
+	# A box name is required — the whole command is "in front of WHICH agent".
+	al 'cbxpaste'
+	notok; has "usage:"
+}
+
+# The other half of the decision: when you already have that session open, saying so is better than
+# stealing the terminal you are looking at.
+test_aliases_paste_when_already_attached() {
+	alias_fixture
+	cat > "$FIX/bin/wl-paste" <<'EOF'
+#!/bin/bash
+[ "$1" = "--list-types" ] && { printf 'image/jpeg\n'; exit 0; }
+printf 'JPGDATA'
+EOF
+	chmod +x "$FIX/bin/wl-paste"
+	# `tmux list-clients | wc -l` is the question; make the stub answer "one client".
+	cat > "$FIX/bin/ssh" <<'EOF'
+#!/bin/bash
+printf 'ssh %s\n' "$*" >> "$MUSTER_SSH_LOG"
+case "$*" in *list-clients*) echo 1 ;; esac
+exit 0
+EOF
+	chmod +x "$FIX/bin/ssh"
+	WAYLAND_DISPLAY=wl-0 al 'cbxpaste work1'
+	ok
+	has "waiting in the session you have open"
+	ssh_hasnt "tmux attach -t main"
+	# The extension follows the clipboard's type, so the agent's tooling sees a real .jpg.
+	ssh_has "/home/dev/keep/pasted/"
+	has ".jpg"
+}
+
+# No clipboard reader at all is a different message from an empty clipboard: one says install
+# something, the other says copy something. Getting that wrong sends you looking in the wrong place.
+test_aliases_paste_without_a_clipboard_reader() {
+	alias_fixture
+	OUT="$(cd "$FIX" && env -u WAYLAND_DISPLAY -u DISPLAY PATH="$FIX/bin:/usr/bin:/bin" \
+		MUSTER_SSH_LOG="$SSH_LOG" MUSTER_SERVER=root@test.example MUSTER_PROJECT=proj \
+		bash -c "source '$ROOT/muster.bash_aliases'; cbxpaste work1" 2>&1)"; RC=$?
+	notok
+	case "$(uname -s)" in
+		Darwin) has "pngpaste" ;;
+		*)      has "no clipboard reader" ; has "wl-clipboard" ; has "xclip" ;;
+	esac
+	eq "$(cat "$SSH_LOG")" "" "nothing may be sent when there is no image to send"
+}
+
 test_aliases_refuse_without_a_server() {
 	alias_fixture
 	AL_SERVER="root@your-server" al 'cbx ls'      # the shipped placeholder
@@ -2897,6 +2968,9 @@ run "aliases: box spawns then attaches"            test_aliases_box_spawn_attach
 run "aliases: pipes never allocate a PTY"          test_aliases_pipes_never_allocate_a_pty
 run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the_hub_too
 run "aliases: tunnel specs"                        test_aliases_tunnel_specs
+run "paste: an image, then attach"                 test_aliases_paste_an_image
+run "paste: says so when you are attached"         test_aliases_paste_when_already_attached
+run "paste: no clipboard reader says which"        test_aliases_paste_without_a_clipboard_reader
 run "aliases: refuse an unconfigured stack"        test_aliases_refuse_without_a_server
 run "aliases: cbxcp argument checking"             test_aliases_cbxcp_argument_checking
 run "aliases: completion (cmds, flags, branches)"   test_aliases_completion

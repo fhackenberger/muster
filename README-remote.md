@@ -438,6 +438,21 @@ That gives you:
   Use this for logs, screenshots and build artifacts; use `cbxexport`/`cbximport` for **code**, since
   those move a reviewable git patch rather than loose files. The destination is extracted into if it
   is an existing directory and treated as the new name otherwise — same rule whichever way you copy.
+- **`cbxpaste <box>`** — put the image **on your clipboard** in front of an agent. Take a screenshot,
+  run it, and it lands in the box as `~/keep/pasted/<timestamp>.png` with the path already **typed**
+  into that agent's prompt:
+
+  ```sh
+  cbxpaste work1        # …then add "the button under the header is misaligned" and press Enter
+  ```
+
+  Typed, not sent: the cursor is left after the path so you say what is wrong with the image, which is
+  the half a bare path does not carry. If nobody is attached to that box it drops you into it
+  (`cbxbox`); if you already have that session open it just says so, because stealing the terminal you
+  are looking at is worse than a line of output. Reads the clipboard via `wl-paste` (Wayland), `xclip`
+  (X11) or `pngpaste`/`osascript` (macOS), and waits for you to copy something if the clipboard has no
+  image yet. `~/keep` because a `cbx recreate` in the middle of a task must not take the screenshot
+  with it.
   Everything travels as a tar stream over `docker exec -i`, so modes and symlinks survive, directories
   need no special flag, and nothing is staged on the server in between.
 - **`cbxexec <box|hub> <command…>`** — run an arbitrary command in a box or the hub with its output
