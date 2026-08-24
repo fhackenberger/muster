@@ -71,6 +71,33 @@ if [ -x /usr/local/bin/muster-pinchtab-session ]; then
 	unset _pt
 fi
 
+# PROJECT HOOKS. Every executable in /etc/muster/entrypoint.d runs here, in lexical order, as the
+# box user, after the home mounts are in place and before the command starts. Nothing in muster puts
+# anything there: the directory is for the ADD-ON image (your build-setup.sh writes the drop-ins),
+# which is what keeps project-specific start-up work — dotfiles, a license file, a per-box scratch
+# dir — out of this base image and out of muster's git history. hub/entrypoint.sh runs the SAME
+# directory, so one drop-in covers both add-on images; a hook that is meant for only one side decides
+# that itself (MUSTER_BOX is set in a box and not on the hub).
+#
+# Contract for a hook:
+#   * runs as the runtime user, with HOME and PATH set, every time the container is CREATED — so it
+#     must be idempotent, and must not assume it is the first run (a recreated box keeps its home,
+#     a killed one does not);
+#   * must be quick and non-interactive: it is on the critical path of every box spawn and there is
+#     no tty to prompt on;
+#   * may fail. A hook that exits non-zero is REPORTED AND IGNORED — a broken dotfiles drop-in is
+#     not a reason to leave an agent without a box. Exit 0 (skip) when its inputs are absent, so it
+#     is a no-op on a laptop box, where the mounts it wants are not there.
+if [ -d /etc/muster/entrypoint.d ]; then
+	for _hook in /etc/muster/entrypoint.d/*; do
+		[ -x "$_hook" ] || continue
+		setpriv --reuid "$HOST_UID" --regid "$HOST_GID" --init-groups \
+			env HOME="$HOME" PATH="$PATH" "$_hook" \
+			|| echo "entrypoint: hook $_hook failed (status $?) — continuing" >&2
+	done
+	unset _hook
+fi
+
 # Ctrl-Z on the container tty sends SIGTSTP to the foreground app. For the claude TUI that strands
 # the box: claude stops mid-run while the host-side docker client keeps the terminal in raw mode, so
 # it looks hung with no shell to `fg` from (the stop is INSIDE the container — the docker client is

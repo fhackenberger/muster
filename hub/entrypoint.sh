@@ -265,6 +265,22 @@ if [ -d /opt/muster/skills ] && [ -d "$HOME/.claude" ]; then
 		&& echo "hub: installed the bundled skills into $HOME/.claude/skills" >&2 || true
 fi
 
+# PROJECT HOOKS. Every executable in /etc/muster/entrypoint.d runs here, in lexical order, once the
+# bind-mounted home is in place and before the services start — the hub half of the same mechanism
+# the box entrypoint provides, so ONE drop-in written by your build-setup.sh (dotfiles, a license
+# file, a scratch dir) serves both add-on images. muster itself ships no hook; the directory exists
+# so project-specific start-up work stays out of the project-agnostic base.
+#
+# No privilege drop here — the hub already runs as the dev user. The contract is otherwise the box's:
+# idempotent, non-interactive, and free to fail. A hook that exits non-zero is reported and ignored,
+# because a broken dotfiles drop-in must not cost you the hub.
+if [ -d /etc/muster/entrypoint.d ]; then
+	for hook in /etc/muster/entrypoint.d/*; do
+		[ -x "$hook" ] || continue
+		"$hook" || echo "hub: hook $hook failed (status $?) — continuing" >&2
+	done
+fi
+
 # Start any service whose manifest sets autostart=true (best-effort — a service that fails to launch
 # must never wedge the hub's boot). Everything else stays on-demand via `<cli> up`.
 muster autostart || true

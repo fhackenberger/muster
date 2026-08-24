@@ -53,6 +53,16 @@ latter is what the broker spawns. The toolchain lives once in a **setup script o
 file, made from the shipped `build-setup.sh.example`; the add-on Dockerfile is written once. Jenkins builds each base
 **before** its add-on.
 
+Project work that has to happen at **start** rather than at build time — applying your dotfiles,
+seeding a scratch dir — goes in `/etc/muster/entrypoint.d/`: **both** entrypoints run every
+executable there in lexical order, the box's as the box user once the home mounts are in place and
+before the command, the hub's as `dev` before the services start. Your `build-setup.sh` writes the
+drop-ins, so both the tool and the hook live in the add-on image and the bases stay
+project-agnostic, and one drop-in covers hub and boxes alike (`MUSTER_BOX` is set only in a box, if a
+hook needs to tell them apart). Hooks must be idempotent and non-interactive — they run on every
+spawn and every hub boot, with no tty. A failing one is reported on stderr and ignored, and one whose
+inputs are missing should just `exit 0`; that is what makes it a no-op on a laptop box.
+
 ```sh
 # postgres + sample DB
 docker build -t myapp/dbtest  path/to/myapp/docker-postgre-test

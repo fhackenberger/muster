@@ -28,6 +28,11 @@ set -e
 #   * Set any HOME-relative cache (GRADLE_USER_HOME, MAVEN_OPTS, npm's prefix) in Dockerfile.addon's
 #     ENV, not here, and prefer the default ~/.<tool> so the shared cache mounts in `mounts` apply.
 #   * Keep it idempotent-ish and quiet on success; the image build is where its output is read.
+#   * Need something to happen at every box START rather than at build time (apply dotfiles, seed a
+#     scratch dir)? Write an executable into /etc/muster/entrypoint.d/ from here — the box's
+#     entrypoint runs them all as the box user, best-effort, just before the command. The contract
+#     is in entrypoint.sh; the point of the directory is that such work stays in YOUR image instead
+#     of leaking into the project-agnostic base.
 #
 # What follows is a WORKING example — a Temurin JDK 21 + gradle — kept deliberately small. Replace
 # it wholesale; nothing outside this file assumes java or gradle.
