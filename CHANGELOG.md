@@ -11,6 +11,17 @@ Every commit on `master` is published as well, under its `git describe` name (`0
 moving `dev`, so running an unreleased change never requires cutting a release for it. Those are not
 releases and are not listed here.
 
+## Unreleased
+
+### Added
+- `muster job <box>` — run an **unattended job in a box**: spawn it (or reuse it), wait for its
+  claude to actually be up, brief it with a multi-line prompt, and wait for the agent to write a
+  result file inside its own home, which the hub already mounts read-only. Prints that file on
+  stdout (notes go to stderr) with an exit status a caller can branch on — `0` answered, `3` never
+  did. `--detach` / `--collect` split the two halves so one caller can run many boxes at once and
+  survive its own restart; `--purge` bins the box once the answer is in, never before, and never one
+  holding unreviewed work. See "Unattended job boxes" in `README-remote.md`.
+
 ## [0.1.0] — 2026-08-02
 
 ### Added

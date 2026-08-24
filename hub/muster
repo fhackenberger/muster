@@ -47,6 +47,15 @@ set -euo pipefail
 #   $SELF fix    <box> -m "..."               # send review feedback into that box's claude session
 #   $SELF prereview <box>                     # ask the agent to self-review its diff before you look
 #   $SELF say    <box> "..."                  # say something into that box's claude, no review framing
+#   $SELF job    <box> [-m "..."]             # RUN AN UNATTENDED JOB IN A BOX: spawn it (or reuse it),
+#             [--prompt-file F|-]           #   wait until its claude is actually up, brief it with a
+#             [--result REL]                #   multi-line prompt, then WAIT for the agent to write REL
+#             [--timeout S] [--poll S]      #   inside its own home — which the hub can read — and print
+#             [--detach] [--collect]        #   that file on stdout. Exit 3 = it never appeared.
+#             [--purge] [--json]            #   --detach briefs and returns; --collect waits for a box
+#                                           #   briefed earlier, so one caller can run many boxes at
+#                                           #   once and survive its own restart. --purge bins the box
+#                                           #   once the result is in. See README-remote.md.
 #   $SELF peek   <box> [--snap] [--full]      # SEE what that agent sees: a screenshot of ITS browser tab
 #             [-o FILE]                     #   --snap = the accessibility tree instead (what it reads)
 #                                           #   --full = the whole scrollable page
@@ -2035,6 +2044,224 @@ say() {
 	echo "$SELF: delivered to '$box'."
 }
 
+# ------------------------------------------------------------------ job boxes
+#
+# `$SELF box` + `$SELF say` is the INTERACTIVE loop: you spawn an agent, you type at it, you read the
+# answer off its screen. A JOB BOX is the same machinery driven by a PROGRAM — spawn, brief, and come
+# back with the agent's answer as data, with nobody attached to a terminal.
+#
+# The answer travels through the box's own HOME. Every box's home is data/boxes/<name>/home on the
+# host, which the hub already mounts read-only at $BOXES — it is how `$SELF ls` reads .cbx-state — so
+# a file the agent writes to ~/<result> is a plain file read here. No new mount, no daemon, no port,
+# and nothing the agent can reach outside its own box. That is also why the result path is checked:
+# $BOXES holds EVERY box's home, so a '../' in it would walk out of this box into another one's.
+#
+# Three things this does that a `box` + `say` pair cannot:
+#   * it WAITS for claude to be up before briefing. A paste that lands while muster-box-init is still
+#     running goes into a shell, not into the composer, and the job then sits there to its timeout
+#     having never been asked anything. A fresh box announces itself by writing .cbx-state at
+#     SessionStart, and that is what we wait for.
+#   * it PASTES, so a multi-line brief arrives as ONE prompt. say's send-keys submits on every
+#     newline, so an N-line brief would arrive as N half-prompts, each acted on before the next lands.
+#   * it has an EXIT STATUS — 0 = the agent answered, 3 = it never did — so the caller can retry,
+#     give up, or escalate to a human instead of guessing from stdout.
+JOB_RESULT_DEFAULT="${MUSTER_JOB_RESULT:-muster-job-result.json}"
+# How long to wait for a freshly spawned box's claude to come up. Generous: a box that has to check
+# out a golden and start its dev loop first is minutes, not seconds, and being wrong in this
+# direction only costs a warning.
+JOB_START_TIMEOUT="${MUSTER_JOB_START_TIMEOUT:-300}"
+# A breath between "claude wrote .cbx-state" and the paste. SessionStart fires as the session opens;
+# the composer accepting a bracketed paste is a moment later.
+JOB_BRIEF_SETTLE="${MUSTER_JOB_BRIEF_SETTLE:-3}"
+
+# The host path of a file inside a box's own home.
+job_result_path() {
+	local box="$1" rel="$2"
+	case "$rel" in
+		'')   die "job: --result cannot be empty" ;;
+		/*)   die "job: --result is a path inside the box's home, not an absolute path: $rel" ;;
+		*..*) die "job: --result must not contain '..' (it would leave this box's home): $rel" ;;
+	esac
+	printf '%s/%s/home/%s' "$BOXES" "$box" "$rel"
+}
+
+# Wait until this box's claude has STARTED SINCE <epoch>. muster-activity writes "<state> <epoch>" at
+# SessionStart, so a timestamp at or after the spawn is proof that the session about to receive our
+# paste is the one now running. Returns 1 on timeout; the caller warns and briefs anyway, because
+# "this box image has no activity hooks" must degrade to the old behaviour, not to a hard failure.
+job_wait_session() {
+	local box="$1" since="$2" limit="${3:-300}" deadline st ts
+	deadline=$(( $(date +%s) + limit ))
+	while [ "$(date +%s)" -le "$deadline" ]; do
+		if read -r st ts < "$BOXES/$box/home/.cbx-state" 2>/dev/null; then
+			case "$ts" in
+				''|*[!0-9]*) ;;
+				*) if [ "$ts" -ge "$since" ]; then return 0; fi ;;
+			esac
+		fi
+		sleep 2
+	done
+	return 1
+}
+
+# The protocol footer. Appended to every brief unless --no-protocol, and it names the ACTUAL result
+# path, so the one instruction the job depends on can never disagree with the file the hub watches.
+job_protocol() {
+	cat <<EOF
+
+--- how this job reports back (added by $SELF job) ---
+When you are finished, write your answer to ~/$1 inside this box. That file IS the result: it is the
+only thing the caller reads, and nothing you print here reaches it. Write it even when the task
+failed or you could not finish — a file saying what went wrong tells the caller far more than
+silence does, which it can only read as a timeout. Unless the brief above says otherwise, write JSON.
+Do not hand off, do not commit anything, and do not wait for a reply once the file is written.
+EOF
+}
+
+# Bin a finished job box. Deliberately not box_purge(): that one asks first, and a job runs with
+# nobody there to answer. It keeps the guard that matters — a box holding a branch nobody has looked
+# at is not something a script gets to delete.
+job_purge() {
+	local box="$1" resp
+	if git_ rev-parse --verify -q "refs/agents/$box" >/dev/null; then
+		echo "$SELF: NOT purging '$box' — it pushed a branch that is still in the review queue ($SELF review $box)" >&2
+		return 0
+	fi
+	if resp="$(broker DELETE "/box/$box/purge" 2>&1)"; then
+		rm -f "$STATE/$box.reviewed" "$STATE/$box.sent" "$STATE/$box.rebase" "$STATE/$box.mergeinto"
+		echo "$SELF: purged job box '$box' — freed $(human_size "$(printf '%s' "$resp" | jqr '.freed // 0')")" >&2
+	else
+		echo "$SELF: could not purge '$box': $resp" >&2
+	fi
+}
+
+# The result, on STDOUT and nothing else — every note this command makes goes to stderr, so
+# `$SELF job … > answer.json` is the whole file and not the file plus commentary.
+job_emit() {
+	local box="$1" rel="$2" f="$3" json="$4"
+	if [ -n "$json" ]; then
+		jq -n --arg box "$box" --arg result "$rel" --arg path "$f" --rawfile body "$f" \
+			'{box: $box, status: "done", result: $result, path: $path, body: $body}'
+	else
+		cat "$f"
+	fi
+}
+
+job_collect() {
+	local box="$1" rel="$2" timeout="$3" poll="$4" purge="$5" json="$6"
+	local f deadline warned=0 st age
+	f="$(job_result_path "$box" "$rel")"
+	deadline=$(( $(date +%s) + timeout ))
+	while :; do
+		if [ -r "$f" ]; then
+			job_emit "$box" "$rel" "$f" "$json"
+			if [ -n "$purge" ]; then job_purge "$box"; fi
+			return 0
+		fi
+		if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+		# A box that is WAITING has stopped to ask a question that nobody is going to answer, and the
+		# job would otherwise spend its whole timeout in silence. Say so once — and keep waiting, since
+		# the agent may still time its own prompt out and carry on.
+		if [ "$warned" = 0 ]; then
+			read -r st age <<< "$(box_activity "$box")"
+			if [ "$st" = waiting ]; then
+				echo "$SELF: '$box' is WAITING on a question after ${age}s — unattended it may never finish ($SELF say $box \"...\")" >&2
+				warned=1
+			fi
+		fi
+		sleep "$poll"
+	done
+	echo "$SELF: '$box' wrote no ~/$rel within ${timeout}s — the box is left up so you can look ($SELF say $box '...' / $SELF purge $box --force)" >&2
+	return 3
+}
+
+job() {
+	argsort "-m --prompt-file --result --timeout --poll" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	[ $# -ge 1 ] || die "job needs a box name: $SELF job research-42 --prompt-file brief.md"
+	local box="$1"; shift
+	local msg="" pfile="" rel="$JOB_RESULT_DEFAULT" timeout=1800 poll=5
+	local purge="" detach="" collect="" json="" protocol=1
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-m)            msg="${2:-}"; shift 2 ;;
+			--prompt-file) pfile="${2:-}"; shift 2 ;;
+			--result)      rel="${2:-}"; shift 2 ;;
+			--timeout)     timeout="${2:-}"; shift 2 ;;
+			--poll)        poll="${2:-}"; shift 2 ;;
+			--detach)      detach=1; shift ;;
+			--collect)     collect=1; shift ;;
+			--purge)       purge=1; shift ;;
+			--json)        json=1; shift ;;
+			--no-protocol) protocol=""; shift ;;
+			*) die "job: unknown option '$1'" ;;
+		esac
+	done
+	case "$timeout" in ''|*[!0-9]*) die "job: --timeout wants a number of seconds, got '$timeout'" ;; esac
+	case "$poll" in ''|*[!0-9]*|0) die "job: --poll wants a number of seconds >= 1, got '$poll'" ;; esac
+	if [ -n "$detach" ] && [ -n "$collect" ]; then
+		die "job: --detach and --collect are the two halves of one run — pass one of them, not both"
+	fi
+
+	# --collect: the box was briefed by an earlier --detach, possibly by a caller that has since been
+	# restarted. Nothing is spawned and nothing is said; we only wait for the answer.
+	if [ -n "$collect" ]; then
+		job_collect "$box" "$rel" "$timeout" "$poll" "$purge" "$json"
+		return
+	fi
+
+	if [ -n "$pfile" ]; then
+		if [ "$pfile" = - ]; then
+			msg="$(cat)"
+		else
+			[ -r "$pfile" ] || die "job: cannot read prompt file '$pfile'"
+			msg="$(cat "$pfile")"
+		fi
+	fi
+	[ -n "$msg" ] || die "job needs a brief: -m \"...\", --prompt-file FILE, or --prompt-file - to read stdin"
+	# Validate the result path BEFORE spawning anything: a typo should cost nothing.
+	local f; f="$(job_result_path "$box" "$rel")"
+	if [ -n "$protocol" ]; then msg="$msg$(job_protocol "$rel")"; fi
+
+	# A result file left over from a previous run of this box would be read as this run's answer,
+	# instantly. We cannot delete it ($BOXES is mounted read-only here), so refuse instead of lying.
+	if [ -r "$f" ]; then
+		die "job: '$box' still holds a result from an earlier job at ~/$rel — read it, then remove it in the box ($SELF say $box 'rm ~/$rel') or use a fresh box name"
+	fi
+
+	local since resp container existing restarted
+	since="$(date +%s)"
+	resp="$(broker POST "/box/$box")" || die "job: spawning box '$box' failed: $resp"
+	container="$(printf '%s' "$resp" | jqr '.container // empty')"
+	existing="$(printf '%s' "$resp" | jqr '.existing // empty')"
+	restarted="$(printf '%s' "$resp" | jqr '.restarted // empty')"
+	# A box that was already up has a claude that started long ago, so there is no new SessionStart
+	# coming and waiting for one would burn the whole start timeout before every brief.
+	if [ "$existing" = true ] && [ "$restarted" != true ]; then
+		echo "$SELF: briefing the claude already running in '$box'" >&2
+	else
+		echo "$SELF: box '$box' up as '$container' — waiting for its claude to start" >&2
+		if job_wait_session "$box" "$since" "$JOB_START_TIMEOUT"; then
+			sleep "$JOB_BRIEF_SETTLE"
+		else
+			echo "$SELF: '$box' never reported a session start in ${JOB_START_TIMEOUT}s — briefing anyway (are the activity hooks installed in this box image?)" >&2
+		fi
+	fi
+	paste_to_box "$box" "$msg" \
+		|| die "job: the brief did not land in '$box' — look at it with: docker exec -it -u dev $container tmux attach -t main"
+	echo "$SELF: briefed '$box' ($(printf '%s' "$msg" | wc -l) lines); watching for ~/$rel" >&2
+
+	if [ -n "$detach" ]; then
+		if [ -n "$json" ]; then
+			jq -n --arg box "$box" --arg container "$container" --arg result "$rel" --arg path "$f" \
+				'{box: $box, container: $container, status: "briefed", result: $result, path: $path}'
+		else
+			echo "$SELF: collect it with — $SELF job $box --collect --result $rel"
+		fi
+		return 0
+	fi
+	job_collect "$box" "$rel" "$timeout" "$poll" "$purge" "$json"
+}
+
 # Everything that has to happen once an agent's work is IN $DEV: retire the ref, clear the review
 # state, tell the box, and say whether origin still needs it.
 #
@@ -3389,6 +3616,7 @@ case "$cmd" in
 	fix)      fix "$@" ;;
 	prereview) prereview "$@" ;;
 	say)      say "$@" ;;
+	job)      job "$@" ;;
 	peek)     peek "$@" ;;
 	point)    point "$@" ;;
 	hold)     hold "$@" ;;

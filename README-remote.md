@@ -585,6 +585,58 @@ cbx box work1         # spawn an agent box (mounts per the `mounts` table)
 cbx ls                # services + boxes
 ```
 
+### Unattended job boxes (`cbx job`)
+
+`cbx box` + `cbx say` is the loop you drive by hand: spawn an agent, type at it, read the answer off
+its screen. **`cbx job` is that same loop driven by a program** — spawn, brief, and come back with the
+agent's answer as *data*, with nobody attached to a terminal. It is how you put an agent inside a
+pipeline: a nightly triage run, a queue worker, a tool that needs one page looked at in a real
+browser and does not want a human in the middle.
+
+```sh
+# blocking: spawn, brief, wait for the answer, print it, bin the box
+cbx job price-3494064225 --prompt-file brief.md --timeout 900 --purge > answer.json
+
+# or run many at once: brief each, come back for them later
+cbx job price-a --prompt-file a.md --detach
+cbx job price-b --prompt-file b.md --detach
+cbx job price-a --collect --timeout 900 --purge > a.json
+cbx job price-b --collect --timeout 900 --purge > b.json
+```
+
+The answer travels through **the box's own home**. Every box's home is `data/boxes/<name>/home` on
+the host, which the hub already mounts read-only — it is how `cbx ls` reads each box's activity — so
+a file the agent writes to `~/muster-job-result.json` is a plain file read on the hub. No new mount,
+no daemon, no port, and nothing the agent can reach outside its own box. `--result REL` picks a
+different name; it must stay inside that home (`..` and absolute paths are refused, since the mount
+holds *every* box's home).
+
+Your brief says what to do; `cbx job` appends a short footer saying **where to write the answer**,
+naming the same path it is watching — so the one instruction the whole thing depends on cannot
+disagree with the file the hub is looking for. `--no-protocol` if you would rather write that
+yourself.
+
+Three things it does that a `box` + `say` pair cannot:
+
+- **It waits for claude to be up before briefing.** A paste that lands while `muster-box-init` is
+  still running goes into a shell, not into the composer, and the job then sits there to its timeout
+  having never been asked anything. A fresh box announces itself by writing `.cbx-state` at
+  `SessionStart`, and that is what `job` waits for (`MUSTER_JOB_START_TIMEOUT`, default 300s). A box
+  image without the activity hooks degrades to briefing anyway, with a warning.
+- **It pastes.** A multi-line brief arrives as **one** prompt; `say`'s send-keys submits on every
+  newline, so an N-line brief would arrive as N half-prompts, each acted on before the next lands.
+- **It has an exit status.** `0` = the agent answered, `3` = it never did, anything else = the run
+  itself failed. A caller can retry, give up, or escalate to a human instead of parsing stdout.
+
+Everything `job` says about itself goes to **stderr**, so `cbx job … > answer.json` is the answer and
+nothing else. Two safety rules are worth knowing, because both are places an automated caller would
+otherwise lie to itself:
+
+- a result file **left over from an earlier job** in the same box is refused up front, rather than
+  being read instantly as this run's answer;
+- `--purge` bins the box **only once an answer is in**, and never a box that has pushed a branch to
+  the review queue. A job that timed out is left up, so you can attach and see what happened.
+
 ### Dev-service manifests (`hub-services/`)
 
 Which services the hub can run is **not baked into the image** — each is one file in the stack's

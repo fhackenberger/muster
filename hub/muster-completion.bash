@@ -56,7 +56,7 @@ _muster_complete() {
 
 	case "$cmd" in
 		# <box>
-		review|merge|fix|drop|rebase|kill|box|recreate|prereview|export|import|say|peek|point|hold|release)
+		review|merge|fix|drop|rebase|kill|box|recreate|prereview|export|import|say|job|peek|point|hold|release)
 			mapfile -t COMPREPLY < <(compgen -W "$(_muster_boxes | sort -u)" -- "$cur") ;;
 		# <service>
 		up|down|logs|restart)

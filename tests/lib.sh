@@ -224,6 +224,14 @@ handoff() {
 # Register a box with the stub broker, so `cbx ls`/`kill`/`say` behave as if it were running.
 box_up() { curl -s -X POST -H "X-Broker-Token: test" "$BROKER_URL/box/$1" >/dev/null; }
 
+# Write the activity file the hub reads for a box: "<state> <epoch>", in the box's home anchor.
+# The offset is added to now, so a test can hand `job` a session start it must accept (+60) or one
+# that is far too old to be this run's (-600).
+box_state() { mkdir -p "$FIX/boxes/$1/home"; printf '%s %s\n' "${2:-idle}" "$(( $(date +%s) + ${3:-0} ))" > "$FIX/boxes/$1/home/.cbx-state"; }
+
+# Put a job's answer where the agent would have written it — inside the box's own home.
+box_result() { mkdir -p "$FIX/boxes/$1/home/$(dirname "$2")"; printf '%s' "$3" > "$FIX/boxes/$1/home/$2"; }
+
 # ---------------------------------------------------------------- the laptop aliases
 #
 # muster.bash_aliases builds COMMAND STRINGS and hands them to ssh; almost every bug it can have is a

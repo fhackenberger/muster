@@ -3008,6 +3008,144 @@ PYEOF
 
 # =====================================================================  the run
 
+# =====================================================================  job boxes
+#
+# The unattended path: spawn, brief, and collect an answer through the box's own home. Every test
+# here pre-writes .cbx-state, because a fresh box makes `job` wait for its claude to announce itself
+# — which in a real stack is minutes and here has to be a fact the fixture states.
+job_env() { export MUSTER_JOB_BRIEF_SETTLE=0 MUSTER_JOB_START_TIMEOUT=2; }
+
+test_job_briefs_and_collects() {
+	job_env
+	box_state j1 idle 60                       # its claude "started" after we did
+	cbx job j1 -m "price this chair" --detach
+	ok
+	stub_saw POST "/box/j1" || fail "the box was never spawned"
+	stub_saw POST "/box/j1/paste" || fail "the brief did not go through /paste"
+	# A brief is multi-line the moment the protocol footer is on it, and send-keys would submit it
+	# one line at a time — so /say must never be how a job is delivered.
+	if stub_saw POST "/box/j1/say"; then fail "a job brief must be pasted, not typed line by line"; fi
+	OUT="$(stub_body /box/j1/paste)"
+	has "price this chair"
+	has "muster-job-result.json"               # the footer names the file the hub actually watches
+
+	# Now the agent answers, and a second call collects it. Stdout is the file and nothing else.
+	box_result j1 muster-job-result.json '{"price_eur": 240}'
+	cbx job j1 --collect --timeout 5 --poll 1
+	ok
+	eq "$OUT" '{"price_eur": 240}' "the result file is what lands on stdout"
+}
+
+test_job_collect_times_out() {
+	job_env
+	box_state j2 idle 60
+	cbx job j2 --collect --timeout 1 --poll 1
+	eq "$RC" "3" "no answer must be its own exit status, not a generic failure"
+	has "wrote no ~/muster-job-result.json"
+	has "left up"                              # you can still go and look at it
+}
+
+test_job_collect_timeout_zero_is_one_look() {
+	job_env
+	box_state j2b idle 60
+	# A caller polling many boxes from one loop needs --timeout 0 to LOOK and return, never
+	# to block: kavintage's research daemon depends on exactly this.
+	local before after
+	before="$(date +%s)"
+	cbx job j2b --collect --timeout 0 --poll 5
+	after="$(date +%s)"
+	eq "$RC" "3" "nothing there yet is still exit 3"
+	[ "$((after - before))" -le 2 ] || fail "--timeout 0 waited $((after - before))s; it must not block"
+}
+
+test_job_result_path_cannot_escape_the_box() {
+	job_env
+	# $BOXES is every box's home, so '..' in a result path is a read of somebody else's box.
+	cbx job j3 --collect --result ../../other/home/.ssh/id_rsa
+	notok
+	has "must not contain '..'"
+	cbx job j3 --collect --result /etc/passwd
+	notok
+	has "not an absolute path"
+	# And it is checked BEFORE anything is spawned: a typo costs nothing.
+	if stub_saw POST "/box/j3"; then fail "a bad --result must be caught before the box is spawned"; fi
+}
+
+test_job_refuses_a_stale_result() {
+	job_env
+	box_state j4 idle 60
+	box_result j4 muster-job-result.json '{"from": "a job that ran yesterday"}'
+	cbx job j4 -m "do it again"
+	notok
+	has "still holds a result"
+	if stub_saw POST "/box/j4/paste"; then fail "nothing may be briefed while yesterday's answer is still there"; fi
+}
+
+test_job_purges_only_after_an_answer() {
+	job_env
+	box_state j5 idle 60
+	box_result j5 muster-job-result.json 'done'
+	cbx job j5 --collect --purge --timeout 5 --poll 1
+	ok
+	has "done"
+	stub_saw DELETE "/box/j5/purge" || fail "--purge should bin the box once the answer is in"
+
+	# A box that never answered is NOT purged: whatever went wrong is only visible in the box.
+	box_state j6 idle 60
+	cbx job j6 --collect --purge --timeout 1 --poll 1
+	eq "$RC" "3" "a timeout is exit 3"
+	if stub_saw DELETE "/box/j6/purge"; then fail "a timed-out job box must survive so you can look at it"; fi
+}
+
+test_job_keeps_unreviewed_work() {
+	job_env
+	handoff j7 1 >/dev/null                    # the box pushed a branch nobody has read
+	box_state j7 idle 60
+	box_result j7 muster-job-result.json 'ok'
+	cbx job j7 --collect --purge --timeout 5 --poll 1
+	ok
+	has "NOT purging"
+	if stub_saw DELETE "/box/j7/purge"; then fail "a script may not bin a box holding unreviewed work"; fi
+}
+
+test_job_waits_for_the_session_then_briefs_anyway() {
+	job_env
+	# No .cbx-state at all: an image without the activity hooks. That must degrade to "brief it
+	# anyway" — the old behaviour — never to a failure.
+	cbx job j8 -m "hello" --detach
+	ok
+	has "never reported a session start"
+	stub_saw POST "/box/j8/paste" || fail "the brief must still be delivered"
+
+	# A state file left over from an EARLIER session is not proof that this one is up.
+	box_state j9 idle -600
+	cbx job j9 -m "hello" --detach
+	ok
+	has "never reported a session start"
+}
+
+test_job_flags() {
+	job_env
+	box_state j10 idle 60
+	cbx job j10 -m "x" --no-protocol --detach
+	ok
+	OUT="$(stub_body /box/j10/paste)"
+	hasnt "how this job reports back"
+
+	cbx job j11 -m "x" --detach --collect
+	notok
+	has "two halves of one run"
+
+	cbx job j12
+	notok
+	has "needs a brief"
+
+	box_state j13 idle 60
+	cbx job j13 -m "x" --timeout abc
+	notok
+	has "wants a number of seconds"
+}
+
 run "syntax: every script parses"                  test_syntax
 run "skills: muster ships its own, and the image carries them" test_skills_ship
 run "config: no project defaults in the source tree" test_no_project_defaults
@@ -3070,6 +3208,15 @@ run "import: replaces the agent's branch"          test_import_replaces_the_bran
 run "box: a refused name says which rule"          test_box_name_rejection_is_readable
 run "box: spawn / ls / recreate / kill"            test_box_lifecycle
 run "box: retired boxes are listed and purgeable" test_box_retired_and_purge
+run "job: briefs a box and collects its answer"   test_job_briefs_and_collects
+run "job: no answer is exit 3, not a hang"       test_job_collect_times_out
+run "job: --timeout 0 looks once and returns"     test_job_collect_timeout_zero_is_one_look
+run "job: a result path cannot leave the box"    test_job_result_path_cannot_escape_the_box
+run "job: yesterday's answer is not this one"    test_job_refuses_a_stale_result
+run "job: --purge only after an answer"          test_job_purges_only_after_an_answer
+run "job: never bins unreviewed work"            test_job_keeps_unreviewed_work
+run "job: no hooks still gets briefed"           test_job_waits_for_the_session_then_briefs_anyway
+run "job: flag handling"                         test_job_flags
 run "ls: only ls pays for the retired sizes"       test_retired_sizes_only_ls_pays_for_them
 run "ls: an unknown size prints '?', never 0B"     test_retired_size_unknown_prints_a_question_mark
 run "q: one box listing per frame"                 test_box_list_is_fetched_once_per_frame
