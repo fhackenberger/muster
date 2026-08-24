@@ -1073,6 +1073,38 @@ def box_job(box_dir, base, merge):
 	return out
 
 
+def ensure_home_parents(anchor, dsts):
+	"""Create the PARENT directories of every home-relative mount destination, owned by the box user.
+
+	DOCKER CREATES A MISSING MOUNTPOINT — and its missing parents — AS ROOT. A one-level destination
+	is harmless (docker makes /home/dev/repo and immediately covers it with the mount), but a nested
+	one leaves real, root-owned, uncovered directories inside a home that must belong to uid 1000
+	throughout. `.local/share/chezmoi` is the case that taught us: it left ~/.local and
+	~/.local/share owned by root, and the next tool that wanted to create ~/.local/share/<its own
+	dir> simply could not. Nothing warns; the tool reports a bare "Permission denied" about a path
+	the mount table never mentions, days after the row that caused it was added.
+
+	Existing directories are re-owned rather than skipped, so a box that already has the root-owned
+	version is repaired by `cbx recreate` instead of needing to be purged."""
+	for dst in dsts:
+		# parse_mounts/safe_dst hand back ABSOLUTE container paths (/home/dev/…). Anything outside the
+		# home is not the anchor's business — the checkout can be mounted elsewhere entirely.
+		if not dst or not dst.startswith(HOME_IN + "/"):
+			continue
+		parent = os.path.dirname(dst[len(HOME_IN) + 1:])
+		if not parent:
+			continue                      # a top-level dst: docker's mountpoint, covered immediately
+		cur = anchor
+		for part in parent.split("/"):
+			cur = os.path.join(cur, part)
+			os.makedirs(cur, exist_ok=True)
+			try:
+				if os.stat(cur).st_uid != int(BOX_UID):
+					os.chown(cur, int(BOX_UID), int(BOX_GID))
+			except OSError:
+				pass                      # best effort: a home we cannot fix is not a spawn we refuse
+
+
 def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	with _golden_lock:
 		golden = current_golden()
@@ -1094,6 +1126,8 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	slot = alloc_slot(box_dir) if forwards else None
 	svc_env = parse_service_env()
 	rows, checkout_dst, checkout_ro = parse_mounts(golden)
+	# Before docker gets the chance to invent them as root — see ensure_home_parents.
+	ensure_home_parents(anchor, [r[1] for r in rows] + [checkout_dst])
 	claude_args = session_args(box_dir, resume, checkout_dst)
 	job = box_job(box_dir, base, merge)
 	# Project policy for how this box's claude comes up (MUSTER_CLAUDE_PERMISSION_MODE / MUSTER_BOX_PROMPT).

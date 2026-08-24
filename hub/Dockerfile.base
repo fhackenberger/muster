@@ -23,8 +23,21 @@ ARG MUSTER_VERSION=dev
 ENV MUSTER_VERSION=${MUSTER_VERSION}
 
 # The hub's uid-1000 user. Home /home/dev matches the boxes' server user, unifying every bind-mount path.
+#
+# The XDG base directories are created HERE, empty, purely so that DOCKER never has to. A bind mount
+# whose destination does not exist is created by docker — along with every missing parent — as ROOT,
+# and unlike the mountpoint itself those parents stay visible and root-owned inside a home that has to
+# be uid 1000 throughout. One `mounts` row at .local/share/<x> is enough to make ~/.local and
+# ~/.local/share unwritable, and the tool that then fails is not the one named in the row: it is
+# whatever next tried to create its own directory there, reporting a bare "Permission denied" about a
+# path the mount table never mentions. (That is what a chezmoi row did to tuicr, and so to `cbx
+# review`.) The BOX side cannot be fixed here — its /home/dev is itself a bind mount, so anything the
+# image leaves under it is masked — and is handled by the broker's ensure_home_parents instead.
 RUN groupadd -g 1000 dev \
-	&& useradd -m -u 1000 -g 1000 -s /bin/bash dev
+	&& useradd -m -u 1000 -g 1000 -s /bin/bash dev \
+	&& mkdir -p /home/dev/.local/share /home/dev/.local/state /home/dev/.local/bin \
+	            /home/dev/.config /home/dev/.cache \
+	&& chown -R 1000:1000 /home/dev/.local /home/dev/.config /home/dev/.cache
 
 # Shared tooling (base utils, Node + npm via fnm, the pinchtab binary, the tuicr review TUI, tmux, git
 # bash-completion, the ghostty terminfo, socat) — installed by common-setup.sh, the SAME script the

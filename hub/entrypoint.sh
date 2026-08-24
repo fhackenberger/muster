@@ -131,6 +131,42 @@ check_mounts() {
 }
 check_mounts || true
 
+# THE OTHER THING A MOUNT ROW CAN BREAK, and the one that used to break it silently. Docker creates a
+# missing mount destination — and every missing parent — as ROOT. The destination itself is then
+# covered by the mount and nobody notices, but a NESTED destination leaves its parents behind, real
+# and root-owned, in a home that is uid 1000 throughout. Whatever next wants to create a directory
+# there simply cannot, and says so in its own words about a path the mounts table never mentions:
+# `.local/share/chezmoi` cost us ~/.local and ~/.local/share, and what actually failed, days later,
+# was `cbx review` — tuicr, unable to make ~/.local/share/tuicr, reporting "Permission denied".
+#
+# We run as dev, so `-w` asks exactly the right question and we cannot fix it here: the repair is to
+# create the directory in the image (hub/Dockerfile.base) so docker never invents it. Warn loudly
+# instead of failing — a hub that boots with one unwritable corner is still a hub.
+check_home_parents() {
+	[ -n "${MOUNTS_FILE:-}" ] && [ -r "$MOUNTS_FILE" ] || return 0
+	local src dst hub rest parent cur bad=0
+	local home="${HOMEROOT:-/home/dev}"        # overridable so this is testable
+	while read -r src dst hub rest; do
+		case "${src:-}" in ''|'#'*|CHECKOUT) continue ;; esac
+		case "${hub:-}" in rw|ro) ;; *) continue ;; esac
+		parent="$(dirname "$dst")"
+		[ "$parent" != "." ] || continue          # top-level: the mount covers it immediately
+		# Walk UP from the deepest parent. No IFS games: `local IFS=/` would outlive this loop and
+		# silently change how `read` splits every remaining line of the table.
+		cur="$home/$parent"
+		while [ "$cur" != "$home" ] && [ "$cur" != / ]; do
+			if [ -d "$cur" ] && [ ! -w "$cur" ]; then
+				echo "hub: $cur is not writable by $(id -un) — docker created it for the '$dst' mount." >&2
+				echo "hub:   anything wanting its own directory under there fails with 'Permission denied'." >&2
+				bad=1
+			fi
+			cur="$(dirname "$cur")"
+		done
+	done < "$MOUNTS_FILE"
+	[ "$bad" = 0 ] || echo "hub: fix by creating it in hub/Dockerfile.base so docker never has to" >&2
+}
+check_home_parents || true
+
 # The stack's own name for the CLI. On the laptop each stack gets its own command family from a prefix
 # (`muster_stack app …` -> `app`, `apphub`, `appbox`, …), and it would be a poor joke if the name changed the
 # moment you stepped into the hub through `apphub`. So the hub answers to the same word.
