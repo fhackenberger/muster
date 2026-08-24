@@ -308,7 +308,12 @@ REMOTE
 		echo "${_MUSTER_SELF}: http://localhost:${LP[$i]}  ->  $t:${RP[$i]}  ($ip)" >&2
 	done
 	echo "${_MUSTER_SELF}: tunnel up — Ctrl-C to close" >&2
-	ssh -N "${Largs[@]}" "$MUSTER_SERVER"
+	# -n: STDIN FROM /dev/null, never your terminal. A forwarding-only ssh has no use for stdin, but
+	# given a tty it takes one anyway — and then a Ctrl-Z leaves a STOPPED process still holding the
+	# terminal, which starts swallowing what you type: characters vanish, `bg` needs several presses
+	# per letter, and it only clears when the process is killed. Nothing is lost by detaching it:
+	# Ctrl-C reaches ssh through the foreground process group, not through stdin.
+	ssh -n -N "${Largs[@]}" "$MUSTER_SERVER"
 }
 
 # take new commits from origin onto the dev branch, then tell every agent to re-base on them:

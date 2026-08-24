@@ -1513,7 +1513,9 @@ test_aliases_tunnel_specs() {
 	al 'cbxtun work1:4200 hub:8080'
 	# One resolution round-trip, then -L per spec against the resolved container IPs.
 	ssh_has "bash -s proj"
-	ssh_has "ssh -N -L 127.0.0.1:4200:10.0.0."
+	# -n before -N: the tunnel must never hold your terminal's stdin. Without it, suspending the
+	# tunnel leaves a stopped process attached to the tty that eats what you type afterwards.
+	ssh_has "ssh -n -N -L 127.0.0.1:4200:10.0.0."
 	ssh_has "-L 127.0.0.1:8080:10.0.0."
 	al 'cbxtun 9000'                    # bare PORT means the hub
 	ssh_has "-L 127.0.0.1:9000:10.0.0."
@@ -1989,6 +1991,38 @@ for n in good:
     assert b.valid_branch(n), f"should accept {n!r}"
 for n in bad:
     assert not b.valid_branch(n), f"should reject {n!r}"
+print("ok")
+PY
+)"; RC=$?
+	ok; has ok
+}
+
+# The box half of the mount-parent fix. A box's /home/dev IS a bind mount, so the image cannot
+# pre-create anything there — the broker has to, in the anchor, before docker invents the parents as
+# root. Existing directories are re-owned rather than skipped, so `cbx recreate` repairs a box that
+# already has the root-owned version instead of it needing a purge.
+test_broker_creates_home_mount_parents() {
+	OUT="$(python3 - "$BROKER_PY" "$FIX" <<'PY' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+
+anchor = os.path.join(sys.argv[2], "anchor"); os.makedirs(anchor, exist_ok=True)
+b.BOX_UID = b.BOX_GID = str(os.getuid())      # chown to ourselves: the suite is not root
+b.ensure_home_parents(anchor, [
+    "/home/dev/.local/share/chezmoi",         # nested: both parents must appear
+    "/home/dev/repo",                         # top-level: nothing to create
+    "/somewhere/else/entirely",               # outside the home: not the anchor's business
+    "",
+])
+assert os.path.isdir(os.path.join(anchor, ".local", "share")), "the nested parents were not created"
+assert not os.path.exists(os.path.join(anchor, ".local", "share", "chezmoi")), \
+    "the destination itself must be left to docker"
+assert not os.path.exists(os.path.join(anchor, "repo")), "a top-level dst needs no parent"
+assert not os.path.exists(os.path.join(anchor, "somewhere")), "a dst outside the home was created"
+assert not os.path.exists(os.path.join(anchor, "home")), \
+    "the absolute /home/dev prefix was not stripped — it was recreated inside the anchor"
 print("ok")
 PY
 )"; RC=$?
@@ -2844,6 +2878,7 @@ run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 
 run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: retired sizes are opt-in"             test_broker_retired_sizes_are_opt_in
+run "broker: home mount parents are pre-created"   test_broker_creates_home_mount_parents
 run "broker: the branch job survives a recreate"   test_broker_persists_the_branch_job
 run "broker: query parameters"                     test_broker_query_params
 run "broker: a killed box resumes its session"      test_broker_session_resume
@@ -2895,6 +2930,46 @@ test_hub_reaps_the_pinchtab_profile() {
 	[ "$reap" -lt "$auto" ] || fail "the profile is reaped AFTER autostart — pinchtab would be using it"
 }
 
+# A NESTED MOUNT DESTINATION LEAVES ROOT-OWNED PARENTS. Docker creates a missing destination, and
+# every missing parent, as root; the destination is then covered by the mount, but the parents stay —
+# real, root-owned, in a home that is uid 1000 throughout. The tool that fails afterwards is not the
+# one in the mounts row: `.local/share/chezmoi` is what made ~/.local/share unwritable, and what broke
+# was tuicr, unable to create ~/.local/share/tuicr, so `cbx review` died with "Permission denied".
+# The hub cannot repair it (it runs as dev), so it must at least SAY so at boot.
+test_hub_warns_about_unwritable_mount_parents() {
+	fixture
+	[ "$(id -u)" != 0 ] || { skip "running as root: every -w test passes regardless"; return 0; }
+	local blk="$FIX/parents.sh"
+	# The function, verbatim from the entrypoint, so the test cannot drift from what boots.
+	awk '/^check_home_parents\(\) \{/,/^\}$/' "$ROOT/hub/entrypoint.sh" > "$blk"
+	[ -s "$blk" ] || fail "could not find check_home_parents in hub/entrypoint.sh"
+	echo 'check_home_parents' >> "$blk"
+	printf './data/chezmoi\t.local/share/chezmoi\tro\tro\n' > "$FIX/mounts-t"
+	mkdir -p "$FIX/fakehome/.local/share"
+	# Writable: the good case must stay silent, or the warning is noise nobody reads.
+	OUT="$(HOMEROOT="$FIX/fakehome" MOUNTS_FILE="$FIX/mounts-t" bash "$blk" 2>&1)"; RC=$?
+	ok; eq "$OUT" "" "a writable home must produce no warning"
+	# What docker leaves behind: the parent exists and we cannot write to it.
+	chmod 555 "$FIX/fakehome/.local/share"
+	OUT="$(HOMEROOT="$FIX/fakehome" MOUNTS_FILE="$FIX/mounts-t" bash "$blk" 2>&1)"; RC=$?
+	chmod 755 "$FIX/fakehome/.local/share"          # so the fixture can be cleaned up
+	has ".local/share is not writable"
+	has "Permission denied"                          # names the symptom you will actually see
+	has ".local/share/chezmoi"                       # …and the row that caused it
+	# THE CHAIN, not just the nearest parent. `.local/share/chezmoi` made BOTH ~/.local and
+	# ~/.local/share root-owned; a check that looked only at the immediate parent would clear a home
+	# whose ~/.local is still unwritable, which is the half that breaks ~/.local/bin next.
+	chmod 555 "$FIX/fakehome/.local"
+	OUT="$(HOMEROOT="$FIX/fakehome" MOUNTS_FILE="$FIX/mounts-t" bash "$blk" 2>&1)"
+	chmod 755 "$FIX/fakehome/.local"
+	has "/.local is not writable"
+	# A top-level destination is NOT a warning: docker covers that mountpoint immediately.
+	printf './data/npm-cache\t.npm\trw\trw\n' > "$FIX/mounts-t"
+	OUT="$(HOMEROOT="$FIX/fakehome" MOUNTS_FILE="$FIX/mounts-t" bash "$blk" 2>&1)"
+	eq "$OUT" "" "a top-level mount destination has no parents to warn about"
+}
+
+run "hub: warns about unwritable mount parents"    test_hub_warns_about_unwritable_mount_parents
 run "pinchtab: the hub seeds a token"              test_pinchtab_token
 run "pinchtab: the hub reaps the profile"           test_hub_reaps_the_pinchtab_profile
 run "pinchtab: the broker hands boxes that token"  test_broker_pinchtab_token
