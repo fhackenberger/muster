@@ -107,12 +107,69 @@ _muster_need_server() {
 	return 1
 }
 
+# WHAT A DROPPED CONNECTION LEAVES BEHIND, and why your shell then prints gibberish at you.
+#
+# A TUI at the far end (claude in a box, tuicr in `cbx review`) switches THE TERMINAL into modes only
+# it understands: SGR mouse reporting with motion (1003/1006) and the kitty keyboard protocol. Both
+# are turned off by the program on its way out. When ssh dies instead — an idle timeout, a hub
+# restart, a closed lid — nothing sends the "off" sequences, so ghostty goes on reporting every mouse
+# movement and every keypress in an encoding your local shell cannot read, and prints them:
+#
+#     35;62;35M35;57;37M…      mouse motion, one report per movement
+#     9;1:3u9;5u               keys, in the kitty encoding
+#
+# The far end is gone, so only this side can clean up. Restoring the SAVED termios rather than running
+# `stty sane` matters: sane would also discard whatever the user configured (-ixon and friends), and
+# this runs after every session, not only the broken ones.
+#
+# Everything is written to /dev/tty, never stdout: _muster_ssh is also called inside command
+# substitutions (`out="$(_muster_ssh …)"` in _muster_run and _muster_box_spawn), where a printf on
+# stdout would be captured as part of the output and corrupt what the caller then parses.
+# HAVING a controlling terminal, which `[ -w /dev/tty ]` does NOT answer: the device node exists and
+# is mode 666 even in a cron job or a subshell that has none, so the test passes and the open then
+# fails with ENXIO. Only trying it tells you. The redirect is inside a group because `2>/dev/null` on
+# a simple command does not suppress a REDIRECTION error — bash reports that before the command runs.
+_muster_has_tty() { { : > /dev/tty; } 2>/dev/null; }
+_muster_tty_save() { _muster_has_tty || return 0; { stty -g < /dev/tty; } 2>/dev/null || true; }
+_muster_tty_restore() {
+	local saved="${1:-}"
+	_muster_has_tty || return 0
+	[ -z "$saved" ] || { stty "$saved" < /dev/tty; } 2>/dev/null || true
+	#  ?1000/1002/1003  mouse: click, drag, any-motion     ?1006/1015/1016  its SGR/urxvt encodings
+	#  ?25h             cursor visible again               \033[<u          pop the kitty key stack
+	#  ?1049l           leave the alternate screen, so a TUI that died fullscreen gives scrollback back
+	printf '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l\033[?1016l\033[?25h\033[<u\033[?1049l' \
+		> /dev/tty 2>/dev/null
+	return 0
+}
+
+# `<prefix>tty` — do it by hand, for a terminal wrecked by something outside these helpers (a manual
+# ssh, a TUI killed with -9). Here `stty sane` IS the right tool: you are explicitly saying the state
+# is wrong, and there is no saved copy to go back to.
+_muster_tty_fix() {
+	_muster_has_tty || { echo "${_MUSTER_SELF}: no terminal here" >&2; return 1; }
+	_muster_tty_restore ""
+	{ stty sane < /dev/tty; } 2>/dev/null || true
+	echo "${_MUSTER_SELF}: mouse reporting, key encoding and terminal modes reset" >&2
+}
+
+# KEEPALIVES, because half of these drops are avoidable. An idle ssh through a NAT or a firewall is
+# collected silently after a few minutes, and you find out by typing into a session that is already
+# dead. ServerAlive probes ride the connection every 30s and keep it in the table; three missed ones
+# (~90s) is a real failure, and failing then beats hanging. It does nothing about a hub restart, which
+# is why the cleanup above exists too. MUSTER_TRANSPORT=mosh sidesteps both.
+_MUSTER_SSH_KEEPALIVE=(-o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+
 # One-shot commands: run over ssh so stdout/stderr land on your terminal and persist in scrollback.
 # `-t` gives the remote a PTY (proper width/color for `--help` etc.); ssh doesn't use an alternate
 # screen, so nothing is wiped on exit.
 _muster_ssh() {
 	_muster_need_server || return 1
-	ssh -t "$MUSTER_SERVER" "$1"
+	local saved rc
+	saved="$(_muster_tty_save)"
+	ssh "${_MUSTER_SSH_KEEPALIVE[@]}" -t "$MUSTER_SERVER" "$1"; rc=$?
+	_muster_tty_restore "$saved"
+	return "$rc"
 }
 
 # Long-lived interactive sessions: ssh by default, mosh when MUSTER_TRANSPORT=mosh (roaming). ssh runs
@@ -122,11 +179,16 @@ _muster_ssh() {
 # `: "${MUSTER_TRANSPORT:=ssh}"` default above, so an empty value still means ssh, not mosh.
 _muster_session() {
 	_muster_need_server || return 1
+	local saved rc
+	# The modes a dropped session leaves behind are this side's to undo — see _muster_tty_restore.
+	saved="$(_muster_tty_save)"
 	if [ "${MUSTER_TRANSPORT:-ssh}" = mosh ]; then
-		mosh "$MUSTER_SERVER" -- bash -lc "$1"
+		mosh "$MUSTER_SERVER" -- bash -lc "$1"; rc=$?
 	else
-		ssh -t "$MUSTER_SERVER" "$1"
+		ssh "${_MUSTER_SSH_KEEPALIVE[@]}" -t "$MUSTER_SERVER" "$1"; rc=$?
 	fi
+	_muster_tty_restore "$saved"
+	return "$rc"
 }
 
 # The `-e …` flags every `docker exec` below needs, because docker propagates NOTHING from your
@@ -1077,7 +1139,7 @@ declare -A _MUSTER_COMP_PREFIX=() _MUSTER_COMP_FN=()
 _MUSTER_FAMILY=(
 	-:_muster_run  hub:_muster_hub_attach  box:_muster_box_attach  tun:_muster_tun  sync:_muster_sync
 	export:_muster_export  import:_muster_import  cp:_muster_cp  exec:_muster_exec  refresh:_muster_refresh
-	peek:_muster_peek  paste:_muster_paste
+	peek:_muster_peek  paste:_muster_paste  tty:_muster_tty_fix
 )
 # suffix:completion-function, for the ones that complete more than nothing.
 _MUSTER_FAMILY_COMP=(

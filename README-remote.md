@@ -438,6 +438,13 @@ That gives you:
   Use this for logs, screenshots and build artifacts; use `cbxexport`/`cbximport` for **code**, since
   those move a reviewable git patch rather than loose files. The destination is extracted into if it
   is an existing directory and treated as the new name otherwise — same rule whichever way you copy.
+- **`cbxtty`** — unwedge a terminal that has started printing gibberish at you (`35;62;35M…`,
+  `9;1:3u…`). Those are your terminal's own **mouse-motion** and **kitty-keyboard** reports: a TUI in
+  the box switched those modes on, and a connection that dropped instead of exiting never switched
+  them off. The sessions started by these helpers now restore the terminal themselves — this is for a
+  terminal wrecked by something else (a manual ssh, a TUI killed with `-9`). Prevention for the other
+  half, the idle timeout, is `ServerAliveInterval` on every ssh here; `MUSTER_TRANSPORT=mosh` avoids
+  the problem entirely by surviving the disconnect.
 - **`cbxpaste <box>`** — put the image **on your clipboard** in front of an agent. Take a screenshot,
   run it, and it lands in the box as `~/keep/pasted/<timestamp>.png` with the path already **typed**
   into that agent's prompt:

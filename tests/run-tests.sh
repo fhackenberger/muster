@@ -1435,7 +1435,7 @@ test_service_ready_is_cached() {
 test_aliases_forward_to_the_hub() {
 	alias_fixture
 	al 'cbx ls'
-	ssh_has "ssh -t root@test.example docker exec -it"
+	ssh_has "-t root@test.example docker exec -it"
 	ssh_has "label=com.docker.compose.service=hub"
 	# THE REMOTE BINARY IS `muster`, NEVER THE PREFIX. `muster` is in every image; the prefix is a
 	# symlink the hub entrypoint makes from MUSTER_PREFIX, so it only exists once that variable has
@@ -1486,7 +1486,7 @@ test_aliases_box_spawn_attaches() {
 # transport; everything else is one-shot and must stay on ssh or its output would be wiped.
 test_aliases_transport_split() {
 	alias_fixture
-	al 'cbx q --text'; ssh_has "ssh -t"; ssh_hasnt "mosh"
+	al 'cbx q --text'; ssh_has "-t root@test.example"; ssh_hasnt "mosh"
 	al 'MUSTER_TRANSPORT=mosh cbx q';       ssh_has "mosh"
 	al 'MUSTER_TRANSPORT=mosh cbx logs backend'; ssh_has "mosh"
 	al 'MUSTER_TRANSPORT=mosh cbx ls';     ssh_hasnt "mosh"   # one-shot: ssh even under mosh
@@ -1497,9 +1497,9 @@ test_aliases_transport_split() {
 	MUSTER_TRANSPORT=mosh al 'cbx logs backend'
 	ssh_has "mosh "
 	MUSTER_TRANSPORT=mosh al 'cbx logs backend --tail 200'
-	ssh_has "ssh -t"; ssh_hasnt "mosh "
+	ssh_has "-t root@test.example"; ssh_hasnt "mosh "
 	MUSTER_TRANSPORT=mosh al 'cbx logs backend --file'
-	ssh_has "ssh -t"; ssh_hasnt "mosh "
+	ssh_has "-t root@test.example"; ssh_hasnt "mosh "
 }
 
 test_aliases_quote_hostile_arguments() {
@@ -1640,6 +1640,44 @@ test_aliases_set_the_tab_title() {
 	# …and never into a pipe, where the escape would land in whatever is reading.
 	al 'cbxbox work1 | cat'
 	hasnt "]2;"
+}
+
+# A DROPPED SESSION LEAVES THE TERMINAL SWITCHED ON. The TUI at the far end enables SGR mouse motion
+# reporting and the kitty keyboard protocol and turns both off as it exits — but when ssh dies (idle
+# timeout, hub restart) nothing sends the "off" sequences, and the terminal keeps reporting into a
+# shell that prints the reports as text: `35;62;35M…`, `9;1:3u…`. Only this side can clean up.
+test_aliases_restore_the_terminal_after_a_session() {
+	command -v script >/dev/null || { skip "no 'script' for a pseudo-terminal"; return 0; }
+	alias_fixture
+	TTY=1 al 'cbxbox work1'
+	ok
+	has "[?1003l"        # any-motion mouse reporting off — the one that produces the flood
+	has "[?1006l"        # …and its SGR encoding
+	has "[<u"            # the kitty keyboard stack, popped
+	has "[?1049l"        # and out of the alternate screen, so scrollback comes back
+	# One-shots go through the same door: `cbx review` runs a TUI over ssh -t, and a drop there leaves
+	# exactly the same mess behind.
+	TTY=1 al 'cbx ls'
+	ok; has "[?1003l"
+	# Keepalives, so the idle-timeout half of the problem stops happening in the first place.
+	ssh_has "ServerAliveInterval=30"
+	ssh_has "ServerAliveCountMax=3"
+}
+
+# The escapes must never reach STDOUT: _muster_ssh is also called inside command substitutions, where
+# a printf would be captured as part of the output the caller parses — the box name, in the case that
+# matters, which `cbx box` reads back out of the spawn message to know what to attach to.
+test_aliases_terminal_restore_never_touches_stdout() {
+	command -v script >/dev/null || { skip "no 'script' for a pseudo-terminal"; return 0; }
+	alias_fixture
+	# In a FILE, dot-sourced. TTY mode passes the code through a double-quoted `script -qec "…"`, so a
+	# $( ) written inline here would be expanded by THIS shell long before cbx ever ran.
+	cat > "$FIX/capture.sh" <<'EOF'
+out="$(cbx ls)"
+case "$out" in *1003l*) echo POLLUTED ;; *) echo CLEAN ;; esac
+EOF
+	TTY=1 al ". $FIX/capture.sh"
+	ok; has "CLEAN"; hasnt "POLLUTED"
 }
 
 test_aliases_refuse_without_a_server() {
@@ -1804,7 +1842,7 @@ test_aliases_interactive_gets_a_pty() {
 	command -v script >/dev/null || { skip "no 'script' for a pseudo-terminal"; return 0; }
 	alias_fixture
 	AL_PROJECT_FILE=1 TTY=1 al 'cbxpsql mydb'
-	ssh_has "ssh -t"; ssh_has "docker exec -it -u postgres"
+	ssh_has "-t root@test.example"; ssh_has "docker exec -it -u postgres"
 }
 
 # =====================================================================  minto
@@ -3056,6 +3094,8 @@ run "aliases: pipes never allocate a PTY"          test_aliases_pipes_never_allo
 run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the_hub_too
 run "aliases: tunnel specs"                        test_aliases_tunnel_specs
 run "aliases: the tab title names the box"         test_aliases_set_the_tab_title
+run "aliases: a session restores the terminal"     test_aliases_restore_the_terminal_after_a_session
+run "aliases: the restore never hits stdout"       test_aliases_terminal_restore_never_touches_stdout
 run "paste: an image, then attach"                 test_aliases_paste_an_image
 run "paste: says so when you are attached"         test_aliases_paste_when_already_attached
 run "paste: no clipboard reader says which"        test_aliases_paste_without_a_clipboard_reader
