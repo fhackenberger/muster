@@ -408,6 +408,11 @@ That gives you:
   is already running is on neither branch and attaching would skip the setup it asked for.
 - **`cbxpsql <dbname>`** — open a psql shell on the stack's `db` (e.g. `cbxpsql myapp_dev`).
 - **`cbxtun [spec…]`** — SSH-tunnel hub and/or agent-box dev ports to your laptop (default `hub:4211`).
+  Tunnels deliberately bypass ssh multiplexing (`ControlPath=none`). With `ControlMaster auto` in your
+  config, `-L` installs the forwards on the shared **master**, which outlives the Ctrl-C that ends
+  your tunnel — the ports stay bound by a process you cannot see, `ControlPersist` never expires it
+  (an open forward keeps it busy), and the next tunnel fails with `bind: Address already in use`. If
+  you meet that from an older version or a hand-run ssh, `ssh -O exit <server>` frees them.
 - **`cbxfe <box>` / `cbxfe <box> --own`** — project shorthand: open **one agent's** frontend at
   `http://localhost:4211`, with **both** candidate backends tunnelled alongside it — the hub's
   (`:8091`, the default) *and* that box's own (`:<8900+slot>`, what `$FRONTEND_DEV_BACKEND_URL_OWN`

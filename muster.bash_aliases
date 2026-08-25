@@ -406,7 +406,24 @@ REMOTE
 	# terminal, which starts swallowing what you type: characters vanish, `bg` needs several presses
 	# per letter, and it only clears when the process is killed. Nothing is lost by detaching it:
 	# Ctrl-C reaches ssh through the foreground process group, not through stdin.
-	ssh -n -N "${Largs[@]}" "$MUSTER_SERVER"
+	#
+	# NOT THROUGH THE MULTIPLEXED MASTER. With `ControlMaster auto` in your ssh config — a common
+	# setting, and a good one for every other command here — `-L` does not open a connection of its
+	# own: it asks the EXISTING master to install the forwards. Ctrl-C then kills your client while the
+	# master keeps running (ControlPersist) with the listeners still bound, so the ports stay held by a
+	# process you never see, and the next tunnel dies with
+	#
+	#     bind [127.0.0.1]:4211: Address already in use
+	#
+	# which names the symptom and not the cause. ControlPersist does not save you either: an open
+	# forward keeps the master busy, so it never goes idle and never expires — the ports are held until
+	# you know to run `ssh -O exit`. A tunnel's forwards have to live and die with the process you are
+	# pressing Ctrl-C on, so this one connection opts out of multiplexing.
+	#
+	# ExitOnForwardFailure for the same reason: a forward that could not bind is a tunnel that silently
+	# does not do what its own output just claimed. Fail, and say which port.
+	ssh -n -N -o ControlPath=none -o ControlMaster=no -o ExitOnForwardFailure=yes \
+		"${Largs[@]}" "$MUSTER_SERVER"
 }
 
 # take new commits from origin onto the dev branch, then tell every agent to re-base on them:

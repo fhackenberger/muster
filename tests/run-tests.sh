@@ -1541,7 +1541,15 @@ test_aliases_tunnel_specs() {
 	ssh_has "bash -s proj"
 	# -n before -N: the tunnel must never hold your terminal's stdin. Without it, suspending the
 	# tunnel leaves a stopped process attached to the tty that eats what you type afterwards.
-	ssh_has "ssh -n -N -L 127.0.0.1:4200:10.0.0."
+	ssh_has "ssh -n -N"
+	ssh_has "-L 127.0.0.1:4200:10.0.0."
+	# NOT through a multiplexed master: it would install the forwards on a connection that outlives
+	# your Ctrl-C, leaving the ports bound by a process you cannot see and the next tunnel refused
+	# with "Address already in use".
+	ssh_has "ControlPath=none"
+	ssh_has "ControlMaster=no"
+	# …and a forward that cannot bind must fail loudly, not leave a tunnel that lies about itself.
+	ssh_has "ExitOnForwardFailure=yes"
 	ssh_has "-L 127.0.0.1:8080:10.0.0."
 	al 'cbxtun 9000'                    # bare PORT means the hub
 	ssh_has "-L 127.0.0.1:9000:10.0.0."
