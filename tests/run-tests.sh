@@ -2546,6 +2546,94 @@ PYEOF
 	ok; has ok
 }
 
+# THE STACK'S OWN CLAUDE SETTINGS. A statusLine or a model is project policy, but it has to land in
+# claude's settings.json — the file that holds the login, that claude rewrites itself, and that every
+# box shares. So it is merged, never templated, and the whole test here is about what the merge must
+# NOT take with it.
+test_broker_claude_settings() {
+	fixture
+	mkdir -p "$FIX/claude"
+	cat > "$FIX/claude/settings.json" <<-'EOF'
+		{
+		  "model": "opus",
+		  "permissions": {"defaultMode": "plan", "allow": ["Bash(ls:*)"]},
+		  "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "my-own-hook"}]}]}
+		}
+	EOF
+	cat > "$FIX/claude-settings.json" <<-'EOF'
+		// a whole-line comment, because a config nobody may annotate is one nobody dares change
+		{
+		  "statusLine": {"type": "command", "command": "bash ~/.claude/statusline-command.sh"},
+		  "permissions": {"defaultMode": "acceptEdits"}
+		}
+	EOF
+	OUT="$(CLAUDE_HOME="$FIX/claude" CLAUDE_SETTINGS_FILE="$FIX/claude-settings.json" \
+		BOX_UID=4242 BOX_GID=4242 python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, json, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+FIX = sys.argv[2]
+S = os.path.join(os.environ["CLAUDE_HOME"], "settings.json")
+load = lambda: json.load(open(S))
+
+b.ensure_claude_settings()
+d = load()
+assert d["statusLine"]["command"] == "bash ~/.claude/statusline-command.sh", d
+# A NESTED key merges into its object instead of replacing it: setting defaultMode must not silently
+# throw away the permissions someone allowed.
+assert d["permissions"] == {"defaultMode": "acceptEdits", "allow": ["Bash(ls:*)"]}, d
+assert d["model"] == "opus", d                                    # untouched keys stay untouched
+assert d["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "my-own-hook", d
+
+# Idempotent: this runs on every single spawn.
+b.ensure_claude_settings()
+assert load() == d, (d, load())
+
+# The activity hooks go on AFTER, so a project's `hooks` block can never switch off the hub's view of
+# what a box is doing.
+b.ensure_activity_hooks()
+cmds = [h["command"] for v in load()["hooks"].values() for g in v for h in g["hooks"]]
+assert "muster-activity idle" in cmds and "my-own-hook" in cmds, cmds
+
+# REMOVING a key from the project file removes it from settings.json — otherwise the file only ever
+# grows, and a setting you deleted keeps applying with no way to be rid of it short of the server.
+open(os.path.join(FIX, "claude-settings.json"), "w").write('{"permissions": {"defaultMode": "acceptEdits"}}')
+b.ensure_claude_settings()
+d = load()
+assert "statusLine" not in d, d
+assert d["permissions"] == {"defaultMode": "acceptEdits", "allow": ["Bash(ls:*)"]}, d
+assert d["model"] == "opus" and d["hooks"], d      # and takes nothing else with it
+
+# ...but only while the value is still OURS. Once someone has changed it by hand, it is theirs:
+# silently reverting an edit is the worse of the two surprises.
+d["permissions"]["defaultMode"] = "bypassPermissions"
+json.dump(d, open(S, "w"))
+open(os.path.join(FIX, "claude-settings.json"), "w").write('{}')
+b.ensure_claude_settings()
+assert load()["permissions"]["defaultMode"] == "bypassPermissions", load()
+
+# A BROKEN project file applies nothing and touches nothing — a stack without its statusLine beats a
+# stack whose settings.json (and login) we just rewrote.
+before = open(S).read()
+open(os.path.join(FIX, "claude-settings.json"), "w").write('{"statusLine": nope}')
+b.ensure_claude_settings()
+assert open(S).read() == before, "a syntax error must not reach settings.json"
+# Same the other way round: settings.json is the file with the login in it.
+open(S, "w").write("{ not json at all")
+open(os.path.join(FIX, "claude-settings.json"), "w").write('{"model": "sonnet"}')
+b.ensure_claude_settings()
+assert open(S).read() == "{ not json at all", "an unparseable settings.json must be left alone"
+
+# No project file at all is not an error — most stacks will not have one.
+os.remove(os.path.join(FIX, "claude-settings.json"))
+b.ensure_claude_settings()
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 # THE PROJECT'S PER-BOX ENVIRONMENT. muster must not know what FRONTEND_DEV_BACKEND_URL means — it
 # used to build a sibling of it here, under a name it could only have copied from one project. What
 # it does know is forward names and port numbers; box-env is where a project turns those into its own
@@ -3326,6 +3414,7 @@ run "broker: a box that is already up reattaches"   test_broker_box_already_up
 run "broker: the spawn route checks for it first"   test_broker_spawn_route_reattaches
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
+run "broker: the stack's claude settings merge in" test_broker_claude_settings
 run "broker: messages target claude's pane"        test_broker_box_target
 run "broker: a killed box frees its port slot"     test_broker_slot_reuse
 run "broker: the mounts table grammar"             test_broker_parse_mounts

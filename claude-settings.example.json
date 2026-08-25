@@ -1,0 +1,34 @@
+// claude-settings.json — THE STACK'S OWN CLAUDE SETTINGS.
+//
+// Copy this next to `mounts` in the stack dir and let Ansible template it (see the claude_box role's
+// claude_box_config_files). On every box spawn the broker DEEP-MERGES it into the shared
+// ~/.claude/settings.json — the file every box and the hub see at ~/.claude, which also holds the
+// login and which claude rewrites by itself. That is why this file exists at all: the settings you
+// want are project policy, but their home is a file no deploy may overwrite.
+//
+// What that means in practice:
+//   * only the keys named here are touched — everything else in settings.json is left alone;
+//   * objects merge key by key, so `permissions.defaultMode` does not take the whole `permissions`
+//     block with it. Lists REPLACE: a list is the value you asked for;
+//   * DELETE a key here and the next spawn takes it back out of settings.json — unless someone has
+//     changed that value in the meantime, which makes it theirs, not ours;
+//   * whole-line `//` comments (like these) are stripped before parsing. Nothing else about the file
+//     is special: it is JSON;
+//   * a syntax error means the settings are not applied, loudly, in the broker's log — never a box
+//     that will not spawn. `docker compose logs box-broker | grep claude-settings` after a deploy.
+//
+// The muster activity hooks are re-applied AFTER this file, so a `hooks` block here cannot switch
+// off the hub's view of what a box is doing.
+{
+  // A status line for every box's claude. The script has to exist inside the box: put it in the
+  // shared claude home (data/claude/, which is ~/.claude everywhere) and Ansible can sync it there
+  // without going anywhere near settings.json.
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline-command.sh"
+  }
+
+  // Anything else claude takes in settings.json can go here too, e.g.:
+  // "model": "opus",
+  // "permissions": { "defaultMode": "acceptEdits" }
+}

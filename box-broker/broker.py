@@ -53,6 +53,8 @@ Config (env, from compose):
   PINCHTAB_SERVER     e.g. http://hub:9867     PINCHTAB_TOKEN  the pinchtab token
   PORT_FORWARDS_FILE  HOST path of the port-forwards manifest (NAME BOX_PORT HUB_BASE_PORT per line)
   PORT_FORWARD_SLOTS  max concurrent boxes with forwards; each box's slot N -> hub port BASE+N (dflt 16)
+  CLAUDE_SETTINGS_FILE  HOST path of the project's claude-settings.json — a JSON document deep-merged
+                      into the shared ~/.claude/settings.json (statusLine, model, permissions, …)
   SERVICE_ENV_FILE    KEY=VALUE lines given to the hub (compose env_file) AND every box, verbatim
   BOX_ENV_FILE        KEY=VALUE lines for BOXES ONLY, values expanded per box, applied last
   BOX_UID/BOX_GID     synthetic non-root identity inside the box (default 1000/1000)
@@ -110,6 +112,10 @@ BOX_ENV_FILE = os.environ.get("BOX_ENV_FILE", "")
 BOX_UID = os.environ.get("BOX_UID", "1000")
 BOX_GID = os.environ.get("BOX_GID", "1000")
 MUSTER_SCRIPT = os.environ.get("MUSTER_SCRIPT", "/usr/local/bin/muster-box.sh")
+# The project's own claude settings (a statusLine, a model, permissions): a JSON document deep-merged
+# into the shared ~/.claude/settings.json on every spawn. Optional; see ensure_claude_settings() and
+# claude-settings.example.json.
+CLAUDE_SETTINGS_FILE = os.environ.get("CLAUDE_SETTINGS_FILE", "")
 
 # Which muster this is, baked into the image (see the Dockerfiles). Reported over /version so the hub
 # can tell you when the two have drifted apart — three images, three build paths, and otherwise
@@ -925,6 +931,171 @@ def ensure_activity_hooks():
 	print(f"box-broker: registered activity hooks in {path}", flush=True)
 
 
+# ---------------------------------------------------------- the project's own claude settings
+#
+# WHICH claude settings a stack wants — a statusLine, a model, a permissions policy — is project
+# policy, exactly like `mounts` or `service-env`. But unlike those it has to end up in claude's OWN
+# settings.json: the file that also holds the login, that claude rewrites by itself, and that every
+# box in the stack shares (one CLAUDE_HOME, mounted at ~/.claude everywhere). So Ansible cannot
+# template it — that would clobber the login — and the boxes cannot each own a copy.
+#
+# So the project drops a claude-settings.json next to `mounts`, root-owned and Ansible-synced like
+# every other manifest here, and the broker MERGES it in on every spawn: re-asserted after a wipe,
+# and no one has to hand-edit JSON on the server. Only the keys the project names are touched;
+# everything else in that file, including whatever claude put there, is left exactly as it was.
+CLAUDE_SETTINGS_STAMP = ".muster-claude-settings.json"
+
+
+def _json_without_comments(text):
+	"""JSON, minus whole-line `//` comments.
+
+	Every other project manifest here can say WHY a line is there, and a config file nobody may
+	annotate is a config file nobody dares change. Only lines whose first non-space characters are
+	`//` are dropped, so a `//` inside a value — a URL — is safe. Lines are blanked rather than
+	removed to keep json's error line numbers pointing at the line you are looking at."""
+	return "\n".join("" if ln.lstrip().startswith("//") else ln for ln in text.splitlines())
+
+
+def read_claude_settings():
+	"""The project's settings document, or {} if there is none / it is unusable.
+
+	Never raises and never returns junk: a syntax error here must degrade to "the stack's settings
+	are not applied", loudly, and never to boxes that will not spawn."""
+	if not CLAUDE_SETTINGS_FILE or not os.path.exists(CLAUDE_SETTINGS_FILE):
+		return {}
+	try:
+		with open(CLAUDE_SETTINGS_FILE) as fh:
+			doc = json.loads(_json_without_comments(fh.read()) or "{}")
+	except (ValueError, OSError) as e:  # noqa: BLE001
+		print(f"box-broker: ignoring {CLAUDE_SETTINGS_FILE} ({e}) — the stack's claude settings are "
+		      f"NOT applied", flush=True)
+		return {}
+	if not isinstance(doc, dict):
+		print(f"box-broker: ignoring {CLAUDE_SETTINGS_FILE} — a settings file has to be a JSON "
+		      f"object, this is a {type(doc).__name__}", flush=True)
+		return {}
+	return doc
+
+
+def _merge_into(base, over):
+	"""over into base, recursively; base is modified in place.
+
+	Objects merge key by key, so a project can set `permissions.defaultMode` without owning the whole
+	`permissions` block. Anything else REPLACES: a list is the value the project asked for, and a
+	merge that appended could never take an entry back out."""
+	for k, v in over.items():
+		if isinstance(v, dict) and isinstance(base.get(k), dict):
+			_merge_into(base[k], v)
+		else:
+			base[k] = v
+	return base
+
+
+def _leaves(doc, prefix=()):
+	"""Every (path, value) the document actually SETS — a nested key is one leaf, not its parents."""
+	for k, v in doc.items():
+		if isinstance(v, dict) and v:
+			yield from _leaves(v, prefix + (k,))
+		else:
+			yield prefix + (k,), v
+
+
+def _drop_leaf(doc, path):
+	"""Remove doc[path…] and any parent object the removal has just emptied."""
+	parents = [doc]
+	for k in path[:-1]:
+		nxt = parents[-1].get(k)
+		if not isinstance(nxt, dict):
+			return
+		parents.append(nxt)
+	parents[-1].pop(path[-1], None)
+	for depth in range(len(parents) - 1, 0, -1):
+		if parents[depth]:
+			break
+		parents[depth - 1].pop(path[depth - 1], None)
+
+
+def ensure_claude_settings():
+	"""Merge the project's claude-settings.json into the shared ~/.claude/settings.json.
+
+	Two rules make this safe to run on every spawn, forever:
+
+	  * a key REMOVED from the project file is taken back out of settings.json — otherwise the file
+	    would only ever accumulate, and a setting you deleted would keep applying with no way short of
+	    editing the server to be rid of it. What we last wrote is remembered in a stamp file beside
+	    settings.json, so we know which keys are ours to retract;
+	  * ...but only while the live value is still the one WE wrote. A value someone has since changed
+	    by hand belongs to them, and silently reverting it would be the worse of the two surprises.
+
+	A settings.json we cannot parse is left completely alone — a stack without its statusLine is very
+	much better than a clobbered login.
+
+	Called BEFORE ensure_activity_hooks() on purpose: a project that sets `hooks` replaces the list
+	for that event, and the activity hooks are then re-added on top, so muster's own view of what a
+	box is doing cannot be switched off by accident."""
+	if not CLAUDE_HOME:
+		return
+	want = read_claude_settings()
+	stamp_path = os.path.join(CLAUDE_HOME, CLAUDE_SETTINGS_STAMP)
+	applied = {}
+	if os.path.exists(stamp_path):
+		try:
+			with open(stamp_path) as fh:
+				applied = json.load(fh)
+		except (ValueError, OSError):  # noqa: BLE001
+			applied = {}
+	if not isinstance(applied, dict):
+		applied = {}
+	if not want and not applied:
+		return
+	path = os.path.join(CLAUDE_HOME, "settings.json")
+	data = {}
+	if os.path.exists(path):
+		try:
+			with open(path) as fh:
+				data = json.load(fh)
+		except (ValueError, OSError) as e:  # noqa: BLE001
+			print(f"box-broker: not touching {path} ({e}) — the stack's claude settings are NOT "
+			      f"applied", flush=True)
+			return
+	if not isinstance(data, dict):
+		return
+	before = json.dumps(data, sort_keys=True)
+	wanted_paths = {p for p, _ in _leaves(want)}
+	for p, old in _leaves(applied):
+		if p in wanted_paths:
+			continue
+		cur = data
+		for k in p:
+			if not isinstance(cur, dict) or k not in cur:
+				cur = None
+				break
+			cur = cur[k]
+		if cur == old:                    # still ours, so ours to remove
+			_drop_leaf(data, p)
+	_merge_into(data, want)
+	if json.dumps(data, sort_keys=True) != before:
+		tmp = path + ".muster-tmp"
+		with open(tmp, "w") as fh:
+			json.dump(data, fh, indent=2)
+			fh.write("\n")
+		os.replace(tmp, path)
+		# Same best-effort hand-over as the activity hooks: the broker is root, the boxes are not, and
+		# claude has to be able to write its own settings.
+		try:
+			os.chown(path, int(BOX_UID), int(BOX_GID))
+		except OSError:
+			pass
+		print(f"box-broker: applied the stack's claude settings to {path} "
+		      f"({', '.join('.'.join(p) for p in sorted(wanted_paths)) or 'nothing'})", flush=True)
+	if applied != want:
+		tmp = stamp_path + ".muster-tmp"
+		with open(tmp, "w") as fh:
+			json.dump(want, fh, indent=2)
+			fh.write("\n")
+		os.replace(tmp, stamp_path)
+
+
 MEMO_START = "<!-- muster:box start -->"
 MEMO_END = "<!-- muster:box end -->"
 
@@ -1159,6 +1330,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	if CLAUDE_HOME:
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
+		ensure_claude_settings()      # first: the hooks below are re-asserted on top of it
 		ensure_activity_hooks()
 		ensure_box_memo()
 	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at

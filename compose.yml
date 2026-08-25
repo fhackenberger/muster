@@ -70,6 +70,11 @@ services:
       MUSTER_PREFIX: ${MUSTER_PREFIX:-}
       HUB_GIT_URL: ${HUB_GIT_URL:-git://hub/repo}
       CLAUDE_HOME: ${STACK_DIR}/data/claude
+      # The project's own claude settings — a statusLine, a model, a permissions policy — deep-merged
+      # by the broker into the shared ~/.claude/settings.json above. That file holds the login and is
+      # rewritten by claude itself, so Ansible cannot template it; this one it can. Optional, and only
+      # the keys it names are touched. See claude-settings.example.json.
+      CLAUDE_SETTINGS_FILE: ${STACK_DIR}/claude-settings.json
       BOXROOT: ${STACK_DIR}/data/boxes
       # The `mounts` table: ONE row per path with a mode for the hub and a mode for the box, so the two
       # environments cannot drift apart (see mounts.example). The broker reads the box column from

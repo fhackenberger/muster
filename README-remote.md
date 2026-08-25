@@ -1216,6 +1216,50 @@ pre-creates those parents for boxes (and re-owns existing ones, so `cbx recreate
 hub image ships the XDG bases, and the hub warns at boot about any parent it cannot write.
 
 
+## The stack's claude settings (`claude-settings.json`)
+
+A statusLine, a model, a permissions policy — which claude settings a stack wants is project policy,
+like `mounts` or `service-env`. What makes it awkward is where those settings have to *land*:
+
+- `~/.claude/settings.json` is **claude's own file**. It sits next to the login, and claude rewrites
+  it — so a deploy that templates it is a deploy that can log the whole stack out.
+- and every box **shares** it. There is one `CLAUDE_HOME` (`data/claude`), mounted at `~/.claude` in
+  the hub and in every box, so per-box copies are not a thing and chezmoi (which applies per box, at
+  start, into the same bind mount) would have N boxes racing on one file.
+
+So the project drops a **`claude-settings.json`** next to `mounts` — root-owned, Ansible-templated
+like every other manifest — and the broker **merges** it in at every spawn:
+
+```json
+{
+  "statusLine": {"type": "command", "command": "bash ~/.claude/statusline-command.sh"},
+  "permissions": {"defaultMode": "acceptEdits"}
+}
+```
+
+| | |
+|---|---|
+| touched | only the keys the file names; everything else in `settings.json` is left as it was |
+| objects | merged key by key — `permissions.defaultMode` does not take `permissions.allow` with it |
+| lists | replaced: a list is the value you asked for, and appending could never take an entry back |
+| deleting a key | takes it back out of `settings.json` on the next spawn — **unless** someone has changed that value in the meantime, which makes it theirs |
+| comments | whole-line `//` is stripped before parsing. Otherwise it is plain JSON |
+| a syntax error | applies nothing, changes nothing, and says so in the broker's log |
+
+It is re-asserted on every spawn, so a wiped `data/claude` heals itself, and the muster activity
+hooks are applied *after* it — a `hooks` block here cannot switch off the hub's view of what a box is
+doing. See `claude-settings.example.json`.
+
+**A command in there must exist inside the box.** The shared claude home is the easy place to put
+one: Ansible syncs a script to `data/claude/statusline-command.sh` — a *new* file, nothing claude
+owns — and it is `~/.claude/statusline-command.sh` in every box and on the hub.
+
+```sh
+docker compose logs box-broker | grep claude-settings   # what the merge did, or why it did not
+cbx recreate all                                        # boxes read settings.json at session start
+```
+
+
 ## What a box keeps (`~/keep`)
 
 Every box gets one directory whose lifetime is the **box's**, not the container's:

@@ -14,6 +14,12 @@ releases and are not listed here.
 ## Unreleased
 
 ### Added
+- **`claude-settings.json`** — a stack can set its own claude settings (a `statusLine`, a model, a
+  permissions policy) by dropping a JSON file next to `mounts`. The broker deep-merges it into the
+  shared `~/.claude/settings.json` at every spawn: only the keys it names, a key removed from the
+  file is retracted again unless someone changed that value by hand, and a file it cannot parse
+  applies nothing rather than clobbering the file that also holds the login. Whole-line `//` comments
+  are allowed. See "The stack's claude settings" in `README-remote.md`.
 - `muster job <box>` — run an **unattended job in a box**: spawn it (or reuse it), wait for its
   claude to actually be up, brief it with a multi-line prompt, and wait for the agent to write a
   result file inside its own home, which the hub already mounts read-only. Prints that file on
