@@ -1662,7 +1662,7 @@ test_aliases_restore_the_terminal_after_a_session() {
 	has "[?1003l"        # any-motion mouse reporting off — the one that produces the flood
 	has "[?1006l"        # …and its SGR encoding
 	has "[<u"            # the kitty keyboard stack, popped
-	has "[?1049l"        # and out of the alternate screen, so scrollback comes back
+	has '[?1049$p'       # and the alternate screen ASKED about, not assumed — see the next test
 	# One-shots go through the same door: `cbx review` runs a TUI over ssh -t, and a drop there leaves
 	# exactly the same mess behind.
 	TTY=1 al 'cbx ls'
@@ -1670,6 +1670,39 @@ test_aliases_restore_the_terminal_after_a_session() {
 	# Keepalives, so the idle-timeout half of the problem stops happening in the first place.
 	ssh_has "ServerAliveInterval=30"
 	ssh_has "ServerAliveCountMax=3"
+}
+
+# ?1049l IS NOT A PLAIN SWITCH. xterm's ctlseqs defines 1049l as "use normal screen buffer AND
+# restore the cursor as in DECRC" — the cursor half fires whether or not you were on the alternate
+# screen. Sent blind after every command it drags the cursor back to wherever a pager saved it, and
+# the next command's output prints over text still on screen ("To github.com:you/repo.gitompleted
+# with 66 local objects."). So it may go out only when the terminal SAYS it is on the alternate
+# screen, and the terminal is asked with DECRQM: CSI ?1049$p → CSI ?1049;<1=set|2=reset>$y.
+#
+# The pty is fed the reply here (see AL_TTY_INPUT), which is the only way to test this without a real
+# terminal on the other end. Note what each case asserts: "[?1049l" as SENT text can never be
+# confused with the fed-in reply, which contains "[?1049;1$y".
+test_aliases_leave_the_alternate_screen_only_when_it_is_set() {
+	command -v script >/dev/null || { skip "no 'script' for a pseudo-terminal"; return 0; }
+	alias_fixture
+	# A TUI really did die fullscreen: the terminal answers "set", so the escape goes out.
+	AL_TTY_INPUT=$'\033[?1049;1$y' TTY=1 al 'cbxbox work1'
+	ok; has '[?1049$p'; has "[?1049l"
+	# The normal case — nothing was fullscreen. Answering "reset" must leave the cursor ALONE.
+	AL_TTY_INPUT=$'\033[?1049;2$y' TTY=1 al 'cbxbox work1'
+	ok; has '[?1049$p'; hasnt "[?1049l"
+	# A terminal that doesn't implement DECRQM says nothing at all. No answer means no: leaving a
+	# normal screen alone costs nothing, guessing "yes" is the corruption above.
+	TTY=1 al 'cbxbox work1'
+	ok; hasnt "[?1049l"
+	# Typeahead is not a reply. A reply always starts with ESC, so anything else stops the read then
+	# and there — and must not be mistaken for one.
+	AL_TTY_INPUT='hello' TTY=1 al 'cbxbox work1'
+	ok; hasnt "[?1049l"
+	# `<prefix>tty` is the escape hatch for a terminal that cannot answer, so THERE it is sent blind —
+	# you have said out loud that the state is wrong.
+	TTY=1 al 'cbxtty'
+	has "[?1049l"
 }
 
 # The escapes must never reach STDOUT: _muster_ssh is also called inside command substitutions, where
@@ -3371,6 +3404,7 @@ run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the
 run "aliases: tunnel specs"                        test_aliases_tunnel_specs
 run "aliases: the tab title names the box"         test_aliases_set_the_tab_title
 run "aliases: a session restores the terminal"     test_aliases_restore_the_terminal_after_a_session
+run "aliases: the alternate screen is asked, not assumed" test_aliases_leave_the_alternate_screen_only_when_it_is_set
 run "aliases: the restore never hits stdout"       test_aliases_terminal_restore_never_touches_stdout
 run "paste: an image, then attach"                 test_aliases_paste_an_image
 run "paste: says so when you are attached"         test_aliases_paste_when_already_attached

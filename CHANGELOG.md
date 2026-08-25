@@ -28,6 +28,16 @@ releases and are not listed here.
   survive its own restart; `--purge` bins the box once the answer is in, never before, and never one
   holding unreviewed work. See "Unattended job boxes" in `README-remote.md`.
 
+### Fixed
+- **The terminal cleanup no longer scrambles the screen it just cleaned up.** `muster.bash_aliases`
+  sent `\e[?1049l` after every command, but that escape does not only leave the alternate screen —
+  per xterm's ctlseqs it also "restores the cursor as in DECRC", on the normal screen too. So a
+  command that ran a pager (`cbx push` shows its `--stat` listing through less/delta) left a saved
+  cursor behind, the cleanup restored it, and everything the next command printed landed on top of
+  output still on screen. The alternate screen is now *asked about* with DECRQM and the escape sent
+  only when the terminal answers that it is set; no answer means no. `<prefix>tty`, the explicit
+  "my terminal is wrecked" hatch, still sends it unconditionally.
+
 ## [0.1.0] — 2026-08-02
 
 ### Added

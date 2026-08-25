@@ -272,13 +272,24 @@ EOF
 # al '<shell code>' — run code with the aliases sourced against a fake stack.
 # $OUT = stdout+stderr, $SSHLOG = every ssh/mosh invocation it made, $RC = status.
 # TTY=1 al '…' runs it under a real pseudo-terminal, which is how the `-t`/`-T` decisions are tested.
+#
+# AL_TTY_INPUT='…' (TTY mode only) feeds bytes into that pseudo-terminal as if they had been typed.
+# `script` forwards its own stdin to the pty, so this is how the suite plays TERMINAL: a DECRQM reply
+# ("I am on the alternate screen") is just input that arrives after the query goes out, and the code
+# reading it cannot tell the difference. What is fed also ECHOES into $OUT — so assert on the escape
+# the code SENDS, never on one that could be the echo of what was fed in.
 al() {
 	: > "$SSH_LOG"
 	local pre="source '$ROOT/muster.bash_aliases';"
 	[ -z "${AL_PROJECT_FILE:-}" ] || pre="$pre source '$ROOT/muster.bash_aliases.project.example';"
 	local env="PATH=$FIX/bin:$PATH MUSTER_SSH_LOG=$SSH_LOG MUSTER_SERVER=${AL_SERVER:-root@test.example} MUSTER_PROJECT=${AL_PROJECT:-proj}"
 	if [ -n "${TTY:-}" ] && command -v script >/dev/null; then
-		OUT="$(script -qec "env $env bash -c \"$pre $1\"" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
+		if [ -n "${AL_TTY_INPUT:-}" ]; then
+			OUT="$(printf '%s' "$AL_TTY_INPUT" \
+				| script -qec "env $env bash -c \"$pre $1\"" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
+		else
+			OUT="$(script -qec "env $env bash -c \"$pre $1\"" /dev/null 2>&1 | sed 's/\r$//')"; RC=$?
+		fi
 	else
 		OUT="$(env $env bash -c "$pre $1" </dev/null 2>&1)"; RC=$?
 	fi

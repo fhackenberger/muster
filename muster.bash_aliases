@@ -137,18 +137,62 @@ _muster_tty_restore() {
 	[ -z "$saved" ] || { stty "$saved" < /dev/tty; } 2>/dev/null || true
 	#  ?1000/1002/1003  mouse: click, drag, any-motion     ?1006/1015/1016  its SGR/urxvt encodings
 	#  ?25h             cursor visible again               \033[<u          pop the kitty key stack
-	#  ?1049l           leave the alternate screen, so a TUI that died fullscreen gives scrollback back
-	printf '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l\033[?1016l\033[?25h\033[<u\033[?1049l' \
+	printf '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l\033[?1016l\033[?25h\033[<u' \
 		> /dev/tty 2>/dev/null
+	# ?1049l LAST, AND ONLY WHEN THE TERMINAL SAYS IT IS ON THE ALTERNATE SCREEN — see
+	# _muster_on_altscreen for the question, and why sending it blind corrupts a perfectly fine
+	# terminal instead of repairing a broken one.
+	_muster_on_altscreen && printf '\033[?1049l' > /dev/tty 2>/dev/null
 	return 0
+}
+
+# IS THE TERMINAL ON THE ALTERNATE SCREEN? Asked, never assumed, because ?1049 is not the plain
+# on/off switch its name suggests: per xterm's ctlseqs, 1049h saves the cursor AND switches, 1049l
+# switches back AND "restores the cursor as in DECRC". The cursor half happens either way. So a bare
+# ?1049l sent to a terminal that is already on the normal screen teleports the cursor to whatever
+# position was saved last — typically wherever a pager did its smcup several commands ago — and
+# everything printed afterwards lands on top of text that is still on screen:
+#
+#     To github.com:you/repo.gitompleted with 66 local objects.
+#     cbx: pushed build/test to originberger/frontend-2026 -> …
+#
+# That is `cbx push` (whose --stat listing goes through less/delta) followed by any second command,
+# and it was this cleanup doing it — the one thing meant to leave the terminal better than it found it.
+#
+# DECRQM answers it: we send  CSI ? 1049 $ p  and a terminal that implements it replies
+# CSI ? 1049 ; <state> $ y  with state 1 = set (alternate screen), 2 = reset (normal screen).
+# NO REPLY MEANS NO, deliberately: leaving a normal screen alone costs nothing, while guessing "yes"
+# is the corruption above. A terminal too old to answer keeps `<prefix>tty`, which still sends it
+# unconditionally — there you have said out loud that the state is wrong.
+#
+# The read is time-boxed twice over (`min 0 time 1` on the tty, plus bash's own -t) so a silent
+# terminal costs ~100ms, not a hang. It stops at the first byte if that byte is not ESC: a reply
+# always starts with one, so anything else is the user's typeahead and there is no point eating more
+# of it. Nothing can be pushed back, so that one byte is lost — the alternative is consuming the
+# whole line, which is worse.
+_muster_on_altscreen() {
+	_muster_has_tty || return 1
+	local saved reply="" first=""
+	saved="$(stty -g < /dev/tty 2>/dev/null)" || return 1
+	{ stty raw -echo min 0 time 1 < /dev/tty; } 2>/dev/null || return 1
+	printf '\033[?1049$p' > /dev/tty 2>/dev/null
+	if IFS= read -rs -t 0.1 -n 1 first < /dev/tty 2>/dev/null && [ "$first" = $'\033' ]; then
+		IFS= read -rs -t 0.1 -d 'y' reply < /dev/tty 2>/dev/null || reply=""
+	fi
+	{ stty "$saved" < /dev/tty; } 2>/dev/null || true
+	case "$reply" in *'?1049;1$'*) return 0 ;; esac
+	return 1
 }
 
 # `<prefix>tty` — do it by hand, for a terminal wrecked by something outside these helpers (a manual
 # ssh, a TUI killed with -9). Here `stty sane` IS the right tool: you are explicitly saying the state
-# is wrong, and there is no saved copy to go back to.
+# is wrong, and there is no saved copy to go back to. Same reason ?1049l goes out UNCONDITIONALLY
+# here and nowhere else: this is the escape hatch for a terminal that is stuck fullscreen and cannot
+# (or will not) answer DECRQM, so a needless cursor restore is the cheaper mistake.
 _muster_tty_fix() {
 	_muster_has_tty || { echo "${_MUSTER_SELF}: no terminal here" >&2; return 1; }
 	_muster_tty_restore ""
+	printf '\033[?1049l' > /dev/tty 2>/dev/null
 	{ stty sane < /dev/tty; } 2>/dev/null || true
 	echo "${_MUSTER_SELF}: mouse reporting, key encoding and terminal modes reset" >&2
 }
