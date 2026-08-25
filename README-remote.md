@@ -609,7 +609,9 @@ the host, which the hub already mounts read-only — it is how `cbx ls` reads ea
 a file the agent writes to `~/muster-job-result.json` is a plain file read on the hub. No new mount,
 no daemon, no port, and nothing the agent can reach outside its own box. `--result REL` picks a
 different name; it must stay inside that home (`..` and absolute paths are refused, since the mount
-holds *every* box's home).
+holds *every* box's home). What the agent actually leaves there is resolved and checked the same way
+before it is read: a symlink pointing out of its own home — at another box, at the hub's own files —
+is refused rather than followed and printed as the answer.
 
 Your brief says what to do; `cbx job` appends a short footer saying **where to write the answer**,
 naming the same path it is watching — so the one instruction the whole thing depends on cannot

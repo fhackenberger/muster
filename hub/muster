@@ -2085,6 +2085,28 @@ job_result_path() {
 	printf '%s/%s/home/%s' "$BOXES" "$box" "$rel"
 }
 
+# Is there an ANSWER at that path — a real file, and really inside this box's home?
+#
+# job_result_path only vets the string WE were handed. The file itself is written by the agent, and
+# the agent can put anything at that name: a symlink to /work/repo, to another box's home under
+# $BOXES, to the hub's own files — which we would then resolve HERE, on the hub, and print as "the
+# box's answer". Same for a symlinked directory anywhere along the path. So resolve the whole thing
+# and require it to land under this box's home; -f rather than -r because a symlink to a fifo or
+# /dev/zero is readable and would hang the collect forever.
+#
+# Returns 0 = an answer is here, 1 = nothing yet (keep waiting), 2 = something is here that we refuse
+# to read. Only the caller knows whether 2 is fatal, so it does the dying.
+job_result_ready() {
+	local box="$1" f="$2" home real
+	[ -e "$f" ] || [ -L "$f" ] || return 1
+	[ -f "$f" ] || return 2
+	home="$(readlink -f "$BOXES/$box/home" 2>/dev/null)" || return 2
+	real="$(readlink -f "$f" 2>/dev/null)" || return 2
+	[ -n "$home" ] && [ -n "$real" ] || return 2
+	case "$real" in "$home"/*) return 0 ;; esac
+	return 2
+}
+
 # Wait until this box's claude has STARTED SINCE <epoch>. muster-activity writes "<state> <epoch>" at
 # SessionStart, so a timestamp at or after the spawn is proof that the session about to receive our
 # paste is the one now running. Returns 1 on timeout; the caller warns and briefs anyway, because
@@ -2149,15 +2171,18 @@ job_emit() {
 
 job_collect() {
 	local box="$1" rel="$2" timeout="$3" poll="$4" purge="$5" json="$6"
-	local f deadline warned=0 st age
+	local f deadline warned=0 st age rc
 	f="$(job_result_path "$box" "$rel")"
 	deadline=$(( $(date +%s) + timeout ))
 	while :; do
-		if [ -r "$f" ]; then
-			job_emit "$box" "$rel" "$f" "$json"
-			if [ -n "$purge" ]; then job_purge "$box"; fi
-			return 0
-		fi
+		rc=0; job_result_ready "$box" "$f" || rc=$?
+		case "$rc" in
+			0)
+				job_emit "$box" "$rel" "$f" "$json"
+				if [ -n "$purge" ]; then job_purge "$box"; fi
+				return 0 ;;
+			2) die "job: '$box' put something at ~/$rel that is not a plain file inside its own home (a symlink out of it, or not a regular file) — refusing to read it as the answer" ;;
+		esac
 		if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
 		# A box that is WAITING has stopped to ask a question that nobody is going to answer, and the
 		# job would otherwise spend its whole timeout in silence. Say so once — and keep waiting, since
@@ -2224,7 +2249,9 @@ job() {
 
 	# A result file left over from a previous run of this box would be read as this run's answer,
 	# instantly. We cannot delete it ($BOXES is mounted read-only here), so refuse instead of lying.
-	if [ -r "$f" ]; then
+	# -e/-L, not -r: a DANGLING symlink parked at that name reads as "nothing here" now and becomes a
+	# write straight out of the box's home the moment the agent answers through it.
+	if [ -e "$f" ] || [ -L "$f" ]; then
 		die "job: '$box' still holds a result from an earlier job at ~/$rel — read it, then remove it in the box ($SELF say $box 'rm ~/$rel') or use a fresh box name"
 	fi
 

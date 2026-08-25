@@ -3071,6 +3071,38 @@ test_job_result_path_cannot_escape_the_box() {
 	if stub_saw POST "/box/j3"; then fail "a bad --result must be caught before the box is spawned"; fi
 }
 
+test_job_result_symlink_cannot_escape_the_box() {
+	job_env
+	box_state j3b idle 60
+	# The --result check only vets the NAME we were handed; the file is written by the agent, and a
+	# symlink parked at that name is resolved HERE, on the hub, where $BOXES holds every box's home
+	# and the hub's own files sit right next to it. Same read the '..' check refuses, spelled with a
+	# symlink — so it has to be refused the same way, and above all never printed as "the answer".
+	printf 'the hub secret\n' > "$FIX/outside-any-box"
+	ln -sfn "$FIX/outside-any-box" "$FIX/boxes/j3b/home/muster-job-result.json"
+	cbx job j3b --collect --timeout 5 --poll 1
+	notok
+	hasnt "the hub secret"
+	has "refusing to read it"
+
+	# A symlinked DIRECTORY along the way is the same hole, so the whole path is resolved, not just
+	# its last component.
+	box_state j3c idle 60
+	ln -sfn "$FIX" "$FIX/boxes/j3c/home/out"
+	cbx job j3c --collect --result out/outside-any-box --timeout 5 --poll 1
+	notok
+	hasnt "the hub secret"
+
+	# And a DANGLING symlink is caught at brief time: it reads as "nothing here yet", and the agent's
+	# answer would then be written straight through it, out of its own home.
+	box_state j3d idle 60
+	ln -sfn "$FIX/not-there-yet" "$FIX/boxes/j3d/home/muster-job-result.json"
+	cbx job j3d -m "go"
+	notok
+	has "still holds a result"
+	if stub_saw POST "/box/j3d/paste"; then fail "nothing may be briefed onto a symlink out of the box"; fi
+}
+
 test_job_refuses_a_stale_result() {
 	job_env
 	box_state j4 idle 60
@@ -3212,6 +3244,7 @@ run "job: briefs a box and collects its answer"   test_job_briefs_and_collects
 run "job: no answer is exit 3, not a hang"       test_job_collect_times_out
 run "job: --timeout 0 looks once and returns"     test_job_collect_timeout_zero_is_one_look
 run "job: a result path cannot leave the box"    test_job_result_path_cannot_escape_the_box
+run "job: a symlinked result cannot escape either" test_job_result_symlink_cannot_escape_the_box
 run "job: yesterday's answer is not this one"    test_job_refuses_a_stale_result
 run "job: --purge only after an answer"          test_job_purges_only_after_an_answer
 run "job: never bins unreviewed work"            test_job_keeps_unreviewed_work
