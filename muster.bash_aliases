@@ -245,7 +245,33 @@ _muster_box_spawn() {
 # (the owner of the hub tmux server); for a root shell add `-u root` after `exec -it` — but that's a
 # separate, empty tmux server, so use `bash -l` instead of the tmux part for root.
 _muster_hub_attach() {
+	local rc
+	# Same rule as the boxes, so a row of tabs reads as "which stack / which agent" rather than as a
+	# column of identical prefixes. The project first for the same reason the box name is.
+	_muster_title "${MUSTER_PROJECT} hub"
 	_muster_session "$(_muster_hub) tmux new-session -A -s cbxhub -c /home/dev/repo"
+	rc=$?
+	_muster_title -
+	return "$rc"
+}
+
+# THE TAB TITLE, and the reason the box name comes FIRST. With several agents open you are reading a
+# row of tabs, each truncated to a few characters, and every one of them would start with the same
+# word — "cbx box ui26-map-section" and "cbx box ui26-settings-user" are indistinguishable at the
+# width a tab actually gets. "ui26-map-section box" is not. Nothing set a title before this: what you
+# saw was the terminal naming the tab after the command line that launched it.
+#
+# OSC 2 sets it; CSI 22;2t / 23;2t push and pop the terminal's OWN title stack, so leaving the box
+# puts back whatever was there before instead of a title we invented. Terminals implementing neither
+# ignore both (an OSC/CSI is swallowed, not printed), and a shell with a title-setting prompt takes
+# the tab back at its next prompt anyway. MUSTER_TITLE=0 opts out.
+_muster_title() {
+	[ "${MUSTER_TITLE:-1}" = 1 ] && [ -t 1 ] || return 0
+	case "$1" in
+		-) printf '\033[23;2t' ;;                       # pop: restore what was there before
+		*) printf '\033[22;2t\033]2;%s\033\\' "$1" ;;    # push, then set
+	esac
+	return 0
 }
 
 # attach to an agent box by name (Ctrl-b d to detach):  cbxbox work1
@@ -253,7 +279,12 @@ _muster_hub_attach() {
 # runs under the box's 'dev' user, not root (root's tmux socket is empty → "no sessions"). The -e
 # flags come from _muster_env (TERM + LANG) — see there for why both are needed.
 _muster_box_attach() {
+	local rc
+	_muster_title "$1 box"
 	_muster_session "docker exec -it -u dev $(_muster_env)box-${MUSTER_PROJECT}-$1 tmux attach -t main"
+	rc=$?
+	_muster_title -
+	return "$rc"
 }
 
 # cbxtun — one SSH tunnel to reach hub and/or agent-box (cbox) dev services from your laptop, so you

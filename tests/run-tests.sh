@@ -1620,6 +1620,28 @@ test_aliases_paste_without_a_clipboard_reader() {
 	eq "$(cat "$SSH_LOG")" "" "nothing may be sent when there is no image to send"
 }
 
+# THE BOX NAME FIRST. A row of terminal tabs truncates hard, so a title that begins with the same
+# word for every agent tells you nothing — which is what the terminal's own "name the tab after the
+# command line" default gives you.
+test_aliases_set_the_tab_title() {
+	alias_fixture
+	TTY=1 al 'cbxbox work1'
+	ok
+	has "]2;work1 box"                  # OSC 2, box name leading
+	hasnt "]2;cbx box work1"
+	has "[22;2t"                        # pushed…
+	has "[23;2t"                        # …and popped again on the way out
+	# The hub gets the same treatment, named by stack.
+	TTY=1 al 'cbxhub'
+	ok; has "]2;proj hub"
+	# Opt-out, for a terminal or a workflow that manages its own titles.
+	TTY=1 al 'MUSTER_TITLE=0 cbxbox work1'
+	ok; hasnt "]2;work1 box"
+	# …and never into a pipe, where the escape would land in whatever is reading.
+	al 'cbxbox work1 | cat'
+	hasnt "]2;"
+}
+
 test_aliases_refuse_without_a_server() {
 	alias_fixture
 	AL_SERVER="root@your-server" al 'cbx ls'      # the shipped placeholder
@@ -3033,6 +3055,7 @@ run "aliases: box spawns then attaches"            test_aliases_box_spawn_attach
 run "aliases: pipes never allocate a PTY"          test_aliases_pipes_never_allocate_a_pty
 run "aliases: exec into the hub"                   test_aliases_exec_runs_in_the_hub_too
 run "aliases: tunnel specs"                        test_aliases_tunnel_specs
+run "aliases: the tab title names the box"         test_aliases_set_the_tab_title
 run "paste: an image, then attach"                 test_aliases_paste_an_image
 run "paste: says so when you are attached"         test_aliases_paste_when_already_attached
 run "paste: no clipboard reader says which"        test_aliases_paste_without_a_clipboard_reader
