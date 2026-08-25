@@ -678,6 +678,16 @@ broker() {
 
 jqr() { jq -r "$1" 2>/dev/null || true; }
 
+# The broker's reason, in words, out of the JSON it arrived wrapped in. Its rejections SAY things now
+# ("box name 'x' is 48 characters; the limit is 49 for project 'infostars'…") and that sentence is the
+# whole value — printing `{"error": "…"}` around it makes the reader parse JSON to read English.
+# Falls back to the raw body, which is all a non-JSON failure (a proxy, a crash) leaves us.
+broker_err() {
+	local msg
+	msg="$(printf '%s' "$1" | jqr '.error // empty')"
+	printf '%s' "${msg:-$1}"
+}
+
 # The box listing, ONCE PER DASHBOARD FRAME. A frame needs it twice — activity_snapshot compares each
 # box's state against the last frame's, status_overview renders the table — and both run in their own
 # subshell (a command substitution and a process substitution), so neither can memoise for the other.
@@ -726,7 +736,7 @@ version_drift() {
 box_new() {
 	local name="${1:-$(cut -c1-6 /proc/sys/kernel/random/uuid 2>/dev/null || echo $$)}"
 	local resp container
-	resp="$(broker POST "/box/$name")" || die "spawning box '$name' failed: $resp"
+	resp="$(broker POST "/box/$name")" || die "spawning box '$name' failed: $(broker_err "$resp")"
 	container="$(printf '%s' "$resp" | jqr '.container // empty')"
 	[ -n "$container" ] || container="$(printf '%s' "$resp" | sed -n 's/.*"container"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 	# A NAME YOU ALREADY HAVE IS A REQUEST TO GO BACK INTO IT, not a mistake — so the broker answers
@@ -2715,7 +2725,7 @@ minto_spawn() {
 	# debug through a tmux session.
 	if ! resp="$(broker POST "/box/$box?base=$target&merge=$DEV")"; then
 		rm -f "$STATE/$box.mergeinto"
-		die "spawning box '$box' failed: $resp"
+		die "spawning box '$box' failed: $(broker_err "$resp")"
 	fi
 	container="$(printf '%s' "$resp" | jqr '.container // empty')"
 	if paste_to_box "$box" "$(minto_prompt "$target" "$intent" "$conflicts" "$box")"; then

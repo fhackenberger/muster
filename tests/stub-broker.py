@@ -161,6 +161,15 @@ class H(BaseHTTPRequestHandler):
                 return self._reply(200, {verb: n})
         if path.startswith("/box/"):
             n = path[len("/box/"):]
+            # The real broker refuses a name longer than the container hostname can carry, and its
+            # refusal is a SENTENCE naming the rule. Mirrored here (with this stub's own project) so
+            # the hub's side of it — unwrapping .error rather than printing raw JSON at you — is
+            # covered end to end.
+            limit = 63 - len("box-test-")
+            if len(n) > limit:
+                return self._reply(400, {"error": f"box name {n!r} is {len(n)} characters; the limit "
+                                                  f"is {limit} for project 'test', because the "
+                                                  f"container's hostname (box-test-<name>) must fit in 63"})
             BOXES[n] = {"golden": current_golden(),
                         "base": self._param("base") or "", "merge": self._param("merge") or "",
                         "dirty": []}

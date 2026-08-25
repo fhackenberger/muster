@@ -924,6 +924,21 @@ test_import_replaces_the_branch() {
 
 # =====================================================================  boxes (via the stub broker)
 
+# A REFUSAL HAS TO BE READABLE. The broker's reasons are sentences; the hub used to print the JSON
+# they arrived in, so you read `{"error": "box name 'x' is 50 characters…"}` and parsed it yourself.
+test_box_name_rejection_is_readable() {
+	local long
+	long="$(printf 'a%.0s' $(seq 1 60))"
+	cbx box "$long"
+	notok
+	has "is 60 characters"        # the sentence survived
+	has "the limit is"
+	hasnt '{"error"'              # …without the wrapper it came in
+	# A name at the limit is not refused — the boundary belongs to the usable side.
+	cbx box "$(printf 'b%.0s' $(seq 1 54))"
+	ok
+}
+
 test_box_lifecycle() {
 	cbx box work1
 	ok; has "box 'work1' up"
@@ -2183,6 +2198,55 @@ PY
 	ok; has ok
 }
 
+# BOX NAMES ARE AS LONG AS THE HOSTNAME ALLOWS, and the limit is derived from the project rather than
+# picked. The old cap was 31 — a number from the first commit with no reasoning attached — which
+# rejects names like 'legacy-features-migration-2026' that say what a box is for.
+test_broker_box_name_limit_follows_the_hostname() {
+	OUT="$(python3 - "$BROKER_PY" <<'PY' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+os.environ["PROJECT_NAME"] = "infostars"
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+
+# box-infostars- is 14 characters, and a hostname label is 63.
+assert b.NAME_MAX == 63 - len("box-infostars-"), b.NAME_MAX
+assert b.NAME_MAX == 49, b.NAME_MAX
+assert b.valid_name("a" * 49), "the limit itself must be usable"
+assert not b.valid_name("a" * 50), "one over the limit must be refused"
+# The name that prompted this: 48 characters, and now fine.
+assert b.valid_name("my-really-long-box-name-that-is-sometimes-useful")
+# …and the whole container name really does fit in a hostname label.
+assert len(f"box-infostars-{'a' * b.NAME_MAX}") <= 63
+
+# EVERY REJECTION SAYS WHICH RULE, because "bad box name" left you guessing between the two.
+long = b.name_problem("a" * 50)
+assert "50 characters" in long and "49" in long and "infostars" in long, long
+assert "hostname" in long, long
+bad = b.name_problem("Work1")
+assert "lowercase" in bad, bad
+assert "characters" not in bad, "a charset error must not read as a length error: " + bad
+assert b.name_problem("") and b.name_problem("-lead") and b.name_problem("has space")
+assert b.name_problem("work1") is None
+
+# A longer project name costs its boxes exactly those characters — the reason this is computed.
+os.environ["PROJECT_NAME"] = "customer-portal-staging"
+spec2 = importlib.util.spec_from_file_location("b2", sys.argv[1])
+b2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(b2)
+assert b2.NAME_MAX == 63 - len("box-customer-portal-staging-"), b2.NAME_MAX
+assert b2.NAME_MAX < b.NAME_MAX
+print("ok")
+PY
+)"; RC=$?
+	ok; has ok
+	# The prefix the limit is derived from must be the one muster-box.sh actually sets as the hostname,
+	# or the arithmetic above is measuring nothing.
+	OUT="$(grep -A1 -- '--hostname' "$ROOT/muster-box.sh" | head -2)"
+	has 'MUSTER_NAME'
+	OUT="$(grep -n 'return f"box-{PROJECT}-{name}"' "$BROKER_PY")"
+	has "box-{PROJECT}-{name}"
+}
+
 test_broker_persists_the_branch_job() {
 	OUT="$(python3 - "$BROKER_PY" "$FIX" <<'PY' 2>&1
 import importlib.util, os, sys
@@ -2935,6 +2999,7 @@ run "pull: fast-forwards from origin"              test_pull_fast_forward
 run "export: produces an mbox"                     test_export_produces_an_mbox
 run "import: replaces the agent's branch"          test_import_replaces_the_branch
 
+run "box: a refused name says which rule"          test_box_name_rejection_is_readable
 run "box: spawn / ls / recreate / kill"            test_box_lifecycle
 run "box: retired boxes are listed and purgeable" test_box_retired_and_purge
 run "ls: only ls pays for the retired sizes"       test_retired_sizes_only_ls_pays_for_them
@@ -2998,6 +3063,7 @@ run "box-init: a minto box opens on the conflict"  test_box_init_minto_sets_up_t
 run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 
 run "broker: branch-name validation"               test_broker_branch_validation
+run "broker: box-name limit follows the hostname"  test_broker_box_name_limit_follows_the_hostname
 run "broker: retired sizes are opt-in"             test_broker_retired_sizes_are_opt_in
 run "broker: home mount parents are pre-created"   test_broker_creates_home_mount_parents
 run "box: ~/keep survives a recreate"              test_broker_box_keeps_a_durable_dir

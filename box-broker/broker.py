@@ -170,7 +170,39 @@ def box_prompt(name, facts):
 	text = string.Template(MUSTER_BOX_PROMPT).safe_substitute(mapping)
 	return base64.b64encode(text.encode()).decode()
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+# A box name. The CHARACTER SET is the deliberate part; the LENGTH is derived, not chosen.
+#
+# It used to be `{0,30}` — a number that arrived with the very first commit, carried no reasoning, and
+# rejected names like 'legacy-features-migration-2026' that describe what a box is actually for. There
+# is a real ceiling, but it is not 31: muster-box.sh passes `--hostname box-<project>-<name>`, and a
+# hostname label is 63 characters, so what a name may cost is 63 minus that prefix. Computing it from
+# PROJECT rather than hard-coding it matters — a stack called `customer-portal-staging` has 23 fewer
+# characters to give away than one called `app`, and a hard-coded limit would either rob the short
+# names or hand the long ones a hostname docker refuses at spawn time, which is far more confusing
+# than being told the rule up front.
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+NAME_MAX = max(1, 63 - len(f"box-{PROJECT}-"))
+
+
+def name_problem(name):
+	"""Why this box name cannot be used, in words, or None when it is fine.
+
+	One message per rule, naming the rule and the actual value: every rejection used to be the same
+	"bad box name", so a name that was one character too long and a name with a capital letter in it
+	were indistinguishable, and neither told you what was allowed."""
+	if not name:
+		return "a box name is required"
+	if not NAME_RE.match(name):
+		return (f"bad box name {name!r} — lowercase letters, digits, '-' and '_' only, "
+		        f"starting with a letter or a digit")
+	if len(name) > NAME_MAX:
+		return (f"box name {name!r} is {len(name)} characters; the limit is {NAME_MAX} for project "
+		        f"{PROJECT!r}, because the container's hostname (box-{PROJECT}-<name>) must fit in 63")
+	return None
+
+
+def valid_name(name):
+	return name_problem(name) is None
 GOLDEN_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 # A git branch name, for the ?base=/?merge= spawn parameters (`cbx minto`). These end up in the box's
 # environment and are handed to `git checkout`/`git merge` there, so the set is deliberately narrow:
@@ -1587,8 +1619,9 @@ class Handler(BaseHTTPRequestHandler):
 				return self._reply(200, list_goldens())
 			if path.startswith("/box/") and path.endswith("/dirty"):
 				name = path[len("/box/"):-len("/dirty")]
-				if not NAME_RE.match(name):
-					return self._reply(400, {"error": "bad box name"})
+				bad = name_problem(name)
+				if bad:
+					return self._reply(400, {"error": bad})
 				return self._reply(200, box_dirty(name))
 			return self._reply(404, {"error": "not found"})
 		except Exception as e:  # noqa: BLE001
@@ -1611,22 +1644,25 @@ class Handler(BaseHTTPRequestHandler):
 				return self._reply(200, refresh_forwarders())
 			if path.startswith("/forwards/"):
 				fname = path[len("/forwards/"):]
-				if not NAME_RE.match(fname):
-					return self._reply(400, {"error": "bad box name"})
+				bad = name_problem(fname)
+				if bad:
+					return self._reply(400, {"error": bad})
 				return self._reply(200, refresh_forwarders(fname))
 			# Recreate (newest image + respawn resuming each box's session). /recreate = every box.
 			if path == "/recreate":
 				return self._reply(200, recreate_all(fresh_upper=fresh))
 			if path.startswith("/recreate/"):
 				rname = path[len("/recreate/"):]
-				if not NAME_RE.match(rname):
-					return self._reply(400, {"error": "bad box name"})
+				bad = name_problem(rname)
+				if bad:
+					return self._reply(400, {"error": bad})
 				return self._reply(200, recreate_box(rname, fresh_upper=fresh))
 			# Deliver review feedback into a box's claude session.
 			if path.startswith("/box/") and path.endswith("/say"):
 				name = path[len("/box/"):-len("/say")]
-				if not NAME_RE.match(name):
-					return self._reply(400, {"error": "bad box name"})
+				bad = name_problem(name)
+				if bad:
+					return self._reply(400, {"error": bad})
 				text = self._body()
 				if not text.strip():
 					return self._reply(400, {"error": "empty message"})
@@ -1635,8 +1671,9 @@ class Handler(BaseHTTPRequestHandler):
 			# send-keys would split into one prompt per line.
 			if path.startswith("/box/") and path.endswith("/paste"):
 				name = path[len("/box/"):-len("/paste")]
-				if not NAME_RE.match(name):
-					return self._reply(400, {"error": "bad box name"})
+				bad = name_problem(name)
+				if bad:
+					return self._reply(400, {"error": bad})
 				text = self._body()
 				if not text.strip():
 					return self._reply(400, {"error": "empty message"})
@@ -1645,8 +1682,9 @@ class Handler(BaseHTTPRequestHandler):
 			if not path.startswith("/box/"):
 				return self._reply(404, {"error": "not found"})
 			name = path[len("/box/"):]
-			if not NAME_RE.match(name):
-				return self._reply(400, {"error": "bad box name"})
+			bad = name_problem(name)
+			if bad:
+				return self._reply(400, {"error": bad})
 			# ?base=<branch>&merge=<branch> — `cbx minto`: start this box on <base> with <merge>
 			# merged in and conflicted, instead of a fresh branch off DEV_BRANCH.
 			base, merge = self._param("base"), self._param("merge")
@@ -1693,8 +1731,9 @@ class Handler(BaseHTTPRequestHandler):
 		# /box/<name>/purge  purge: the directory goes too, permanently
 		purge = path.endswith("/purge")
 		name = path[len("/box/"):-len("/purge")] if purge else path[len("/box/"):]
-		if not NAME_RE.match(name):
-			return self._reply(400, {"error": "bad box name"})
+		bad = name_problem(name)
+		if bad:
+			return self._reply(400, {"error": bad})
 		try:
 			self._reply(200, purge_box(name) if purge else kill_box(name))
 		except Exception as e:  # noqa: BLE001
