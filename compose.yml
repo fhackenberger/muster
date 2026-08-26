@@ -152,6 +152,12 @@ services:
       # Only so the entrypoint can put a CONFIGURED token into the pinchtab config; when it is unset
       # the hub generates one there instead. The hub itself does not talk to pinchtab.
       PT_TOKEN: ${PT_TOKEN:-}
+      # `muster ask` — the human end of the optional muster-ask service below. Harmless when that
+      # service is not deployed: the CLI says so instead of hanging on a name that does not resolve.
+      # The hub is not the intended CALLER (its own claude is a person's, not a service's); this is
+      # for proving the endpoint is reachable and configured before wiring an application to it.
+      ASK_URL: ${ASK_URL:-http://muster-ask:8098}
+      ASK_TOKEN: ${ASK_TOKEN:-}
     # Everything PROJECT-specific (backend/frontend wiring, API keys) lives in `service-env` instead
     # of here, because the box-broker hands the very same file to every agent box. That is what makes
     # a backend an AGENT starts behave like the one the hub starts. Keep this `environment:` block for
@@ -180,6 +186,60 @@ services:
       # gen-hub-mounts.sh renders, so the hub and the boxes cannot be configured differently by
       # accident. What stays here is the stack's own plumbing above: the repo, the goldens, box state,
       # the manifests, the shared claude/pinchtab/git identity.
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ optional: muster-ask
+  #
+  # ONE LOCKED-DOWN `claude -p` PER REQUEST, for the stack's own services. Off unless the stack asks
+  # for it (COMPOSE_PROFILES=ask in .env), because most stacks have nothing that wants an inference
+  # and an idle inference endpoint is surface for nothing.
+  #
+  # It exists so that a project service needing a single model call — classify this photograph,
+  # extract these fields — does not have to bake the claude CLI AND a bind mount of the shared,
+  # logged-in ~/.claude into its own application image, or drive a whole agent box for a question
+  # that is not agentic at all. Every request is a fresh process, so context resets between calls by
+  # construction rather than by remembering to clear it. See ask/muster-ask and README-remote.md.
+  #
+  # NOT ON THE BOX-BROKER, deliberately. The broker owns the docker socket and its invariant is that
+  # a CALLER NEVER CHOOSES MOUNTS (it is handed a box NAME; the mounts come from the root-owned
+  # table), and BROKER_TOKEN is the credential that authorises spawning boxes — so an application
+  # container holding it in order to make an inference would be a real escalation. Running `claude`
+  # needs claude and a login, not the ability to create containers.
+  muster-ask:
+    profiles: [ask]
+    image: ${BOX_IMAGE:-muster:stable}
+    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
+    # Straight to the service: this is not a box, so it must not go through the box entrypoint,
+    # which materializes a runtime user from HOST_UID and launches claude in tmux.
+    entrypoint: ["/usr/local/bin/muster-ask"]
+    user: "1000:1000"
+    environment:
+      # No default: muster-ask refuses to start without one rather than leave an unauthenticated
+      # inference endpoint on the stack network.
+      ASK_TOKEN: ${ASK_TOKEN:-}
+      HOME: /home/dev
+      # Same reason as the hub's: claude keeps the login in ~/.claude.json, OUTSIDE ~/.claude, so
+      # without this the mount below would carry the config and not the credential.
+      CLAUDE_CONFIG_DIR: /home/dev/.claude
+      # What a request may expose to claude, as key=/path pairs. The caller sends the KEY and can
+      # never send a path. Empty here on purpose — a project adds its own in compose.project.yml,
+      # together with the volume that makes the path real.
+      ASK_DIRS: ${ASK_DIRS:-}
+      ASK_TOOLS: ${ASK_TOOLS:-Read}
+      ASK_SLOTS: ${ASK_SLOTS:-4}
+      ASK_MODEL: ${ASK_MODEL:-}
+      ASK_EFFORT: ${ASK_EFFORT:-}
+    volumes:
+      # The stack's shared claude home — the hub's and every box's ~/.claude, already logged in.
+      # One place holds the login, instead of every image that wants an answer holding it.
+      - ./data/claude:/home/dev/.claude
+    # No ports: reachable only as http://muster-ask:8098 on the stack network, by name, with a token.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8098/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
   # ------------------------------------------------------------------ build-only

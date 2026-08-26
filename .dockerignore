@@ -1,0 +1,51 @@
+# What must NEVER enter an image build context from this directory.
+#
+# THE REASON THIS FILE EXISTS is the same one the .gitignore beside it opens with: this directory is
+# both the source tree AND, once copied to a server, a live stack directory. compose.yml builds every
+# image with `context: .`, so on a server `docker compose --profile build build hub-image` tars up
+# the whole stack dir and hands it to the docker daemon — goldens, the hub's git repo, every box's
+# overlay, and data/claude, which holds the CLAUDE LOGIN. None of that is a build input.
+#
+# On a CI worker holding a fresh checkout this file changes nothing, which is exactly why the gap
+# went unnoticed: the images that are built in CI never saw a populated data/. It bites the first
+# time someone builds where the stack actually runs — which is the supported way to run a stack whose
+# add-on nobody else builds for them.
+#
+# IT IS NOT A COPY OF .gitignore, and the difference is the one line that matters:
+#
+#     build-setup.sh is GITIGNORED (it is your file, made from build-setup.sh.example) but it MUST
+#     be in the build context — Dockerfile.addon COPYs it, by the name SETUP_SCRIPT gives. Exclude
+#     it here and every add-on build fails at the COPY.
+#
+# Same for anything else a Dockerfile reads: common-setup.sh, terminfo-ghostty, tmux.conf, hub/,
+# box-bin/, box-broker/, skills/, muster-box.sh, entrypoint.sh, pinchtab-config.json.example. If you
+# add an exclusion, check it against the COPY lines first.
+
+# ---- live stack state (bind mounts). The big one is data/, and the dangerous one is data/claude. ----
+data/
+db-init/
+boxes/
+
+# ---- the stack's own credentials ----
+git-identity/
+.env
+service-env
+box-env
+
+# ---- per-stack config, made from the *.example files or templated onto the server ----
+mounts
+port-forwards
+hub-services/
+compose.project.yml
+compose.override.yml
+claude-settings.json
+
+# ---- repository furniture: read by developers and by CI, never by a Dockerfile ----
+.git/
+.github/
+docs/
+tools/
+tests/
+__pycache__/
+*.pyc
+*.swp

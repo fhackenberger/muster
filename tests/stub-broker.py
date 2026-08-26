@@ -32,6 +32,10 @@ STAGING = os.environ.get("GOLDEN_STAGING", "")
 
 BOXES = {}       # name -> {"golden": …, "base": …, "merge": …, "dirty": [ … ]}
 
+# What a TEST wants /box/<n>/dirty to say, as JSON: {"work1": {"dirty": [" M a.txt"], "head": "<sha>"}}
+# The real broker reads both out of the container; here they are whatever the fixture is pretending.
+BOX_STATE = json.loads(os.environ.get("STUB_BOX_STATE", "{}"))
+
 
 def record(method, path, body=""):
     with open(LOG, "a") as fh:
@@ -98,7 +102,10 @@ class H(BaseHTTPRequestHandler):
                 "retired": retired})
         if path.startswith("/box/") and path.endswith("/dirty"):
             n = path[len("/box/"):-len("/dirty")]
-            return self._reply(200, {"dirty": BOXES.get(n, {}).get("dirty", [])})
+            st = BOX_STATE.get(n, {})
+            return self._reply(200, {"box": n, "reachable": True,
+                                     "dirty": st.get("dirty", BOXES.get(n, {}).get("dirty", [])),
+                                     "head": st.get("head", "")})
         if path == "/golden":
             cur = current_golden()
             in_use = {}
@@ -159,6 +166,15 @@ class H(BaseHTTPRequestHandler):
                 if not body.strip():
                     return self._reply(400, {"error": "empty message"})
                 return self._reply(200, {verb: n})
+        if path.startswith("/box/") and "/migrate/" in path:
+            rest = path[len("/box/"):]
+            n, _, action = rest.partition("/migrate/")
+            st = BOX_STATE.get(n, {})
+            if st.get("migrate_fails"):
+                return self._reply(500, {"ok": False, "error": "pretend the patch did not apply"})
+            files = [ln.split(None, 1)[-1] for ln in st.get("dirty", [])]
+            return self._reply(200, {"ok": True, "action": action, "files": files,
+                                     "output": f"applied {len(files)} path(s)"})
         if path.startswith("/box/"):
             n = path[len("/box/"):]
             # The real broker refuses a name longer than the container hostname can carry, and its

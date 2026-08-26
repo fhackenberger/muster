@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""muster-ask — ONE locked-down claude call per request, for the stack's own services.
+
+WHY THIS EXISTS. A project service that wants a single inference — classify this photograph, extract
+these fields — has, without this, three bad options: bake an API key into the stack, bake the claude
+CLI plus a bind mount of the shared (logged-in) ~/.claude into its own image, or drive a whole agent
+box for something that is not agentic at all. The first costs a second credential to hold and rotate,
+the second puts the stack's login inside every application image that wants an inference, and the
+third pays box spawn + brief + poll latency for a question answered in one shot.
+
+So: one small service, holding the login once, that runs exactly this and nothing else —
+
+    claude -p <prompt> --output-format json --model … --effort …
+           --allowedTools <allow-listed> --permission-mode dontAsk --add-dir <a CONFIGURED dir>
+
+EVERY REQUEST IS A FRESH PROCESS. That is the whole design, not an implementation detail: there is no
+session, so there is no context to reset between calls, no conversation to grow and no drift from the
+previous ad. "Reset the context after each run" is structural here rather than something a caller has
+to remember to do.
+
+WHY NOT THE BOX-BROKER, which is the other thing in a stack that talks to claude-shaped workloads:
+the broker owns the docker socket, and its central invariant is that a CALLER NEVER CHOOSES MOUNTS —
+it is handed a box NAME and reads the mounts from the root-owned table. An endpoint taking "expose
+this directory to an inference" is precisely what that invariant excludes, and BROKER_TOKEN is the
+credential that authorises spawning boxes, so handing it to an application container so it can
+appraise a photograph would be a real escalation. Running `claude -p` needs claude and a login; it
+does not need the ability to create containers. Hence a separate, unprivileged service with its own
+token and NO docker socket.
+
+The same principle is kept here in the small: a request may not name a PATH, only a KEY from the
+ASK_DIRS map the stack configured, and it may not ask for a tool outside ASK_TOOLS. The permission
+mode is not a parameter at all.
+
+Config (env, from compose):
+  ASK_TOKEN        shared secret; required in the X-Ask-Token header. The service refuses to start
+                   without one — an open inference endpoint on the stack network is not a default.
+  ASK_PORT         listen port (default 8098; not published to the host)
+  ASK_DIRS         what a request may expose to claude, as key=/path pairs:
+                     ASK_DIRS=images=/data/images,briefs=/data/briefs
+                   The caller sends {"dir": "images"}; it can never send a path. Empty = no dir may
+                   be exposed, which is the right default for a stack that only sends text.
+  ASK_TOOLS        tools a request may ask for (default "Read"). A request may use a SUBSET. Bash,
+                   Write and Edit are rejected outright however this is set — see FORBIDDEN below.
+  ASK_SLOTS        concurrent inferences (default 4). Beyond this, requests wait ASK_QUEUE_WAIT
+                   seconds for a slot and are then refused with 503, because a caller that keeps
+                   piling on work should be told, not silently queued for minutes.
+  ASK_QUEUE_WAIT   how long to wait for a slot (default 30)
+  ASK_MODEL        default model when a request does not name one (default claude-opus-5)
+  ASK_EFFORT       default effort (default low)
+  ASK_MAX_TIMEOUT  ceiling for a request's timeout (default 300)
+  ASK_MAX_PROMPT   largest prompt accepted, in bytes (default 200000)
+  CLAUDE_BIN       the CLI (default: claude on PATH)
+
+Endpoints:
+  GET  /health     unauthenticated liveness — {"ok": true}, and nothing else. It says nothing about
+                   the configuration on purpose: it exists for a compose healthcheck, which cannot
+                   carry a token.
+  GET  /config     (token) what this service will accept: dir keys, tools, slots, defaults. So a
+                   caller can fail early and legibly instead of on its first real request.
+  POST /ask        (token) {"prompt": "...", "dir": "images", "tools": ["Read"],
+                            "model": "...", "effort": "low", "timeout": 120}
+                   -> {"ok": true, "exit": 0, "stdout": "<claude's json envelope>", "ms": 4210}
+                   The envelope is returned RAW. Parsing it is the caller's job — it already has to
+                   handle claude's is_error/result shape, and a second interpretation here would be a
+                   second thing to keep in step with the CLI.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TOKEN = os.environ.get("ASK_TOKEN", "")
+PORT = int(os.environ.get("ASK_PORT", "8098"))
+SLOTS = max(1, int(os.environ.get("ASK_SLOTS", "4")))
+QUEUE_WAIT = float(os.environ.get("ASK_QUEUE_WAIT", "30"))
+DEFAULT_MODEL = os.environ.get("ASK_MODEL", "claude-opus-5")
+DEFAULT_EFFORT = os.environ.get("ASK_EFFORT", "low")
+MAX_TIMEOUT = float(os.environ.get("ASK_MAX_TIMEOUT", "300"))
+MAX_PROMPT = int(os.environ.get("ASK_MAX_PROMPT", "200000"))
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+
+# TOOLS THAT ARE NEVER ALLOWED, however ASK_TOOLS is set. The text in a prompt here is UNTRUSTED by
+# construction — it is a classifieds ad, a scraped page, a user's message — so the one thing this
+# service must never do is hand that text a way to run commands or change files. Read (with an
+# --add-dir the STACK chose) is the useful, bounded case this exists for.
+FORBIDDEN_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Task"}
+
+
+def parse_dirs(spec):
+	"""ASK_DIRS as {key: path}. Malformed entries are dropped LOUDLY rather than ignored: a typo here
+	means a caller's `dir` stops resolving, and the failure would otherwise surface as a claude that
+	cannot see the file it was told to read."""
+	out = {}
+	for entry in (spec or "").split(","):
+		entry = entry.strip()
+		if not entry:
+			continue
+		if "=" not in entry:
+			print(f"muster-ask: ignoring ASK_DIRS entry {entry!r} — expected key=/path", file=sys.stderr)
+			continue
+		key, path = entry.split("=", 1)
+		key, path = key.strip(), path.strip()
+		if not key or not path.startswith("/"):
+			print(f"muster-ask: ignoring ASK_DIRS entry {entry!r} — key=/absolute/path", file=sys.stderr)
+			continue
+		if not os.path.isdir(path):
+			# Not fatal: compose may create the mount a moment later, and refusing to start would turn
+			# a mount-order wobble into a dead service. Say it once, at boot, where it can be seen.
+			print(f"muster-ask: ASK_DIRS key {key!r} -> {path} does not exist (yet?)", file=sys.stderr)
+		out[key] = path
+	return out
+
+
+DIRS = parse_dirs(os.environ.get("ASK_DIRS", ""))
+ALLOWED_TOOLS = [t.strip() for t in os.environ.get("ASK_TOOLS", "Read").split(",") if t.strip()]
+ALLOWED_TOOLS = [t for t in ALLOWED_TOOLS if t not in FORBIDDEN_TOOLS]
+
+_slots = threading.BoundedSemaphore(SLOTS)
+_busy = threading.Lock()
+_in_flight = 0
+
+
+class AskError(Exception):
+	"""A bad request, with the status to answer it with."""
+
+	def __init__(self, status, message):
+		super().__init__(message)
+		self.status = status
+		self.message = message
+
+
+def build_argv(req):
+	"""Turn a request into the argv we are willing to run. Everything not validated here is NOT a
+	parameter: --permission-mode and --output-format are fixed, because they are the difference
+	between 'a bounded inference' and 'an agent with your filesystem'."""
+	prompt = req.get("prompt")
+	if not isinstance(prompt, str) or not prompt.strip():
+		raise AskError(400, "prompt is required")
+	if len(prompt.encode()) > MAX_PROMPT:
+		raise AskError(413, f"prompt is larger than ASK_MAX_PROMPT ({MAX_PROMPT} bytes)")
+
+	tools = req.get("tools") or ALLOWED_TOOLS
+	if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+		raise AskError(400, "tools must be a list of strings")
+	bad = [t for t in tools if t not in ALLOWED_TOOLS]
+	if bad:
+		raise AskError(403, f"tool(s) {bad} are not allowed here (ASK_TOOLS={','.join(ALLOWED_TOOLS)})")
+
+	argv = [
+		CLAUDE_BIN, "-p", prompt,
+		"--output-format", "json",
+		"--model", str(req.get("model") or DEFAULT_MODEL),
+		"--effort", str(req.get("effort") or DEFAULT_EFFORT),
+		"--permission-mode", "dontAsk",
+	]
+	if tools:
+		argv += ["--allowedTools", ",".join(tools)]
+
+	# A KEY, NEVER A PATH. This is the whole confinement story: the stack decides in ASK_DIRS what
+	# may be looked at, exactly as the broker's root-owned mounts table decides what a box may see.
+	key = req.get("dir")
+	if key is not None:
+		if not isinstance(key, str):
+			raise AskError(400, "dir must be a string key from ASK_DIRS")
+		if key not in DIRS:
+			raise AskError(403, f"dir {key!r} is not configured (have: {sorted(DIRS)})")
+		argv += ["--add-dir", DIRS[key]]
+
+	timeout = req.get("timeout")
+	try:
+		timeout = float(timeout) if timeout is not None else MAX_TIMEOUT
+	except (TypeError, ValueError):
+		raise AskError(400, "timeout must be a number of seconds") from None
+	timeout = max(1.0, min(timeout, MAX_TIMEOUT))
+	return argv, timeout
+
+
+def run_ask(argv, timeout):
+	started = time.monotonic()
+	try:
+		proc = subprocess.run(
+			argv, capture_output=True, text=True, timeout=timeout,
+			# stdin from /dev/null: with a terminal on stdin the CLI waits seconds for piped input
+			# that is never coming, on every single call.
+			stdin=subprocess.DEVNULL, check=False,
+		)
+	except subprocess.TimeoutExpired:
+		return {"ok": False, "error": f"claude timed out after {timeout:g}s",
+		        "ms": int((time.monotonic() - started) * 1000)}
+	except OSError as exc:
+		return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+		        "ms": int((time.monotonic() - started) * 1000)}
+	ms = int((time.monotonic() - started) * 1000)
+	return {
+		"ok": proc.returncode == 0,
+		"exit": proc.returncode,
+		"stdout": proc.stdout or "",
+		"stderr": (proc.stderr or "")[:2000],
+		"ms": ms,
+	}
+
+
+class Handler(BaseHTTPRequestHandler):
+	server_version = "muster-ask"
+
+	def log_message(self, fmt, *args):
+		# One line per request on stderr, so `muster logs` / `docker logs` shows what was asked and
+		# how long it took — without the prompt, which is untrusted text and often an entire ad.
+		sys.stderr.write("muster-ask: %s\n" % (fmt % args))
+
+	def _reply(self, status, payload):
+		body = json.dumps(payload).encode()
+		self.send_response(status)
+		self.send_header("Content-Type", "application/json")
+		self.send_header("Content-Length", str(len(body)))
+		self.end_headers()
+		self.wfile.write(body)
+
+	def _authed(self):
+		if not TOKEN or self.headers.get("X-Ask-Token") != TOKEN:
+			self._reply(403, {"error": "forbidden"})
+			return False
+		return True
+
+	def _path(self):
+		return self.path.split("?", 1)[0].rstrip("/") or "/"
+
+	def do_GET(self):
+		path = self._path()
+		if path == "/health":
+			# Deliberately unauthenticated and deliberately empty of detail: a compose healthcheck
+			# cannot carry a token, and liveness is not a place to publish configuration.
+			self._reply(200, {"ok": True})
+			return
+		if path == "/config":
+			if not self._authed():
+				return
+			self._reply(200, {
+				"dirs": sorted(DIRS),
+				"tools": ALLOWED_TOOLS,
+				"slots": SLOTS,
+				"in_flight": _in_flight,
+				"model": DEFAULT_MODEL,
+				"effort": DEFAULT_EFFORT,
+				"max_timeout": MAX_TIMEOUT,
+				"max_prompt": MAX_PROMPT,
+			})
+			return
+		self._reply(404, {"error": "not found"})
+
+	def do_POST(self):
+		global _in_flight
+		if self._path() != "/ask":
+			self._reply(404, {"error": "not found"})
+			return
+		if not self._authed():
+			return
+		n = int(self.headers.get("Content-Length") or 0)
+		if n > MAX_PROMPT + 4096:
+			self._reply(413, {"error": "request too large"})
+			return
+		try:
+			req = json.loads(self.rfile.read(n).decode() or "{}")
+		except (ValueError, UnicodeDecodeError) as exc:
+			self._reply(400, {"error": f"body is not JSON: {exc}"})
+			return
+		if not isinstance(req, dict):
+			self._reply(400, {"error": "body must be a JSON object"})
+			return
+		try:
+			argv, timeout = build_argv(req)
+		except AskError as exc:
+			self._reply(exc.status, {"error": exc.message})
+			return
+
+		# BOUNDED, AND HONEST ABOUT IT. Without a cap, a caller that never throttles turns this into
+		# N concurrent claude processes against one login, and the first thing that breaks is an
+		# agent box mid-brief — a failure that looks nothing like its cause.
+		if not _slots.acquire(timeout=QUEUE_WAIT):
+			self._reply(503, {"error": f"all {SLOTS} slots busy for {QUEUE_WAIT:g}s — retry"})
+			return
+		with _busy:
+			_in_flight += 1
+		try:
+			result = run_ask(argv, timeout)
+		finally:
+			_slots.release()
+			with _busy:
+				_in_flight -= 1
+		self._reply(200 if result.get("ok") else 502, result)
+
+
+def main():
+	if not TOKEN:
+		raise SystemExit("muster-ask: ASK_TOKEN is required — refusing to run an open inference endpoint")
+	if not ALLOWED_TOOLS:
+		print("muster-ask: no tools allowed; requests can only send text", file=sys.stderr)
+	if shutil.which(CLAUDE_BIN) is None:
+		# Fail at boot, not on the first request. A service that is 'up' and fails everything it is
+		# asked is the exact shape of problem the hub's ready= probes exist to prevent.
+		raise SystemExit(f"muster-ask: {CLAUDE_BIN!r} is not on PATH")
+	print(f"muster-ask: listening on :{PORT}, {SLOTS} slot(s), "
+	      f"tools={','.join(ALLOWED_TOOLS) or '(none)'}, dirs={','.join(sorted(DIRS)) or '(none)'}",
+	      file=sys.stderr)
+	ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+	main()

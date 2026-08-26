@@ -30,3 +30,7 @@ __pycache__/
 
 # --- the project's own build toolchain (made from build-setup.sh.example) ---
 build-setup.sh
+
+# The stack claude settings (made from claude-settings.example.json) — holds no secret by design,
+# but it is a running stack's file, not the source tree's.
+claude-settings.json

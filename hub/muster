@@ -56,6 +56,12 @@ set -euo pipefail
 #                                           #   briefed earlier, so one caller can run many boxes at
 #                                           #   once and survive its own restart. --purge bins the box
 #                                           #   once the result is in. See README-remote.md.
+#   $SELF ask    [-m "..."]                   # ONE locked-down claude call — no box, no session, no
+#             [--prompt-file F|-]           #   context carried over: every call is a fresh process.
+#             [--dir KEY] [--tools T,T]     #   For a stack service that wants a single inference
+#             [--model M] [--effort E]      #   (classify this photo) instead of an agent. --dir names
+#             [--timeout S] [--raw]         #   a KEY from ASK_DIRS, never a path. Needs the muster-ask
+#                                           #   service (COMPOSE_PROFILES=ask). See README-remote.md.
 #   $SELF peek   <box> [--snap] [--full]      # SEE what that agent sees: a screenshot of ITS browser tab
 #             [-o FILE]                     #   --snap = the accessibility tree instead (what it reads)
 #                                           #   --full = the whole scrollable page
@@ -110,6 +116,28 @@ set -euo pipefail
 #                                           #   asks first; -y skips BOTH the preview and the question)
 #
 #   $SELF golden snapshot [--prep]            # freeze the repo as the new base + move every box onto it
+#                                           #   --prep runs GOLDEN_PREP_CMD (from the stack's .env) in THIS
+#                                           #   repo FIRST — `npm ci`, `gradle classes`, whatever makes the
+#                                           #   tree buildable — so every box starts warm instead of
+#                                           #   re-installing the world on its first build. It runs here and
+#                                           #   NOT in the staging copy on purpose: installed deps bake
+#                                           #   absolute paths in, and the golden is mounted back at this
+#                                           #   very path inside every box, so a tree prepared anywhere else
+#                                           #   is wrong everywhere. Only a convenience for commands you
+#                                           #   could type here yourself before snapshotting; an empty
+#                                           #   GOLDEN_PREP_CMD does nothing, and a prep that FAILS freezes
+#                                           #   nothing — fix it in the repo and re-run.
+#   $SELF golden snapshot [--force]           # …and move even boxes whose work is not handed off,
+#                                           #   discarding it. Without it they simply STAY on their
+#                                           #   old golden and the snapshot still happens — goldens
+#                                           #   are versioned, and `golden ls`/`retire`/`reap` have
+#                                           #   always expected a box to sit on an older one.
+#   $SELF golden migrate <box>|--all          # move a box onto the CURRENT golden and carry its
+#             [--force] [--dry-run]         #   UNCOMMITTED work across (patch via the box's ~/keep,
+#                                           #   which outlives the overlay; re-applied with a 3-way
+#                                           #   merge). Lists what is coming and warns where it
+#                                           #   overlaps the new golden's OWN dirty files. It cannot
+#                                           #   carry COMMITS — handoff those first.
 #   $SELF golden seal <id>                    # finish a staged golden you fixed up by hand
 #   $SELF golden ls | reap                    # list snapshots / delete unreferenced ones
 #   $SELF golden retire <id>                  # free one that boxes are still on: move them onto the
@@ -1083,7 +1111,7 @@ status_overview() {
 	# `$SELF q`'s watch mode repaints THIS, so keep it cheap and side-effect free. Its one network call
 	# is the origin fetch, which `--no-fetch` skips (the watch loop throttles it to $WATCH_FETCH).
 	local behind ahead box sha st bhd ahd age note conf dconf act other list running gprov gsha gbehind todo=()
-	local cols nw=3 sumw rows=() row bname bstatus bgolden bstate bage detail
+	local cols nw=3 sumw rows=() row bname bstatus bgolden bstate bage detail bmark gcur
 
 	cols="$(term_cols)"
 
@@ -1092,10 +1120,13 @@ status_overview() {
 	# printed, which is why the call sits up here rather than in the boxes section below.
 	list="$(agent_refs)"
 	running="$(box_list)"
+	# Which golden is current, resolved BEFORE the boxes table: it is what marks a box that was left
+	# behind by a snapshot. (The golden section further down reports on the golden itself.)
+	gcur="$(basename "$(readlink -f "$GOLDEN/current" 2>/dev/null)" 2>/dev/null || true)"
 	if [ -n "$running" ]; then
 		while IFS=$'\t' read -r bname bstatus bgolden; do
 			[ -n "$bname" ] || continue
-			rows+=("$bname"$'\t'"$bstatus")
+			rows+=("$bname"$'\t'"$bstatus"$'\t'"$bgolden")
 		done < <(printf '%s' "$running" | jq -r '.boxes[]? | "\(.box)\t\(.status)\t\(.golden)"' 2>/dev/null)
 	fi
 	for box in $list; do [ "${#box}" -gt "$nw" ] && nw="${#box}"; done
@@ -1233,6 +1264,16 @@ status_overview() {
 		read -r bstate bage <<< "$(box_activity "$bname")"
 		# The right-hand column answers "and how long has that been true", which is the whole reason to
 		# look: a 3s 'waiting' is the agent thinking out loud, a 5h33m one is a session you forgot.
+		# A BOX THAT IS NOT ON THE CURRENT GOLDEN. Since `golden snapshot` leaves behind any box whose
+		# work is not handed off, this is a normal state rather than an oddity — and an invisible one
+		# without a marker: the box builds against a base that is no longer what new boxes get, and the
+		# only way to notice used to be `golden ls`.
+		bgolden="${row#*$'\t'}"; bgolden="${bgolden#*$'\t'}"
+		if [ -n "$bgolden" ] && [ -n "${gcur:-}" ] && [ "$bgolden" != "$gcur" ]; then
+			bmark=" ${C_YEL}on $bgolden${C_RESET}${C_DIM} (not current — $SELF golden migrate $bname)${C_RESET}"
+		else
+			bmark=""
+		fi
 		case "$bstate" in
 			busy)    detail="${C_DIM}working for${C_RESET} $(human_age "$bage")" ;;
 			waiting) detail="${C_B}${C_MAG}wants your input${C_RESET} ${C_DIM}for${C_RESET} $(human_age "$bage")" ;;
@@ -1241,7 +1282,7 @@ status_overview() {
 			*)       detail="${C_DIM}$bstatus${C_RESET}" ;;
 		esac
 		printf '  %s %s%s %-8s%s %s\n' \
-			"$(cell "$C_B" "$nw" "$(trunc "$nw" "$bname")")" "$(act_color "$bstate")" "●" "$bstate" "$C_RESET" "$detail"
+			"$(cell "$C_B" "$nw" "$(trunc "$nw" "$bname")")" "$(act_color "$bstate")" "●" "$bstate" "$C_RESET" "$detail$bmark"
 	done
 
 	hdr golden
@@ -3414,11 +3455,21 @@ golden_retire() {
 		case "$answer" in
 			m|M)
 				for b in $boxes; do
+					# --fresh, and ONLY after checking. Keeping the upper layer looked kinder — it was
+					# the old comment here — but an upper layer is only coherent on the lower layer it
+					# was computed against: re-pointed at another golden, the box's index and HEAD (both
+					# in that layer) describe the old tree while every file the agent never touched comes
+					# from the new one, so everything that changed between the two snapshots shows up as
+					# an uncommitted modification the agent did not make. Kinder is to refuse, and to
+					# offer the command that carries the work properly.
+					if ! box_move_blocker "$b"; then
+						die "'$b' is not ready to move — hand off its commits, then:
+     $SELF golden migrate $b       # carries its uncommitted files onto $cur
+     $SELF recreate $b --fresh     # …or discard them
+     $SELF purge $b                # …or remove the box for good"
+					fi
 					echo "$SELF: moving '$b' onto $cur..."
-					# Not --fresh: the box's upper layer is its unpushed work, and losing that silently
-					# would be the worst outcome of a housekeeping command. A box that needs a clean base
-					# is one you recreate --fresh deliberately.
-					box_recreate "$b" || die "moving '$b' failed — nothing was deleted; fix it and retry"
+					box_recreate "$b" --fresh || die "moving '$b' failed — nothing was deleted; fix it and retry"
 				done ;;
 			p|P)
 				for b in $boxes; do
@@ -3463,6 +3514,171 @@ golden_reap() {
 	echo "$SELF: reaped: $(printf '%s' "$resp" | jqr '.reaped | join(", ") // "(none)"')"
 }
 
+# Is this box safe to move onto a new golden? Prints why not, and returns non-zero when it is not.
+#
+# Moving a box means recreating it with a FRESH upper layer, and that upper layer is the box's entire
+# working copy — its edits AND the git objects for its commits, because .git sits in the same overlay.
+# So "safe" is two things, not one: nothing uncommitted, and nothing committed that the hub has not
+# already got on refs/agents/<box>.
+#
+# ONLY THE FIRST USED TO BE CHECKED, while the refusal told you to "commit + handoff". An agent that
+# finishes a piece of work and commits it without handing off leaves a clean `git status` and commits
+# that exist nowhere else — precisely the case the message warned about and the check waved through.
+box_probe() { broker GET "/box/$1/dirty" 2>/dev/null; }
+box_dirty_of() { printf '%s' "$1" | jqr '.dirty[]?'; }
+
+# Would moving this box lose COMMITS? Uncommitted files are the other half and are recoverable with
+# `golden migrate`; commits are not, because the box's .git lives in the upper layer a move discards
+# and nothing outside the box has them until `handoff` pushes refs/agents/<box>.
+#
+# ONLY THE DIRTY HALF USED TO BE CHECKED, while the refusal told you to "commit + handoff". An agent
+# that finishes a piece of work and commits it without handing off leaves a clean `git status` and
+# commits that exist nowhere else — precisely the case the message warned about.
+box_unpushed_blocker() {
+	local box="$1" resp="$2" head known n
+	head="$(printf '%s' "$resp" | jqr '.head')"
+	if [ -z "$head" ]; then
+		echo "$SELF: box '$box' — this broker does not report HEAD, so committed-but-unpushed work" >&2
+		echo "       cannot be checked (VERSION DRIFT: the broker is older than this CLI)" >&2
+		return 0
+	fi
+	if ! git_ cat-file -e "${head}^{commit}" 2>/dev/null; then
+		echo "$SELF: box '$box' is on a commit the hub has never seen (${head:0:12}) — never handed off" >&2
+		return 1
+	fi
+	known="$DEV"
+	git_ rev-parse --verify -q "refs/agents/$box" >/dev/null 2>&1 && known="refs/agents/$box"
+	n="$(git_ rev-list --count "${known}..${head}" 2>/dev/null || echo 0)"
+	if [ "${n:-0}" != 0 ]; then
+		echo "$SELF: box '$box' is $n commit(s) ahead of ${known#refs/} — committed but not handed off" >&2
+		return 1
+	fi
+	return 0
+}
+
+# Is this box safe to move onto a new golden AS IS — i.e. with its upper layer discarded and nothing
+# carried across? Both halves must be clean. `golden migrate` exists for the case where they are not.
+box_move_blocker() {
+	local box="$1" resp dirty bad=0
+	resp="$(box_probe "$box")" || {
+		echo "$SELF: box '$box' is not reachable — cannot tell whether its work is safe to discard" >&2
+		return 1
+	}
+	dirty="$(box_dirty_of "$resp" | head -5)"
+	if [ -n "$dirty" ]; then
+		echo "$SELF: box '$box' has uncommitted changes:" >&2
+		# QUOTED, and one line per entry. `printf '  %s\n' $dirty` word-splits, so a porcelain line
+		# like " M a.txt" came out as two lines — "M" and "a.txt" — which reads as two mystery files.
+		printf '%s\n' "$dirty" | sed 's/^/  /' >&2
+		bad=1
+	fi
+	box_unpushed_blocker "$box" "$resp" || bad=1
+	return "$bad"
+}
+
+# The paths the CURRENT golden itself carries uncommitted. `golden snapshot` bakes the hub's dirty
+# tree into every golden on purpose — it is how local setup reaches the boxes — so a migrated file can
+# land on top of one the new golden already modifies, and that overlap is worth seeing BEFORE the
+# patch is applied rather than as a conflict marker afterwards.
+# --no-optional-locks: the hub mounts the goldens read-only, so git must not try to refresh the index.
+golden_dirty_paths() {
+	[ -d "$GOLDEN/current" ] || return 0
+	git -C "$GOLDEN/current" --no-optional-locks status --porcelain 2>/dev/null | sed 's/^...//' | sort -u
+}
+
+
+# ---------------------------------------------------------------- golden migrate
+#
+# MOVE A BOX ONTO THE CURRENT GOLDEN AND TAKE ITS UNCOMMITTED WORK WITH IT.
+#
+# The move itself is unavoidably a fresh upper layer (see create_box in the broker: an upper layer is
+# only coherent on the lower layer it was computed against). So the work has to travel as a PATCH:
+# `muster-migrate stash` writes it into the box's ~/keep — a plain bind mount, the one part of a box
+# that outlives the overlay — the box is recreated, and `apply` puts it back with a three-way merge.
+#
+# WHAT THIS DOES NOT CARRY: commits. They live in .git, which is inside the layer being discarded, and
+# nothing outside the box has them until `handoff` pushes refs/agents/<box>. So a box with unpushed
+# commits is refused here, exactly as it is by `golden snapshot` — hand off first, then migrate.
+golden_migrate() {
+	local all=0 force=0 dry=0 args=() box boxes resp dirty id files overlap answer moved=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--all)     all=1; shift ;;
+			--force)   force=1; shift ;;
+			--dry-run) dry=1; shift ;;
+			-*) die "golden migrate: unknown option '$1' (--all | --force | --dry-run)" ;;
+			*)  args+=("$1"); shift ;;
+		esac
+	done
+	if [ "$all" = 1 ]; then
+		boxes="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
+	else
+		[ ${#args[@]} -gt 0 ] || die "migrate needs a box name, or --all: $SELF golden migrate work1"
+		boxes="${args[*]}"
+	fi
+	[ -n "$boxes" ] || { echo "$SELF: no boxes to migrate"; return 0; }
+
+	for box in $boxes; do
+		resp="$(box_probe "$box")" || { echo "$SELF: box '$box' is not reachable — skipped" >&2; continue; }
+		# Commits first: this command cannot carry them, and finding that out AFTER the recreate would
+		# be the worst possible moment.
+		box_unpushed_blocker "$box" "$resp" || {
+			echo "$SELF: '$box' — handoff in the box first, then migrate it" >&2
+			continue
+		}
+		dirty="$(box_dirty_of "$resp")"
+		if [ -z "$dirty" ]; then
+			echo "$SELF: '$box' has nothing uncommitted — moving it straight across"
+			[ "$dry" = 1 ] && continue
+			broker POST "/recreate/$box?fresh=1" >/dev/null || die "recreating '$box' failed"
+			moved=$((moved + 1))
+			continue
+		fi
+
+		id="m-$(date +%Y%m%d-%H%M%S)-$box"
+		resp="$(broker POST "/box/$box/migrate/stash?id=$id")" \
+			|| die "'$box': could not capture its working tree — $(printf '%s' "$resp" | jqr '.error')"
+		files="$(broker POST "/box/$box/migrate/list?id=$id" | jqr '.files[]?')"
+		echo "$SELF: '$box' — carrying $(printf '%s\n' "$files" | sed '/^$/d' | wc -l | tr -d ' ') path(s) across:"
+		printf '%s\n' "$files" | sed '/^$/d;s/^/  /'
+
+		# THE OVERLAP THAT MATTERS. A golden carries the hub's own uncommitted files (snapshot bakes
+		# them in deliberately), so a path in both lists is one where the agent's version is about to
+		# land on top of a version the new golden already changed. git apply -3 will merge or conflict
+		# rather than clobber, but you should know before, not after.
+		overlap="$(comm -12 <(printf '%s\n' "$files" | sed '/^$/d' | sort -u) <(golden_dirty_paths))"
+		if [ -n "$overlap" ]; then
+			echo "$SELF: …and these are ALSO uncommitted in the new golden — the merge may conflict:" >&2
+			printf '%s\n' "$overlap" | sed 's/^/  ! /' >&2
+			if [ "$force" != 1 ] && [ "$dry" != 1 ]; then
+				if [ -t 0 ]; then
+					tty_flush
+					printf '%s: migrate '"'"'%s'"'"' anyway ? [y/N] ' "$SELF" "$box" > /dev/tty
+					read -r answer < /dev/tty || answer=n
+					case "$answer" in y|Y) ;; *) echo "$SELF: '$box' skipped"; continue ;; esac
+				else
+					echo "$SELF: '$box' skipped — rerun interactively, or --force" >&2
+					continue
+				fi
+			fi
+		fi
+		if [ "$dry" = 1 ]; then
+			echo "$SELF: --dry-run: '$box' not moved (its stash is kept at ~/keep/.migrate/$id)"
+			continue
+		fi
+
+		broker POST "/recreate/$box?fresh=1" >/dev/null || die "recreating '$box' failed — its work is still in ~/keep/.migrate/$id"
+		resp="$(broker POST "/box/$box/migrate/apply?id=$id")" || {
+			echo "$SELF: '$box': $(printf '%s' "$resp" | jqr '.error')" >&2
+			die "'$box' was moved but its work did not apply cleanly — it is still in ~/keep/.migrate/$id inside the box"
+		}
+		echo "$SELF: '$box' — $(printf '%s' "$resp" | jqr '.output')"
+		moved=$((moved + 1))
+	done
+	[ "$dry" = 1 ] || echo "$SELF: migrated $moved box(es) onto the current golden"
+	golden_reap
+}
+
 golden_snapshot() {
 	# Freeze THIS repo — exactly as you have it set up — as the base every box overlays.
 	#
@@ -3474,8 +3690,15 @@ golden_snapshot() {
 	#
 	# We can't skip the copy and point the boxes' lowerdir straight at $REPO: overlayfs requires the
 	# lower layer to be immutable while boxes are mounted on it, and you keep editing this tree.
-	local id st prep=0 boxes box dirty svc
-	[ "${1:-}" = --prep ] && prep=1
+	local id st prep=0 force=0 boxes box svc answer
+	local movable=() blocked=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--prep)  prep=1; shift ;;
+			--force) force=1; shift ;;
+			*) die "golden snapshot: unknown option '$1' (--prep | --force)" ;;
+		esac
+	done
 
 	# A build running in the hub's tmux writes into $REPO while we copy it — the snapshot would be a
 	# torn mixture of before and after. Cheap to avoid, miserable to debug. Any service whose manifest
@@ -3493,17 +3716,35 @@ golden_snapshot() {
 		( cd "$REPO" && bash -lc "$GOLDEN_PREP_CMD" ) || die "prep failed — fix it in $REPO and re-run"
 	fi
 
-	# Recreating the boxes discards their upper layers, so anything not committed AND pushed is lost.
-	# Refuse rather than eat it — this is the one destructive step in the whole workflow.
+	# WHICH BOXES CAN COME ALONG. Moving a box discards its upper layer, so anything not committed AND
+	# PUSHED is lost. A box that is not safe is LEFT ON ITS GOLDEN rather than blocking the snapshot:
+	# goldens are versioned and a box may sit on an older one — that is what `golden ls`, `retire` and
+	# `reap` have always been for. The snapshot is about the hub's tree; it should not be held hostage
+	# by one agent with a dirty checkout.
 	boxes="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
 	for box in $boxes; do
-		dirty="$(broker GET "/box/$box/dirty" 2>/dev/null | jqr '.dirty[]?' | head -5)"
-		if [ -n "$dirty" ]; then
-			echo "$SELF: box '$box' has uncommitted changes:" >&2
-			printf '  %s\n' $dirty >&2
-			die "commit + handoff in that box first (or '$SELF kill $box' to abandon it)"
-		fi
+		if box_move_blocker "$box"; then movable+=("$box"); else blocked+=("$box"); fi
 	done
+	if [ ${#blocked[@]} -gt 0 ]; then
+		if [ "$force" = 1 ]; then
+			echo "$SELF: --force: moving ${#blocked[@]} box(es) anyway — work that was not handed off is GONE"
+			movable+=("${blocked[@]}"); blocked=()
+		elif [ -t 0 ]; then
+			tty_flush
+			printf '%s: [l]eave those %d box(es) on the current golden  [f]orce them across (LOSES the work above)  [q]uit ? ' \
+				"$SELF" "${#blocked[@]}" > /dev/tty
+			read -r answer < /dev/tty || answer=q
+			case "$answer" in
+				f|F) movable+=("${blocked[@]}"); blocked=() ;;
+				l|L) ;;
+				*)   die "nothing done" ;;
+			esac
+		else
+			# Not a terminal: take the NON-DESTRUCTIVE branch and say so loudly. The snapshot still
+			# happens, which is the point; nobody's work is touched, which is the other point.
+			echo "$SELF: not a terminal — leaving ${#blocked[@]} box(es) on their current golden." >&2
+		fi
+	fi
 
 	# Whatever is dirty here gets baked in and becomes every agent's starting `git status`. That's the
 	# deal — it's how your local setup reaches the boxes — but it should never be a surprise, and
@@ -3513,7 +3754,17 @@ golden_snapshot() {
 		git_ status --short | sed 's/^/  /'
 	fi
 
+	# Second-resolution ids collide when two snapshots land in the same second — which used to be
+	# nearly unreachable (a snapshot that hit a dirty box refused and you went away to fix it) and is
+	# not any more, now that one simply leaves that box behind and succeeds. The broker refuses a
+	# duplicate, so the failure was a sealed-nothing and a confusing "already exists"; pick the next
+	# free suffix instead.
 	id="g-$(date +%Y%m%d-%H%M%S)"
+	local n=2
+	while [ -e "$STAGING/$id" ] || [ -e "$GOLDEN/$id" ]; do
+		id="g-$(date +%Y%m%d-%H%M%S)-$n"
+		n=$((n + 1))
+	done
 	st="$STAGING/$id"
 	mkdir -p "$STAGING"
 	rm -rf "$st"
@@ -3541,10 +3792,27 @@ golden_snapshot() {
 		|| die "sealing $id failed (staged tree kept — retry with: $SELF golden seal $id)"
 	echo "$SELF: sealed $id as current"
 
-	echo "$SELF: moving every box onto it (fresh upper layers)..."
-	broker POST "/recreate?fresh=1" >/dev/null || die "recreate failed"
+	if [ ${#blocked[@]} -eq 0 ]; then
+		echo "$SELF: moving every box onto it (fresh upper layers)..."
+		broker POST "/recreate?fresh=1" >/dev/null || die "recreate failed"
+	else
+		for box in ${movable[@]+"${movable[@]}"}; do
+			echo "$SELF: moving '$box' onto $id (fresh upper layer)..."
+			broker POST "/recreate/$box?fresh=1" >/dev/null || die "recreating '$box' failed"
+		done
+	fi
+	# Reap takes every golden that is neither current nor referenced by a box — so a golden a blocked
+	# box is still sitting on survives this, by design.
 	golden_reap
-	echo "$SELF: done. Boxes are on $id and back on their pushed branches."
+	if [ ${#blocked[@]} -gt 0 ]; then
+		echo
+		echo "$SELF: these boxes stayed on their old golden, with their work intact:"
+		for box in "${blocked[@]}"; do printf '  %s\n' "$box"; done
+		echo "$SELF: to bring one across (commit + handoff in the box first if it has commits):"
+		echo "    $SELF golden migrate <box>     # carries its UNCOMMITTED files over"
+		echo "    $SELF recreate <box> --fresh   # …or discard them and move it now"
+	fi
+	echo "$SELF: done. Boxes on $id are back on their pushed branches."
 }
 
 # ------------------------------------------------------------------ patch bridge (laptop <-> hub)
@@ -3615,6 +3883,83 @@ import_patch() {
 	fi
 }
 
+# ---------------------------------------------------------------- ask
+#
+# ONE locked-down `claude -p`, run by the muster-ask service (ask/muster-ask) rather than here: that
+# is the container which holds the stack's login, so no other image has to. Nothing about this is a
+# session — each call is a fresh process, which is exactly why it suits a service classifying a
+# stream of things and not an agent doing a piece of work.
+#
+# This subcommand is the human end of it: mostly for proving the service is reachable and configured
+# before wiring an application to it, because "my classifier gets 403" is a slow way to discover that
+# ASK_TOKEN was never deployed.
+ask_call() {
+	local body="$1" timeout="${2:-}"
+	[ -n "${ASK_URL:-}" ] || die "ask: ASK_URL is not set in this hub — is the muster-ask service deployed? (COMPOSE_PROFILES=ask)"
+	[ -n "${ASK_TOKEN:-}" ] || die "ask: ASK_TOKEN is not set in this hub — the service will answer 403"
+	# --fail-with-body for the same reason as broker(): the service's {"error": "..."} is the message
+	# worth reading, and -f alone would throw it away.
+	curl --fail-with-body -sS -X POST -H "X-Ask-Token: $ASK_TOKEN" \
+		-H "Content-Type: application/json" --data-binary "$body" \
+		${timeout:+--max-time "$timeout"} "${ASK_URL}/ask"
+}
+
+ask() {
+	argsort "-m --prompt-file --dir --tools --model --effort --timeout" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	local msg="" pfile="" dir="" tools="" model="" effort="" timeout="" raw=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-m)            msg="${2:-}"; shift 2 ;;
+			--prompt-file) pfile="${2:-}"; shift 2 ;;
+			--dir)         dir="${2:-}"; shift 2 ;;
+			--tools)       tools="${2:-}"; shift 2 ;;
+			--model)       model="${2:-}"; shift 2 ;;
+			--effort)      effort="${2:-}"; shift 2 ;;
+			--timeout)     timeout="${2:-}"; shift 2 ;;
+			--raw)         raw=1; shift ;;
+			--config)      ask_config; return ;;
+			*) die "ask: unknown option '$1'" ;;
+		esac
+	done
+	if [ -n "$pfile" ]; then
+		if [ "$pfile" = - ]; then msg="$(cat)"; else
+			[ -r "$pfile" ] || die "ask: cannot read '$pfile'"
+			msg="$(cat "$pfile")"
+		fi
+	fi
+	[ -n "$msg" ] || die "ask needs a prompt: $SELF ask -m 'is this a teapot?' --dir images"
+
+	# jq builds the body, so a prompt containing quotes, newlines or backslashes — which is every
+	# real prompt — cannot break out of the JSON. Never hand-roll this with printf.
+	local body
+	body="$(jq -n --arg p "$msg" --arg d "$dir" --arg t "$tools" --arg m "$model" \
+		--arg e "$effort" --arg to "$timeout" '
+		{prompt: $p}
+		+ (if $d  != "" then {dir: $d} else {} end)
+		+ (if $t  != "" then {tools: ($t | split(","))} else {} end)
+		+ (if $m  != "" then {model: $m} else {} end)
+		+ (if $e  != "" then {effort: $e} else {} end)
+		+ (if $to != "" then {timeout: ($to | tonumber)} else {} end)')"
+
+	local resp rc=0
+	resp="$(ask_call "$body" "$timeout")" || rc=$?
+	if [ "$rc" != 0 ]; then
+		echo "$SELF: ask failed — $(printf '%s' "$resp" | jqr '.error // empty' || true)" >&2
+		[ -n "$resp" ] && printf '%s\n' "$resp" >&2
+		return 1
+	fi
+	if [ -n "$raw" ]; then printf '%s\n' "$resp"; return 0; fi
+	# The useful default is the MODEL'S answer, not our envelope around claude's envelope around it.
+	# --raw is there for when the timing or the exit status is what you are after.
+	printf '%s' "$resp" | jq -r '.stdout' | jq -r '.result // .' 2>/dev/null \
+		|| printf '%s' "$resp" | jqr '.stdout'
+}
+
+ask_config() {
+	[ -n "${ASK_URL:-}" ] || die "ask: ASK_URL is not set in this hub — is the muster-ask service deployed?"
+	curl --fail-with-body -sS -H "X-Ask-Token: ${ASK_TOKEN:-}" "${ASK_URL}/config"
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
 	up)     [ $# -ge 1 ] || die "up needs a service ($SELF svcs to list)"; svc_up "$1" ;;
@@ -3644,6 +3989,7 @@ case "$cmd" in
 	prereview) prereview "$@" ;;
 	say)      say "$@" ;;
 	job)      job "$@" ;;
+	ask)      ask "$@" ;;
 	peek)     peek "$@" ;;
 	point)    point "$@" ;;
 	hold)     hold "$@" ;;
@@ -3664,7 +4010,8 @@ case "$cmd" in
 			ls)       golden_ls ;;
 			reap)     golden_reap ;;
 			retire)   golden_retire "$@" ;;
-			*) die "golden needs: snapshot [--prep] | seal <id> | ls | reap | retire <id>" ;;
+			migrate)  golden_migrate "$@" ;;
+			*) die "golden needs: snapshot [--prep] [--force] | migrate <box>|--all | seal <id> | ls | reap | retire <id>" ;;
 		esac ;;
 	# Asking for help is not an error: `--help` prints to stdout and exits 0, so it can be used in a
 	# `set -e` script or a CI check. An unknown command still exits 1, and says which word it did not

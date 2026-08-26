@@ -91,7 +91,7 @@ test_help_covers_every_command() {
 	documented="$(printf '%s\n' "$OUT" | sed -n 's/^ *muster \([a-z]*\).*/\1/p' | sort -u)"
 	# Aliases and `golden` subcommands are documented on their parent's line, not their own.
 	missing="$(comm -23 <(printf '%s\n' "$dispatch") <(printf '%s\n' "$documented") \
-		| grep -vx 'seal\|snapshot\|reap\|retire\|ls\|st\|queue\|services')"
+		| grep -vx 'seal\|snapshot\|reap\|retire\|migrate\|ls\|st\|queue\|services')"
 	eq "$missing" "" "these subcommands are not in cbx --help"
 	has "muster push"
 	has "muster pull"
@@ -292,6 +292,259 @@ print("ok")
 PYEOF
 )"; RC=$?
 	ok; has ok
+}
+
+# The stack directory IS a build context (compose.yml uses `context: .`), so .dockerignore is what
+# stops a build ON A SERVER from tarring up data/ — the goldens, every box's overlay, and the shared
+# claude home, which holds the LOGIN — and handing it to the docker daemon. It is not a copy of
+# .gitignore: build-setup.sh is gitignored and MUST be in the context, so the two files disagree on
+# purpose and a well-meaning "sync them up" would break every add-on build.
+test_dockerignore_protects_the_stack_dir() {
+	OUT="$(python3 - "$ROOT" <<'PYEOF' 2>&1
+import sys, os, re, pathlib
+root = pathlib.Path(sys.argv[1])
+pats = [l.split("#")[0].strip() for l in (root / ".dockerignore").read_text().splitlines()]
+pats = [p for p in pats if p]
+
+def ignored(path):
+    """Would docker drop this path? Enough of the semantics for the two questions below:
+    an exact match, or any parent directory listed (with or without a trailing slash)."""
+    parts = path.split("/")
+    for i in range(1, len(parts) + 1):
+        head = "/".join(parts[:i])
+        if head in pats or head + "/" in pats:
+            return True
+    return False
+
+# 1. THE POINT OF THE FILE.
+for must in ("data", "data/claude", "data/golden/current", "git-identity", ".env", "service-env"):
+    assert ignored(must), f".dockerignore no longer excludes {must!r} — a server build would ship it"
+
+# 2. NOTHING A DOCKERFILE READS MAY BE EXCLUDED. Sources are read from the COPY lines themselves, so
+#    this keeps working when a Dockerfile grows one.
+copies = []
+for df in ("Dockerfile", "Dockerfile.addon", "hub/Dockerfile.base", "box-broker/Dockerfile"):
+    text = (root / df).read_text()
+    text = re.sub(r"\\\n", " ", text)          # join continuations
+    for line in text.splitlines():
+        m = re.match(r"\s*COPY\s+(.*)", line)
+        if not m:
+            continue
+        args = [a for a in m.group(1).split() if not a.startswith("--")]
+        copies += args[:-1]                       # last arg is the destination
+srcs = set()
+for c in copies:
+    c = c.replace("${SETUP_SCRIPT}", "build-setup.sh")   # the default; a stack may point it elsewhere
+    if "$" in c:
+        continue
+    srcs.add(c)
+assert "build-setup.sh" in srcs, "the add-on COPY vanished; this test is checking nothing"
+for s in sorted(srcs):
+    assert not ignored(s), f".dockerignore excludes {s!r}, which a Dockerfile COPYs — the build will fail"
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# muster-ask is an inference endpoint that untrusted text flows into (a classifieds ad, a scraped
+# page), so its whole value is what it REFUSES. These exercise build_argv() directly — no server, no
+# claude, no network — because the refusals are the contract:
+#   * a request may name a dir KEY, never a PATH (the broker's "callers don't choose mounts", in the
+#     small);
+#   * a request may only use tools the stack allow-listed, and never Bash/Write/Edit however it is
+#     configured — that is the difference between a bounded inference and an agent with a shell;
+#   * --permission-mode is not a parameter at all.
+test_ask_refuses_what_it_should() {
+	OUT="$(ASK_TOKEN=x ASK_DIRS="images=/tmp,other=/var/tmp" ASK_TOOLS="Read,Glob" \
+	       python3 - "$ROOT/ask/muster-ask" <<'PYEOF' 2>&1
+import sys, importlib.util, importlib.machinery
+spec = importlib.util.spec_from_loader("ask", importlib.machinery.SourceFileLoader("ask", sys.argv[1]))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+def refused(req, why):
+    try:
+        m.build_argv(req)
+    except m.AskError:
+        return
+    raise AssertionError(f"ACCEPTED {why}: {req!r}")
+
+def accepted(req):
+    return m.build_argv(req)[0]
+
+# A path is not a key, however plausible it looks.
+refused({"prompt": "x", "dir": "/etc"}, "an absolute path as dir")
+refused({"prompt": "x", "dir": "/tmp"}, "a configured path spelled as a path")
+refused({"prompt": "x", "dir": "../images"}, "traversal as dir")
+refused({"prompt": "x", "dir": "nope"}, "an unconfigured key")
+# Tools outside the allow-list, and the never-allowed ones.
+refused({"prompt": "x", "tools": ["Bash"]}, "Bash")
+refused({"prompt": "x", "tools": ["Write"]}, "Write")
+refused({"prompt": "x", "tools": ["Read", "Bash"]}, "Bash smuggled beside Read")
+refused({"prompt": "x", "tools": ["WebFetch"]}, "WebFetch")
+refused({"prompt": ""}, "an empty prompt")
+refused({"prompt": "x", "tools": "Read"}, "tools as a bare string")
+
+# The happy path resolves the KEY to the configured path, and pins the dangerous flags.
+argv = accepted({"prompt": "hello", "dir": "images", "tools": ["Read"]})
+assert "--add-dir" in argv and argv[argv.index("--add-dir") + 1] == "/tmp", argv
+assert argv[argv.index("--permission-mode") + 1] == "dontAsk", argv
+assert argv[argv.index("--output-format") + 1] == "json", argv
+assert argv[argv.index("--allowedTools") + 1] == "Read", argv
+# No dir asked for, none granted: a text-only call sees nothing.
+assert "--add-dir" not in accepted({"prompt": "hello"})
+# --permission-mode is NOT A PARAMETER. A request that tries to set it must be ignored rather than
+# honoured -- that flag is the whole difference between a bounded inference and an agent.
+argv = accepted({"prompt": "x", "permission_mode": "bypassPermissions",
+                 "permissionMode": "bypassPermissions", "output_format": "text"})
+assert argv.count("--permission-mode") == 1, argv
+assert argv[argv.index("--permission-mode") + 1] == "dontAsk", argv
+assert "bypassPermissions" not in argv, argv
+assert argv[argv.index("--output-format") + 1] == "json", argv
+# The timeout is clamped to the ceiling rather than believed.
+assert m.build_argv({"prompt": "x", "timeout": 99999})[1] == m.MAX_TIMEOUT
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+
+	# AND AGAIN WITH ASK_TOOLS DELIBERATELY MISCONFIGURED. The block above only proves the allow-list
+	# works; this proves FORBIDDEN_TOOLS overrides it, so an operator who types Bash into ASK_TOOLS —
+	# or a stack that inherits a careless default — still cannot get a shell out of untrusted text.
+	OUT="$(ASK_TOKEN=x ASK_TOOLS="Read,Bash,Write" \
+	       python3 - "$ROOT/ask/muster-ask" <<'PYEOF' 2>&1
+import sys, importlib.util, importlib.machinery
+spec = importlib.util.spec_from_loader("ask2", importlib.machinery.SourceFileLoader("ask2", sys.argv[1]))
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.ALLOWED_TOOLS == ["Read"], f"ASK_TOOLS=Read,Bash,Write must reduce to [Read], got {m.ALLOWED_TOOLS}"
+try:
+    m.build_argv({"prompt": "x", "tools": ["Bash"]})
+except m.AskError:
+    print("ok")
+else:
+    raise AssertionError("ACCEPTED Bash even though FORBIDDEN_TOOLS lists it")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# ASK_TOKEN is the only thing between an inference endpoint and everything else on the stack network,
+# so "no token" must be a refusal to START, not a service that runs open. Checked by running main()
+# with the variable unset and requiring a non-zero exit that says so.
+test_ask_refuses_to_run_without_a_token() {
+	OUT="$(cd "$ROOT" && env -u ASK_TOKEN python3 ask/muster-ask 2>&1)"; RC=$?
+	notok
+	has "ASK_TOKEN is required"
+}
+
+# THE HALF THE GUARD USED TO MISS. `golden snapshot` recreates every box with a fresh upper layer, and
+# the box's .git is IN that layer — so an agent that committed its work and never ran `handoff` has a
+# clean `git status` and commits that exist nowhere else. The old check ran `git status --porcelain`
+# and nothing more, so it waved that box straight through to being deleted, while its own error
+# message told you to "commit + handoff". Both halves are checked now.
+test_golden_snapshot_leaves_unsafe_boxes_behind() {
+	local port pid unknown ahead
+	port=$(( STUB_PORT + 6 ))
+	unknown="0123456789abcdef0123456789abcdef01234567"   # a sha the hub has certainly never seen
+
+	# …and a commit the hub DOES have, but which is ahead of what the box last handed off.
+	git -C "$FIX/repo" update-ref "refs/agents/aheadbox" "$(git -C "$FIX/repo" rev-parse "$DEV_BRANCH")"
+	echo "later" >> "$FIX/repo/a.txt"
+	git -C "$FIX/repo" add a.txt
+	git -C "$FIX/repo" -c user.name=t -c user.email=t@x commit -qm "one more"
+	ahead="$(git -C "$FIX/repo" rev-parse HEAD)"
+	git -C "$FIX/repo" reset -q --hard HEAD^
+
+	STUB_LOG="$FIX/stub6.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" \
+		STUB_BOX_STATE="{\"newbox\": {\"head\": \"$unknown\"}, \"dirtybox\": {\"dirty\": [\" M a.txt\"], \"head\": \"$ahead\"}}" \
+		python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+
+	# COMMITTED, NEVER HANDED OFF — the half the guard used to miss entirely. `git status` is clean, so
+	# the old check waved this box through to having its commits deleted.
+	cbx box newbox >/dev/null 2>&1
+	cbx golden snapshot
+	ok                                        # the snapshot still happens — that is the new deal
+	has "never seen"
+	has "stayed on their old golden"
+	has "golden migrate"
+	# …and it was NOT moved: no recreate for it.
+	grep -q '"/recreate/newbox' "$FIX/stub6.log" && fail "a box that is not ready was moved anyway"
+
+	# UNCOMMITTED FILES — the half that was always checked. Same outcome now: left behind, not refused.
+	cbx box dirtybox >/dev/null 2>&1
+	cbx golden snapshot
+	ok
+	has "uncommitted changes"
+	has "stayed on their old golden"
+
+	# --force moves them across regardless, and says what that costs.
+	cbx golden snapshot --force
+	ok
+	has "work that was not handed off is GONE"
+	# With nothing left blocked, the code takes the recreate-ALL route (one image pull for the lot),
+	# so the evidence is /recreate?fresh=1 rather than a per-box call.
+	grep -q '"path": "/recreate?fresh=1"' "$FIX/stub6.log" || fail "--force did not move the blocked boxes"
+
+	unset BROKER_URL
+	kill "$pid" 2>/dev/null
+}
+
+
+# `golden migrate` is how a box with UNCOMMITTED work crosses onto a new golden: its working tree is
+# captured into ~/keep (the one part of a box that outlives the overlay), the box is recreated fresh,
+# and the patch is re-applied. What matters here is the ORDER and the refusals — the patch mechanics
+# live in box-bin/muster-migrate, inside the box.
+test_golden_migrate() {
+	local port pid ahead
+	port=$(( STUB_PORT + 7 ))
+	git -C "$FIX/repo" update-ref "refs/agents/carry" "$(git -C "$FIX/repo" rev-parse "$DEV_BRANCH")"
+	echo "hub-side edit" >> "$FIX/repo/a.txt"          # the hub's own dirty file -> baked into the golden
+	ahead="$(git -C "$FIX/repo" rev-parse HEAD)"
+
+	STUB_LOG="$FIX/stub7.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" \
+		STUB_BOX_STATE="{\"carry\": {\"dirty\": [\" M b.txt\"], \"head\": \"$ahead\"}, \"clash\": {\"dirty\": [\" M a.txt\"], \"head\": \"$ahead\"}, \"unpushed\": {\"head\": \"0000000000000000000000000000000000000000\"}}" \
+		python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+	cbx golden snapshot >/dev/null 2>&1                # a golden that carries the hub's dirty a.txt
+
+	# 1. A box with commits nobody has: refused, because a patch cannot carry commits. Finding that
+	#    out AFTER the recreate would be the worst possible moment.
+	cbx box unpushed >/dev/null 2>&1
+	cbx golden migrate unpushed
+	has "never seen"
+	has "handoff in the box first"
+	grep -q '"/box/unpushed/migrate/stash' "$FIX/stub7.log" && fail "it stashed a box it had refused"
+
+	# 2. The ordinary case: stash, recreate FRESH, apply — in that order. The order is the whole
+	#    correctness argument: capture before the layer is deleted, re-apply after.
+	cbx box carry >/dev/null 2>&1
+	cbx golden migrate carry
+	ok
+	has "carrying"
+	has "b.txt"
+	stub_order "$FIX/stub7.log" "/box/carry/migrate/stash" "/recreate/carry?fresh=1" "/box/carry/migrate/apply"
+
+	# 3. A path that is ALSO uncommitted in the new golden. Non-interactive and no --force: skipped,
+	#    and named — this collision is what the command exists to show you before it happens.
+	cbx box clash >/dev/null 2>&1
+	cbx golden migrate clash
+	has "ALSO uncommitted in the new golden"
+	has "a.txt"
+	has "skipped"
+	grep -q '"/recreate/clash' "$FIX/stub7.log" && fail "a clashing box was moved without being asked"
+
+	# …and --force takes it across anyway.
+	cbx golden migrate clash --force
+	ok
+	grep -q '"/recreate/clash' "$FIX/stub7.log" || fail "--force did not move the clashing box"
+
+	unset BROKER_URL
+	kill "$pid" 2>/dev/null
 }
 
 # =====================================================================  queue / status
@@ -3306,6 +3559,9 @@ run "help: every command is documented"            test_help_covers_every_comman
 run "help: an unknown command prints usage"        test_unknown_command_prints_usage
 
 run "compose: the box build service is profiled"    test_build_only_service_is_profiled
+run "compose: .dockerignore protects the stack dir" test_dockerignore_protects_the_stack_dir
+run "ask: refuses paths, tools and empty prompts" test_ask_refuses_what_it_should
+run "ask: refuses to run without a token"       test_ask_refuses_to_run_without_a_token
 run "hub: tab-completion for both names"           test_hub_completion
 run "ci: images are named by git describe"         test_images_workflow_names_images_by_describe
 run "status: empty stack"                          test_status_empty
@@ -3384,6 +3640,8 @@ run "version: drift between hub and broker warns"  test_version_drift
 run "golden: snapshot, ls, reap"                   test_golden_snapshot_and_reap
 run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_worktrees
 run "golden: retire one that boxes are still on"   test_golden_retire
+run "golden: leaves unsafe boxes behind"           test_golden_snapshot_leaves_unsafe_boxes_behind
+run "golden: migrate carries uncommitted work"     test_golden_migrate
 run "q: shows how far the golden has drifted"      test_q_shows_golden_drift
 
 run "svcs: lists the manifests"                    test_svcs_lists_manifests

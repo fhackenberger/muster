@@ -1319,9 +1319,37 @@ def ensure_home_parents(anchor, dsts):
 				pass                      # best effort: a home we cannot fix is not a spawn we refuse
 
 
+def recorded_golden(name):
+	"""The golden this box is currently overlaid on, as a HOST path — or "" if it has none or the
+	golden has since been reaped."""
+	gf = os.path.join(BOXROOT, name, "golden")
+	if not os.path.exists(gf):
+		return ""
+	with open(gf) as fh:
+		gid = fh.read().strip()
+	if not gid or not GOLDEN_RE.match(gid):
+		return ""
+	path = os.path.join(GOLDEN_DIR, gid)
+	return path if os.path.isdir(path) else ""
+
+
 def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	with _golden_lock:
-		golden = current_golden()
+		# A RESUME STAYS WHERE IT IS. Only a fresh upper layer moves a box onto the current golden,
+		# because only a fresh upper layer is COHERENT on a different lower one: an upper layer is
+		# copy-ups and whiteouts computed against one specific golden, and the box's .git is in it, so
+		# re-pointing the same layer at a newer tree makes every file that changed between the two
+		# snapshots look like an uncommitted modification the agent never made.
+		#
+		# This used to be an unconditional current_golden(), which was invisible only because
+		# `golden snapshot` moved every box at once and no running box was ever left behind. The
+		# moment one is — and leaving one behind is now a supported outcome — an ordinary
+		# `recreate` for a new image would have silently re-based it. To move a box deliberately and
+		# safely, use fresh_upper (discarding its work) or `muster golden migrate` (carrying it).
+		golden = ""
+		if resume and not fresh_upper:
+			golden = recorded_golden(name)
+		golden = golden or current_golden()
 	container = box_container(name)
 	box_dir = os.path.join(BOXROOT, name)
 	anchor = os.path.join(box_dir, "home")
@@ -1575,17 +1603,66 @@ def purge_box(name):
 
 
 def box_dirty(name):
-	"""`git status --porcelain` inside the box — a FIXED command, not arbitrary exec. The hub uses it
-	to refuse a golden snapshot that would discard an agent's uncommitted work."""
+	"""What the hub needs in order to decide whether this box can be moved onto a new golden: its
+	uncommitted files, and its HEAD. FIXED commands, not arbitrary exec.
+
+	HEAD IS HERE BECAUSE A CLEAN `git status` IS NOT ENOUGH. Moving a box discards its upper layer,
+	and the box's .git lives in that same overlay — so an agent that committed its work and never ran
+	`handoff` has a clean status and commits that exist nowhere else. Reporting HEAD lets the hub ask
+	the only question that settles it: does refs/agents/<box> already contain this commit?"""
 	r = subprocess.run(
 		["docker", "exec", "-u", "dev", box_container(name),
 		 "git", "-C", CHECKOUT_DST, "status", "--porcelain"],
 		capture_output=True, text=True,
 	)
 	if r.returncode != 0:
-		return {"box": name, "reachable": False, "dirty": [], "error": r.stderr.strip()}
+		return {"box": name, "reachable": False, "dirty": [], "head": "", "error": r.stderr.strip()}
 	files = [ln for ln in r.stdout.splitlines() if ln.strip()]
-	return {"box": name, "reachable": True, "dirty": files}
+	h = subprocess.run(
+		["docker", "exec", "-u", "dev", box_container(name),
+		 "git", "-C", CHECKOUT_DST, "rev-parse", "HEAD"],
+		capture_output=True, text=True,
+	)
+	# An unborn HEAD (a box that has not committed anything into a fresh repo) is not an error worth
+	# failing the whole check for — it simply means there is nothing to have pushed.
+	head = h.stdout.strip() if h.returncode == 0 else ""
+	return {"box": name, "reachable": True, "dirty": files, "head": head}
+
+
+MIGRATE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
+
+
+def box_migrate(name, action, stash_id):
+	"""Run `muster-migrate <action> <id>` inside the box — a FIXED command, not arbitrary exec.
+
+	This is how uncommitted work crosses a change of golden: `stash` writes it into ~/keep, which is a
+	plain bind mount (data/boxes/<box>/keep) and therefore the one part of a box that outlives the
+	overlay; the box is then recreated onto the new golden with a fresh upper layer; `apply` puts the
+	work back on the other side. The script itself explains why a patch rather than the old layer.
+
+	`list` is separate from `apply` on purpose: the hub shows you which paths are coming across, and
+	how they overlap with the new golden's OWN uncommitted files, before anything is applied."""
+	if action not in ("stash", "apply", "list"):
+		raise ValueError("action must be stash, apply or list")
+	if not MIGRATE_RE.match(stash_id or ""):
+		raise ValueError("bad stash id")
+	r = subprocess.run(
+		["docker", "exec", "-u", "dev", box_container(name),
+		 "muster-migrate", action, stash_id],
+		capture_output=True, text=True,
+	)
+	out = (r.stdout or "").strip()
+	if r.returncode != 0:
+		err = (r.stderr or "").strip() or out
+		# "not found" from docker exec means the box image predates muster-migrate. Say that, rather
+		# than passing on a bare 127 the caller cannot act on.
+		if "executable file not found" in err or "muster-migrate: not found" in err:
+			err = ("this box's image has no muster-migrate — it predates the command. "
+			       "Recreate the box on a newer image, or move it with --fresh and lose the work.")
+		return {"box": name, "action": action, "ok": False, "error": err}
+	return {"box": name, "action": action, "ok": True,
+	        "files": [ln for ln in out.splitlines() if ln.strip()] if action == "list" else [],
+	        "output": out}
 
 
 BOX_TMUX_SESSION = "main"
@@ -1830,6 +1907,17 @@ class Handler(BaseHTTPRequestHandler):
 					return self._reply(400, {"error": bad})
 				return self._reply(200, recreate_box(rname, fresh_upper=fresh))
 			# Deliver review feedback into a box's claude session.
+			if path.startswith("/box/") and "/migrate/" in path:
+				rest = path[len("/box/"):]
+				rname, _, action = rest.partition("/migrate/")
+				bad = name_problem(rname)
+				if bad:
+					return self._reply(400, {"error": bad})
+				try:
+					res = box_migrate(rname, action, self._param("id") or "")
+				except ValueError as e:
+					return self._reply(400, {"error": str(e)})
+				return self._reply(200 if res.get("ok") else 500, res)
 			if path.startswith("/box/") and path.endswith("/say"):
 				name = path[len("/box/"):-len("/say")]
 				bad = name_problem(name)

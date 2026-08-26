@@ -117,10 +117,25 @@ RUN for t in xclip xsel; do \
 #   handoff       push the branch to the hub for review, with a summary as a git note
 #   mydiff        exactly what this box will hand over (its branch vs the hub's dev)
 #   muster-activity  Claude Code hook: records busy/idle/waiting for the hub (see cbx ls / cbx status)
+#   muster-migrate   carries UNCOMMITTED work across a golden change, through ~/keep (the one
+#                 directory that outlives the overlay). Driven by `muster golden migrate`.
 COPY box-bin/muster-box-init box-bin/handoff box-bin/mydiff box-bin/muster-activity \
-     box-bin/muster-pinchtab-session /usr/local/bin/
+     box-bin/muster-pinchtab-session box-bin/muster-migrate /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/muster-box-init /usr/local/bin/handoff /usr/local/bin/mydiff \
-	/usr/local/bin/muster-activity
+	/usr/local/bin/muster-activity /usr/local/bin/muster-migrate
+
+# muster-ask: ONE locked-down `claude -p` per request, for the stack's own services (see
+# ask/muster-ask and README-remote.md). It ships in THIS image because this is the image that has
+# claude — the compose service overrides the entrypoint and runs it directly, so a project never has
+# to bake the CLI, or a bind mount of the stack's login, into its own application image.
+COPY ask/muster-ask /usr/local/bin/muster-ask
+RUN chmod 0755 /usr/local/bin/muster-ask
+
+# /home/dev owned by the runtime uid. A BOX gets its home as a bind mount and its user from the
+# entrypoint below, so this never mattered; muster-ask skips that entrypoint (it is not a box) and
+# runs straight as uid 1000, and docker would otherwise create this directory as ROOT when it mounts
+# the shared claude home at /home/dev/.claude — leaving HOME unwritable for everything else.
+RUN mkdir -p /home/dev && chown 1000:1000 /home/dev
 
 # Root entrypoint: materialize the runtime user from HOST_USER/UID/GID, then drop privileges.
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh

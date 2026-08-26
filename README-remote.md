@@ -1260,6 +1260,138 @@ cbx recreate all                                        # boxes read settings.js
 ```
 
 
+### A box may sit on an older golden
+
+`golden snapshot` no longer insists that every box come along. A box whose work is not safe to
+discard — uncommitted files, or commits that were never handed off — is **left on the golden it is
+already on**, and the snapshot still happens. That is not a new concept: goldens have always been
+versioned, `data/boxes/<box>/golden` has always recorded which one each box overlays, `reap`
+deliberately skips a golden a box still references, and `retire` exists to drain the stragglers. The
+snapshot was simply the one command that refused to work with it.
+
+```sh
+muster golden snapshot            # leaves unsafe boxes behind (interactive: it asks)
+muster golden snapshot --force    # …or moves them anyway, discarding what was not handed off
+```
+
+`muster ls` marks a box that is not on the current golden, because otherwise it is invisible: it
+keeps building against a base that new boxes no longer get.
+
+**A resumed box stays where it is.** `create_box` used to bind whatever golden was current, which was
+harmless only because every box moved at once. Now an ordinary `recreate` — for a new image, say —
+keeps the box on its recorded golden; only `--fresh` (or `golden migrate`) moves it. That matters
+because an upper layer is only coherent on the lower layer it was computed against.
+
+### Carrying uncommitted work across: `golden migrate`
+
+```sh
+muster golden migrate work1          # one box
+muster golden migrate --all          # every box that can go
+muster golden migrate work1 --dry-run
+```
+
+Moving a box is unavoidably a fresh upper layer, so the work travels as a **patch**:
+
+1. `muster-migrate stash` captures the working tree — staged and unstaged as one `--binary` diff
+   against HEAD, plus the untracked files as a tar (honouring `.gitignore`) — into the box's
+   `~/keep/.migrate/<id>`. `~/keep` is `data/boxes/<box>/keep`, a plain bind mount **outside the
+   overlay**, and therefore the one part of a box that outlives being recreated.
+2. The box is recreated onto the current golden with a fresh upper layer.
+3. `muster-migrate apply` puts it back with `git apply -3`, so a file the new golden also changed
+   merges (or conflicts visibly) instead of being clobbered. Untracked files are extracted with
+   `--keep-old-files`, so a name the new golden introduced is never overwritten.
+
+Before any of that, it prints what is coming across and **warns where those paths overlap the new
+golden's own uncommitted files** — `golden snapshot` bakes the hub's dirty tree into every golden on
+purpose, so that overlap is real and worth seeing before the merge rather than after. Non-interactive
+it skips such a box; `--force` takes it anyway.
+
+**It cannot carry commits.** They live in `.git`, which is inside the layer being discarded, and
+nothing outside the box has them until `handoff` pushes `refs/agents/<box>`. A box with unpushed
+commits is refused *before* anything is captured — hand off first, then migrate.
+
+What survives a move, with or without migrate: `~/keep`, the claude **session** (the box resumes the
+same conversation), its port-forward slot, its name and branch, and whatever it pushed to
+`refs/agents/<box>`. What does not: everything in the upper layer — every edit, and the git objects
+for any commit that was never handed off.
+
+## One locked-down claude call (`muster-ask`)
+
+**Optional, off by default.** A stack service that wants a *single* model call — classify this
+photograph, extract these fields from this page — has three bad options without it: put a second API
+credential in the stack, bake the claude CLI plus a bind mount of the shared logged-in `~/.claude`
+into its own application image, or drive a whole agent box for something that is not agentic. The
+first is a credential to hold and rotate, the second puts the stack's login inside every image that
+wants an answer, and the third pays spawn + brief + poll latency for one inference.
+
+`muster-ask` is a small service that holds the login once and runs exactly this, per request:
+
+```
+claude -p <prompt> --output-format json --model … --effort …
+       --allowedTools <allow-listed> --permission-mode dontAsk --add-dir <a CONFIGURED dir>
+```
+
+**Every request is a fresh process.** There is no session, so there is no context to reset between
+calls and no drift from the previous one — that property is structural here, not something a caller
+has to remember.
+
+Turn it on per stack:
+
+```sh
+# in .env
+COMPOSE_PROFILES=ask
+ASK_TOKEN=$(openssl rand -hex 24)
+```
+
+It runs from the **box image** (that is the image with claude in it), as uid 1000, with
+`./data/claude` mounted as its `~/.claude`. It publishes no port: it is reachable only as
+`http://muster-ask:8098` on the stack network, with the token.
+
+```sh
+muster ask -m 'Reply with the word teapot and nothing else.'      # prove it works
+muster ask --config                                               # what it will accept
+muster ask -m 'What is in this picture?' --dir images --raw       # timing + exit status too
+```
+
+### What it refuses, and why that is the point
+
+Untrusted text flows into this — a classifieds ad, a scraped page, a user's message. So:
+
+- **A request names a `dir` KEY, never a path.** The stack decides what may be looked at, in
+  `ASK_DIRS=images=/data/images`; a caller sending `/etc` gets a 403. This is the same rule as the
+  box-broker's root-owned `mounts` table, in the small.
+- **Tools come from an allow-list** (`ASK_TOOLS`, default `Read`), and `Bash`, `Write`, `Edit`,
+  `WebFetch`, `WebSearch` and `Task` are rejected *however that variable is set*. An operator who
+  types `Bash` into `ASK_TOOLS` still cannot get a shell out of an ad's description.
+- **`--permission-mode` is not a parameter at all.** Neither is `--output-format`.
+- **`ASK_SLOTS` bounds concurrency** (default 4). The inferences come out of the same login the
+  agent boxes use, so an unthrottled caller would break an agent mid-brief — a failure that looks
+  nothing like its cause. Past the cap, requests wait `ASK_QUEUE_WAIT` and are then refused with
+  503 rather than silently queued.
+- **No `ASK_TOKEN`, no service.** It refuses to start rather than leave an open inference endpoint
+  on the stack network.
+
+A project adds its own directory in `compose.project.yml`, together with the volume that makes the
+path real:
+
+```yaml
+services:
+  muster-ask:
+    environment:
+      ASK_DIRS: images=/data/images
+    volumes:
+      - kav-images:/data/images:ro
+```
+
+### Why not the box-broker
+
+The broker owns the docker socket, and its central invariant is that **a caller never chooses
+mounts**: it is handed a box *name*, and the mounts come from the root-owned table. An endpoint
+taking "expose this directory to an inference" is exactly what that invariant excludes. `BROKER_TOKEN`
+is also the credential that authorises spawning boxes, so an application container holding it in
+order to appraise a photograph would be a real escalation. Running `claude` needs claude and a login
+— not the ability to create containers.
+
 ## What a box keeps (`~/keep`)
 
 Every box gets one directory whose lifetime is the **box's**, not the container's:

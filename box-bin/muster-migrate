@@ -1,0 +1,99 @@
+#!/bin/bash
+set -euo pipefail
+
+# muster-migrate — carry a box's UNCOMMITTED work across a change of golden.
+#
+#   muster-migrate stash <id>     capture the working tree into ~/keep/.migrate/<id>
+#   muster-migrate apply <id>     put it back, after the box has been recreated
+#   muster-migrate list <id>      what a stash holds (one path per line), without applying it
+#
+# Run by the broker (docker exec) on behalf of `muster golden migrate`; there is no reason to type it
+# by hand, and doing so around a recreate you are not driving will only confuse the box.
+#
+# WHY A FILE IN ~/keep AND NOT A STASH. `git stash` writes into .git, and .git lives in the box's
+# overlay upper layer — the very thing a golden move deletes. ~/keep is `data/boxes/<box>/keep` on the
+# host, a plain bind mount OUTSIDE the overlay, so it is the one place in a box that survives being
+# recreated. That is what it is for.
+#
+# WHY NOT JUST RE-STACK THE OLD UPPER LAYER ON THE NEW GOLDEN, which would need no script at all: an
+# upper layer is a set of copy-ups and whiteouts computed against ONE lower layer. Put it on another
+# and the box's index and HEAD (also in that layer) describe the old golden while every file the agent
+# never touched comes from the new one — so everything that changed between the two snapshots shows up
+# as an uncommitted modification the agent did not make. A patch is the honest way across: it says
+# what the agent changed, relative to a commit, and git can rebase that onto a different tree.
+#
+# WHAT IS AND IS NOT CAPTURED:
+#   tracked changes     yes — staged and unstaged together, as one diff against HEAD, --binary so
+#                       images and other non-text survive
+#   untracked files     yes — tarred, honouring .gitignore, so build output and node_modules stay out
+#   the INDEX           no. Everything comes back as unstaged working-tree changes. Re-staging is one
+#                       command; reconstructing a half-staged index across two different base trees is
+#                       not something to do silently.
+#   ignored files       no. They are reproducible by definition, and they are the bulk of the bytes.
+
+REPO="${MUSTER_WORKDIR:-/home/dev/repo}"
+KEEP="${MUSTER_KEEP:-/home/dev/keep}"
+
+die() { echo "muster-migrate: $*" >&2; exit 1; }
+
+cmd="${1:-}"; id="${2:-}"
+[ -n "$cmd" ] && [ -n "$id" ] || die "usage: muster-migrate stash|apply|list <id>"
+case "$id" in
+	*/*|..*|"") die "bad stash id '$id'" ;;
+esac
+dir="$KEEP/.migrate/$id"
+
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git repository"
+
+case "$cmd" in
+stash)
+	mkdir -p "$dir"
+	# Staged AND unstaged in one patch: `diff HEAD` is the working tree against the commit, which is
+	# exactly "everything this agent has changed and not committed".
+	git -C "$REPO" diff HEAD --binary > "$dir/changes.patch"
+	# -z/--null throughout: an agent can and will create a file with a space in its name.
+	git -C "$REPO" ls-files --others --exclude-standard -z > "$dir/untracked.list"
+	if [ -s "$dir/untracked.list" ]; then
+		tar -C "$REPO" --null --files-from "$dir/untracked.list" -cf "$dir/untracked.tar"
+	else
+		: > "$dir/untracked.tar"
+	fi
+	# The commit the patch is relative to. `apply` reports it, so a conflict can be explained ("this
+	# was written against a commit your new golden does not have") instead of just failing.
+	git -C "$REPO" rev-parse HEAD > "$dir/base" 2>/dev/null || : > "$dir/base"
+	# A manifest so the hub can list and compare the paths WITHOUT applying anything — that is what
+	# lets `golden migrate` show you the overlap with the new golden's own dirty files first.
+	{
+		git -C "$REPO" diff HEAD --name-only
+		tr '\0' '\n' < "$dir/untracked.list"
+	} | sed '/^$/d' | sort -u > "$dir/files"
+	wc -l < "$dir/files" | tr -d ' '
+	;;
+
+list)
+	[ -d "$dir" ] || die "no stash '$id' in $KEEP/.migrate"
+	cat "$dir/files"
+	;;
+
+apply)
+	[ -d "$dir" ] || die "no stash '$id' in $KEEP/.migrate"
+	rc=0
+	if [ -s "$dir/changes.patch" ]; then
+		# -3 so git can fall back to a real three-way merge when the file also changed in the new
+		# golden: that leaves conflict markers you can resolve, instead of refusing the whole patch.
+		# It needs the pre-image blobs, which the new golden has whenever the two snapshots share
+		# history — the normal case, and the reason `base` above is recorded for when they do not.
+		git -C "$REPO" apply -3 "$dir/changes.patch" || rc=$?
+	fi
+	if [ -s "$dir/untracked.tar" ]; then
+		# Untracked files are new by definition, so there is nothing to merge — but do NOT overwrite
+		# something the new golden introduced under the same name. --keep-old-files leaves those and
+		# reports them; the agent's copy stays in the stash, which is not deleted.
+		tar -C "$REPO" --keep-old-files -xf "$dir/untracked.tar" 2>&1 | sed 's/^/muster-migrate: /' >&2 || true
+	fi
+	[ "$rc" = 0 ] || die "the patch did not apply cleanly (kept at $dir — resolve, then delete it)"
+	echo "applied $(wc -l < "$dir/files" | tr -d ' ') path(s) from $id"
+	;;
+
+*) die "unknown command '$cmd' (stash|apply|list)" ;;
+esac

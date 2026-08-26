@@ -303,4 +303,19 @@ ssh_hasnt() { case "$SSHLOG" in *"$1"*) fail "an ssh invocation should NOT conta
 
 # What the stub was asked. `stub_saw POST /box/x/say` -> 0 if such a request was recorded.
 stub_saw() { grep -q "\"method\": \"$1\", \"path\": \"$2\"" "$STUB_LOG"; }
+# Did these paths appear in the stub's log IN THIS ORDER? For orchestration where the sequence is the
+# correctness argument — `golden migrate` must capture a box's working tree BEFORE the recreate that
+# deletes it, and re-apply AFTER — asserting that each call happened proves nothing.
+stub_order() {
+	local log="$1"; shift
+	local want line n=0 prev=0
+	for want in "$@"; do
+		n="$(grep -n -F "$want" "$log" | head -1 | cut -d: -f1)"
+		[ -n "$n" ] || { fail "stub never saw $want"; return 1; }
+		[ "$n" -gt "$prev" ] || { fail "$want came before the call it must follow (line $n after $prev)"; return 1; }
+		prev="$n"
+	done
+	return 0
+}
+
 stub_body() { jq -r "select(.path == \"$1\") | .body" < "$STUB_LOG" | head -c 4000; }
