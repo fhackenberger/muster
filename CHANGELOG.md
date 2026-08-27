@@ -96,6 +96,15 @@ releases and are not listed here.
   holding unreviewed work. See "Unattended job boxes" in `README-remote.md`.
 
 ### Fixed
+- **The `claude_box` role did not parse.** The `MUSTER_CONF_DIR` check added moments earlier used a
+  nested-quote `tr -d`, which is valid YAML — it sits inside a block scalar, where anything goes —
+  and which ansible's argument splitter rejects outright with "failed at splitting arguments",
+  pointing at the line *after* the offending one. muster's half of the deploy lives here but RUNS in
+  the consuming repository, so nothing caught it until a deploy was already under way. The suite now
+  parses every YAML file it ships, and separately runs `ansible-playbook --syntax-check` over a
+  one-task playbook importing the role — the same parse a caller's play does, and the only one of the
+  two that sees this class of bug.
+
 - **A box that was not running was treated as a box with nothing in it.** The broker's `box_dirty`
   execs into the container and, when that fails, still answers 200 with `{"reachable": false,
   "dirty": [], "head": ""}`. For a retired box the exec always fails — there is no container — so the

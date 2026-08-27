@@ -78,6 +78,20 @@ test_syntax() {
 	done
 	OUT="$(python3 -m py_compile "$BROKER_PY" 2>&1)"; RC=$?
 	ok
+	# THE YAML IS SOURCE TOO. compose.yml and the ansible role are read by other programs, so a
+	# quoting mistake in them fails on the SERVER, in the middle of a deploy, with a parser error
+	# pointing at the line after the real one. `bash -n` covers the scripts and py_compile the
+	# broker; nothing covered these until a nested-quote `tr -d` in the role's own task shipped.
+	python3 -c "import yaml" 2>/dev/null || return 0
+	local f
+	for f in "$ROOT/compose.yml" "$ROOT/compose.project.yml.example" \
+	         "$ROOT"/ansible/roles/*/tasks/*.yml "$ROOT"/ansible/roles/*/defaults/*.yml \
+	         "$ROOT"/.github/workflows/*.yml; do
+		[ -f "$f" ] || continue
+		OUT="$(python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" 2>&1)"; RC=$?
+		[ "$RC" = 0 ] || fail "YAML does not parse: ${f#$ROOT/}"
+	done
+	OUT=""
 }
 
 # The bug this guards: help used to be `sed -n '4,52p'`, a hard-coded line range that silently
@@ -320,6 +334,36 @@ test_hub_completion_covers_every_subcommand() {
 	local literal
 	literal="$(grep -n 'compgen -W "[^$]' "$ROOT/hub/muster-completion.bash" || true)"
 	eq "$literal" "" "hard-coded completion word list in hub/muster-completion.bash — derive it from the CLI instead"
+	OUT=""
+}
+
+# THE ROLE IS PARSED BY ANSIBLE, NOT BY A YAML LIBRARY, and the two do not agree. A `shell:` body
+# with unbalanced quotes is perfectly valid YAML — it is inside a block scalar, where anything goes —
+# and ansible then refuses the whole file with "failed at splitting arguments, either an unbalanced
+# jinja2 block or quotes", pointing at the line after the real one. That is what a nested-quote
+# `tr -d '"'"'…'` in this role did: it parsed, it shipped, and it failed on the deploying machine.
+#
+# muster's half of the deploy lives here but RUNS in the consuming repository, so nothing there
+# checks it until someone is mid-deploy. `--syntax-check` on a one-task playbook that imports the
+# role is the same parse ansible-playbook does, and takes a second.
+test_ansible_role_parses_as_ansible_parses_it() {
+	local role="$ROOT/ansible/roles/claude_box"
+	exists "$role/tasks/main.yml" || return 0
+	command -v ansible-playbook >/dev/null || { skip "ansible-playbook is not installed"; return 0; }
+	local d="$FIX/ansible-check"
+	rm -rf "$d"; mkdir -p "$d"
+	# import_role, not roles: — `roles:` would run the role's handlers/vars resolution differently,
+	# and this is about parsing the task file the way a caller's play does.
+	cat > "$d/play.yml" <<-'EOF'
+		- hosts: localhost
+		  gather_facts: no
+		  tasks:
+		    - import_role: { name: claude_box }
+	EOF
+	OUT="$(cd "$d" && ANSIBLE_ROLES_PATH="$ROOT/ansible/roles" \
+		ansible-playbook --syntax-check -i localhost, play.yml 2>&1)"; RC=$?
+	ok
+	hasnt "failed at splitting arguments"
 	OUT=""
 }
 
@@ -4080,6 +4124,7 @@ run "ask: refuses to run without a token"       test_ask_refuses_to_run_without_
 run "hub: tab-completion for both names"           test_hub_completion
 run "hub: every subcommand tab-completes"          test_hub_completion_covers_every_subcommand
 run "conf: MUSTER_CONF_DIR covers every file"      test_conf_dir_covers_every_config_file
+run "ansible: the role parses as ansible parses"   test_ansible_role_parses_as_ansible_parses_it
 run "conf: gen-hub-mounts follows it"             test_gen_hub_mounts_follows_the_conf_dir
 run "ci: images are named by git describe"         test_images_workflow_names_images_by_describe
 run "status: empty stack"                          test_status_empty

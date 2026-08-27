@@ -91,11 +91,14 @@
 # MUSTER_CONF_DIR from `.env`, and this role has to know it to put the files there — a mismatch
 # leaves a hub whose mounts are all empty directories docker invented, with nothing to say why.
 - name: Check the compose env file agrees about the config directory
+  # Not `source`d: the env file may hold quoted values and this must never execute it. tr strips a
+  # surrounding quote so MUSTER_CONF_DIR="conf" and MUSTER_CONF_DIR=conf compare equal.
   shell: |
     set -o pipefail
-    sed -n 's/^[[:space:]]*MUSTER_CONF_DIR[[:space:]]*=[[:space:]]*//p' {{ claude_box_dir }}/{{ claude_box_env_file }} \
-      | tail -1 | tr -d '"'"'"'"'"'"' || true
-  args: { executable: /bin/bash }
+    sed -n 's/^[[:space:]]*MUSTER_CONF_DIR[[:space:]]*=[[:space:]]*//p' \
+      {{ claude_box_dir }}/{{ claude_box_env_file }} | tail -1 | tr -d "\"'" || true
+  args:
+    executable: /bin/bash
   register: claude_box_env_conf_dir
   changed_when: false
   failed_when: false
