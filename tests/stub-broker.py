@@ -238,11 +238,14 @@ class H(BaseHTTPRequestHandler):
             return self._reply(200, {"purged": n, "freed": 12345678})
         n = path[len("/box/"):]
         if n not in BOXES:
-            return self._reply(500, {"error": f"no such box {n}"})
+            # NOT an error, because the real broker's `docker rm -f` is idempotent: killing a name
+            # that was never spawned SUCCEEDS there. The stub said 500 and so hid the bug where a
+            # kill for a mistyped name printed the same sentence as a kill that worked.
+            return self._reply(200, {"killed": n, "existed": False})
         # kill keeps the directory, so the box becomes RETIRED rather than vanishing.
         RETIRED[n] = BOXES[n]["golden"]
         del BOXES[n]
-        return self._reply(200, {"killed": n})
+        return self._reply(200, {"killed": n, "existed": True})
 
     def log_message(self, *a):
         return

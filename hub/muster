@@ -71,6 +71,10 @@ set -euo pipefail
 #   $SELF hold   <box> [--reason "..."]       # PAUSE that box's browser tab so you can drive it into the
 #             [--timeout SECS]              #   state you want it to work on; its actions get a 409
 #   $SELF release <box>                       # let it browse again (and tell it the page moved)
+#   $SELF tabs   [--reap]                     # pinchtab sessions whose box is GONE, and the browser
+#                                           #   tabs they left open (revoke does not close them, so
+#                                           #   they pile up and a reused port slot points a stale tab
+#                                           #   at a different box). Lists them; --reap closes them
 #   $SELF merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
 #                                           #   (--edit on a 1-commit branch: no merge commit)
@@ -637,6 +641,77 @@ svc_running() { svc_window "$1" && [ ! -f "$(svc_exit_file "$1")" ]; }
 svc_dead() { svc_window "$1" && [ -f "$(svc_exit_file "$1")" ]; }
 svc_exit_status() { cat "$(svc_exit_file "$1")" 2>/dev/null || echo '?'; }
 
+# ---- STOPPING A SERVICE MEANS STOPPING ITS PROCESSES, not closing its window -------------------
+#
+# `tmux kill-window` kills what is IN the pane and nothing else. Everything the service forked is
+# reparented and keeps running — and for pinchtab that child is a `pinchtab bridge` holding a headless
+# Chrome. One of those was found outliving its server by 33 hours with 19 agent tabs still open, every
+# one of them at foreground priority (pinchtab passes --disable-renderer-backgrounding, because a
+# throttled tab screenshots wrong), serving boxes that had been killed weeks earlier. `muster ls` said
+# `pinchtab down` throughout — truthfully, and uselessly. Restarting could not fix it either: the
+# leftover browser still holds SingletonLock on the profile the new server wants.
+#
+# So the pane's pid is taken BEFORE the window goes, and its whole tree is stopped.
+svc_pid_file() { printf '%s/logs/%s.pid\n' "$STATE" "$1"; }
+
+# Field 22 of /proc/<pid>/stat, read the only safe way: a process's comm can contain spaces AND
+# parens, so cut past the LAST ')' and count from there. Recorded next to the pid because pids are
+# recycled — and after a hub recreate they mean nothing at all, so a bare pid would eventually name a
+# stranger's process, and this code kills what it is given.
+proc_starttime() {
+	local s; s="$(cat "/proc/$1/stat" 2>/dev/null || true)"
+	[ -n "$s" ] || return 0
+	s="${s##*) }"
+	printf '%s\n' "$s" | awk '{print $20}'
+}
+
+# Children before parents, so a TERM reaches a leaf before its parent is told to go away.
+proc_descendants() {
+	local pid="$1" kid
+	for kid in $(pgrep -P "$pid" 2>/dev/null || true); do proc_descendants "$kid"; done
+	printf '%s\n' "$pid"
+}
+
+proc_kill_tree() {
+	local root="${1:-}" pids p alive n=0
+	[ -n "$root" ] && [ "$root" -gt 1 ] 2>/dev/null || return 0
+	[ -d "/proc/$root" ] || return 0
+	pids="$(proc_descendants "$root")"
+	[ -n "$pids" ] || return 0
+	kill -TERM $pids 2>/dev/null || true
+	# Five seconds for Chrome to shut its renderers down cleanly, then it stops being asked.
+	while [ "$n" -lt 20 ]; do
+		alive=""
+		for p in $pids; do [ -d "/proc/$p" ] && alive="$alive $p"; done
+		[ -n "$alive" ] || return 0
+		sleep 0.25; n=$((n+1))
+	done
+	kill -KILL $alive 2>/dev/null || true
+}
+
+# What a PREVIOUS run left behind — the case no stop-time cleanup can reach, because by then the
+# window and every record of it are gone. Hence the pid file: it is the only thing that outlives them.
+svc_reap_leftovers() {
+	local svc="$1" f pid st now
+	f="$(svc_pid_file "$svc")"
+	[ -f "$f" ] || return 0
+	read -r pid st < "$f" 2>/dev/null || true
+	rm -f "$f"
+	[ -n "${pid:-}" ] && [ -d "/proc/${pid}" ] || return 0
+	now="$(proc_starttime "$pid")"
+	[ "$now" = "${st:-}" ] || return 0          # pid recycled since — not ours to kill
+	echo "$SELF: $svc had left processes running (pid $pid) — stopping them first"
+	proc_kill_tree "$pid"
+}
+
+# Remember this run, so the next one can clean up after it.
+svc_record_pid() {
+	local svc="$1" pane
+	pane="$(tmux list-panes -t "${TMUX_SESSION}:${svc}" -F '#{pane_pid}' 2>/dev/null | head -1)"
+	[ -n "$pane" ] || return 0
+	printf '%s %s\n' "$pane" "$(proc_starttime "$pane")" > "$(svc_pid_file "$svc")"
+}
+
 svc_up() {
 	local svc="$1" cmd
 	svc_load "$svc" || die "unknown service '$svc' — no manifest at $HUB_SERVICES_DIR/$svc or $HUB_SERVICES_BUILTIN/$svc ('$SELF svcs' lists them)"
@@ -649,6 +724,9 @@ svc_up() {
 		echo "$SELF: $svc had exited (status $(svc_exit_status "$svc")) — restarting it ($SELF logs $svc --tail 200 for why)"
 		tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null || true
 	fi
+	# Whatever the last run forked and left running — a crashed service's children are still its
+	# children, and a browser that survived its server would fight this one for the profile.
+	svc_reap_leftovers "$svc"
 	# The hub's entrypoint starts this server at boot and every service is a WINDOW in it. If it is
 	# gone, tmux would fail with a bare "error connecting to /tmp/tmux-<uid>/default", which says
 	# nothing about what to do.
@@ -673,13 +751,24 @@ svc_up() {
 	# keeps its tty (so gradle/ng keep their colours and progress), and the output survives both the
 	# scrollback and the window itself. -o toggles it on for this pane only.
 	tmux pipe-pane -o -t "${TMUX_SESSION}:${svc}" "cat >> $(printf '%q' "$log")" 2>/dev/null || true
+	svc_record_pid "$svc"
 	echo "$SELF: started $svc ($SELF logs $svc to view, $SELF logs $svc --tail N to read the output)"
 }
 
 svc_down() {
-	local svc="$1"
-	tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null && echo "$SELF: stopped $svc" \
-		|| echo "$SELF: $svc not running"
+	local svc="$1" pane
+	# No window, but possibly still processes: a service that was stopped by closing its window, or
+	# whose window was lost with a tmux server, is exactly how a browser ends up orphaned.
+	if ! svc_window "$svc"; then
+		svc_reap_leftovers "$svc"
+		echo "$SELF: $svc not running"; return 0
+	fi
+	# BEFORE the window goes — afterwards there is nothing left to ask.
+	pane="$(tmux list-panes -t "${TMUX_SESSION}:${svc}" -F '#{pane_pid}' 2>/dev/null | head -1)"
+	tmux kill-window -t "${TMUX_SESSION}:${svc}" 2>/dev/null || true
+	[ -n "$pane" ] && proc_kill_tree "$pane"
+	rm -f "$(svc_pid_file "$svc")"
+	echo "$SELF: stopped $svc"
 }
 
 # Where a service's captured output lives. Under $STATE (the repo's .git/cbx) so it is bind-mounted —
@@ -835,7 +924,17 @@ box_kill() {
 	[ $# -ge 1 ] || die "kill needs a box name"
 	local resp
 	resp="$(broker DELETE "/box/$1")" || die "killing box '$1' failed: $resp"
+	# NOTHING KILLED IS NOT A KILL. `docker rm -f` is idempotent, so the broker used to answer for a
+	# name that never existed exactly as it answers a real kill — and the difference matters, because
+	# the name you type and the name the broker knows can differ (`tabtest` vs `muster-tabtest`). An
+	# older broker does not send this field: treat only an explicit `false` as "no such box".
+	if [ "$(printf '%s' "$resp" | jqr '.existed')" = false ]; then
+		die "no box '$1' — nothing was killed ('$SELF ls' lists the names the broker knows)"
+	fi
 	echo "$SELF: killed box '$1' (its upper layer is kept — '$SELF box $1' reattaches to it)"
+	# Its browser tabs outlive it otherwise — see pt_reap. AFTER the kill is reported, deliberately: a
+	# pinchtab that is down or slow must not make a successful kill read like a failed one.
+	pt_reap "$1"
 }
 
 box_recreate() {
@@ -2010,6 +2109,93 @@ pt_api() {
 	tok="$(box_pt_token "$box")" || return 1
 	curl -sS -X "$method" -H "Authorization: Session $tok" \
 		-H "Content-Type: application/json" "${PT_URL}${path}" "$@"
+}
+
+# ---- reaping a box's tabs ----------------------------------------------------------------------
+#
+# A SESSION'S LIFETIME IS BOUNDED; ITS TAB'S IS NOT. Sessions expire 24h after creation and `kill`
+# ends a box, but pinchtab keeps the tab open through both — it even tells you so: `session revoke`
+# answers with `remainingTabIds`, the tabs it just orphaned. Nothing used to read that, so tabs piled
+# up (25 session files against 2 live boxes, tabs still pointing at port-forward slots of boxes
+# retired weeks earlier) — and because slots are REUSED, a leaked tab does not stay pointed at a dead
+# box: it quietly starts loading whatever box takes that slot next.
+#
+# The server credential, not a session one: pinchtab answers session-management endpoints with
+# `403 session_scope_forbidden` for a session token, which is also why this can only run on the hub.
+# `env -u` because pt_cli exports PINCHTAB_SESSION per call and a stale one in the environment is
+# exactly the failure this pair of functions exists to clean up after.
+pt_srv() { env -u PINCHTAB_SESSION pinchtab "$@"; }
+
+# A box's own session (agent id `muster-<box>`) plus its subagents' — a subagent that sets
+# MUSTER_PINCHTAB_SESSION_FILE gets its own session, labelled `muster-<box>-<suffix>`, and its own
+# tab. Those are most of the tabs a long-lived box accumulates, so matching only the exact id would
+# reap the one tab that was never the problem.
+pt_sessions_for() {
+	local box="$1"
+	pt_srv session list 2>/dev/null | jq -r --arg a "muster-$box" \
+		'.[]? | select(.status=="active" and (.agentId==$a or (.agentId|startswith($a+"-")))) | .id' \
+		2>/dev/null || true
+}
+
+# Revoke, then close what revoke reports. `|| true` on every substitution because this file runs under
+# `set -euo pipefail` and a reap that fails must never take the command that called it down with it —
+# a box that could not be tidied up after is still a box that was killed.
+pt_reap() {
+	local box="$1" sid t n=0
+	command -v pinchtab >/dev/null 2>&1 || return 0
+	for sid in $(pt_sessions_for "$box"); do
+		for t in $(pt_srv session revoke "$sid" 2>/dev/null | jq -r '.remainingTabIds[]?' 2>/dev/null || true); do
+			pt_srv tab close "$t" >/dev/null 2>&1 || true
+			n=$((n+1))
+		done
+	done
+	[ "$n" = 0 ] || echo "$SELF: closed $n leftover browser tab(s) from box '$box'"
+	return 0
+}
+
+# THE SWEEP. Sessions whose box is gone — the backlog `pt_reap` cannot help with, because a box killed
+# while the pinchtab server was down was never reaped by anything, and neither was one killed before
+# this code existed. Dry-run by default: it revokes sessions and closes tabs, which is not something to
+# do because a name looked stale on a first read.
+pt_tabs() {
+	local reap="" a live sid aid name keep b n=0 shown=0
+	for a in "$@"; do
+		case "$a" in
+			--reap) reap=1 ;;
+			*) die "tabs: unknown option '$a' (--reap)" ;;
+		esac
+	done
+	command -v pinchtab >/dev/null 2>&1 || die "tabs: no pinchtab CLI on this host"
+	# The broker is the authority on what is live. If it cannot be reached, every session would look
+	# orphaned and the sweep would close every agent's tab — so refuse instead.
+	live="$(broker GET "/box" 2>/dev/null | jq -r '.boxes[]?.box' 2>/dev/null || true)"
+	[ -n "$live" ] || [ "$(broker GET "/box" 2>/dev/null | jq -r '.boxes | length' 2>/dev/null || echo x)" = 0 ] \
+		|| die "tabs: cannot ask the broker which boxes are live — refusing to guess (every session would look orphaned)"
+	while IFS=$'\t' read -r sid aid; do
+		[ -n "$sid" ] || continue
+		name="${aid#muster-}"; keep=0
+		for b in $live; do case "$name" in "$b"|"$b"-*) keep=1 ;; esac; done
+		[ "$keep" = 1 ] && continue
+		shown=$((shown+1))
+		if [ -n "$reap" ]; then
+			for t in $(pt_srv session revoke "$sid" 2>/dev/null | jq -r '.remainingTabIds[]?' 2>/dev/null || true); do
+				pt_srv tab close "$t" >/dev/null 2>&1 || true
+				n=$((n+1))
+			done
+			echo "  reaped $aid ($sid)"
+		else
+			echo "  would reap $aid ($sid)"
+		fi
+	done < <(pt_srv session list 2>/dev/null \
+		| jq -r '.[]? | select(.status=="active") | "\(.id)\t\(.agentId)"' 2>/dev/null || true)
+	if [ "$shown" = 0 ]; then
+		echo "$SELF: no orphaned pinchtab sessions — every active session belongs to a live box"
+	elif [ -n "$reap" ]; then
+		echo "$SELF: reaped $shown session(s), closed $n tab(s)"
+	else
+		echo "$SELF: $shown orphaned session(s) above — '$SELF tabs --reap' revokes them and closes their tabs"
+	fi
+	return 0
 }
 
 # Where a capture lands when you do not say. Under $STATE so it is inside the repo's .git and gets
@@ -4138,6 +4324,7 @@ case "$cmd" in
 	point)    point "$@" ;;
 	hold)     hold "$@" ;;
 	release)  release "$@" ;;
+	tabs)     pt_tabs "$@" ;;
 	merge)    merge "$@" ;;
 	minto)    colors_init; minto "$@" ;;
 	drop)     drop "$@" ;;

@@ -143,7 +143,20 @@ cbx peek  work1 --snap           # the accessibility tree instead: the text the 
 cbx point work1                  # draw pinchtab's labelled overlay, then capture
 cbx say   work1 "e5 is the one that's misaligned"
 cbxpeek   work1 [--point]        # from the laptop: fetches the PNG over ssh and opens it here
+cbx tabs                         # sessions whose box is gone, and the tabs they left open
+cbx tabs --reap                  # revoke them and close those tabs
 ```
+
+**Tabs outlive the boxes that opened them, unless something closes them.** A session's lifetime is
+bounded — 24h, or its box's kill; its *tab's* is not. `pinchtab session revoke` even answers with
+`remainingTabIds`, the tabs it has just orphaned, and until something reads that field they stay open.
+`kill` now reaps a box's sessions and their tabs (subagent sessions too — those are labelled
+`muster-<box>-<suffix>`), but that cannot help tabs whose server has already died, which is what
+`tabs` sweeps up. This matters more than it sounds: pinchtab runs Chrome with
+`--disable-renderer-backgrounding`, because a throttled tab screenshots wrong — so **every leaked tab
+runs at foreground priority forever**. One hub was found with 19 of them, for boxes retired weeks
+earlier. And because port-forward *slots are reused*, a stale tab does not stay pointed at a dead box:
+it quietly starts loading whatever box takes that slot next.
 
 `point` is the one that needed a design decision. pinchtab's own annotate flow expects a **headed**
 browser where you click a label and it copies a reference to your clipboard; the hub's Chrome is

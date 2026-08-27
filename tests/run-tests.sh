@@ -27,6 +27,8 @@ BOX_INIT="$ROOT/box-bin/muster-box-init"
 # Overridable like MUSTER_BIN above, so a test can be checked for teeth by running it against a
 # mutated copy: BROKER_PY=/tmp/broken.py ./tests/run-tests.sh broker:
 BROKER_PY="${BROKER_PY:-$ROOT/box-broker/broker.py}"
+# Same idea, for the box-side session script.
+PT_SESSION="${PT_SESSION:-$ROOT/box-bin/muster-pinchtab-session}"
 FILTER="${1:-}"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cbx-tests.XXXXXX")"
@@ -70,7 +72,7 @@ echo
 # =====================================================================  basics
 
 test_syntax() {
-	for f in "$MUSTER_BIN" "$BOX_INIT" "$ROOT/gen-hub-mounts.sh" "$ROOT/entrypoint.sh" \
+	for f in "$MUSTER_BIN" "$BOX_INIT" "$PT_SESSION" "$ROOT/gen-hub-mounts.sh" "$ROOT/entrypoint.sh" \
 	         "$ROOT/hub/entrypoint.sh" "$ROOT/box-bin/handoff"; do
 		[ -f "$f" ] || continue
 		OUT="$(bash -n "$f" 2>&1)"; RC=$?
@@ -4356,11 +4358,172 @@ test_hub_warns_about_unwritable_mount_parents() {
 	eq "$OUT" "" "a top-level mount destination has no parents to warn about"
 }
 
+# =====================================================================  tabs outliving their box
+#
+# A session's lifetime is bounded — 24h, or its box's kill. Its TAB's is not: `session revoke` answers
+# with `remainingTabIds` and leaves them open. Nothing read that field, so a hub was found with 19 tabs
+# belonging to boxes retired weeks earlier, all at foreground priority (pinchtab disables renderer
+# backgrounding so screenshots are honest), and a reused port-forward slot silently pointed a stale tab
+# at a different box's dev server.
+test_kill_reaps_the_boxs_tabs() {
+	local port=$((21000 + RANDOM % 900)) pid
+	stub_pinchtab_sessions
+	# The box's own session AND a subagent's (MUSTER_PINCHTAB_SESSION_FILE labels those
+	# muster-<box>-<suffix>) — plus another box's, which must be left strictly alone.
+	pt_sessions "ses_1 muster-work1" "ses_2 muster-work1-sub7" "ses_3 muster-other"
+	STUB_LOG="$FIX/stubkill.log" STUB_PORT="$port" python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port" PINCHTAB_TOKEN=tok
+	cbx box work1 >/dev/null 2>&1
+	cbx kill work1
+	ok
+	has "killed box 'work1'"
+	has "closed 2 leftover browser tab(s)"
+	eq "$(pt_closed | sort | tr '\n' ' ')" "tab-ses_1 tab-ses_2 " "the box's tabs, and only those"
+	# Session management is server-scoped: a call carrying a session credential is a 403, so the reap
+	# must never make one. This is the same mistake that broke --force-new.
+	pt_log | grep -q '^session=[^ ]' && fail "the reap ran pinchtab as a session"
+	unset BROKER_URL PINCHTAB_TOKEN
+	kill "$pid" 2>/dev/null
+}
+
+# `docker rm -f` is idempotent, so the broker answers a kill for a name nobody spawned exactly as it
+# answers a real one. That printed "killed box 'tabtest'" for a box actually named `muster-tabtest`,
+# and the cleanup that was supposed to follow could not run — a false negative that cost an afternoon.
+test_kill_says_when_nothing_was_killed() {
+	local port=$((21000 + RANDOM % 900)) pid
+	STUB_LOG="$FIX/stubkill2.log" STUB_PORT="$port" python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+	cbx kill never-existed
+	notok
+	has "no box 'never-existed'"
+	has "nothing was killed"
+	unset BROKER_URL
+	kill "$pid" 2>/dev/null
+}
+
+# The backlog `kill` cannot reach: a box killed while pinchtab was down, or before the kill-time reap
+# existed. Dry-run by default — this revokes sessions and closes tabs, which is not something to do
+# because a name looked stale on a first read.
+test_tabs_sweeps_sessions_whose_box_is_gone() {
+	local port=$((21000 + RANDOM % 900)) pid
+	stub_pinchtab_sessions
+	pt_sessions "ses_live muster-work1" "ses_sub muster-work1-sub7" "ses_dead muster-gone"
+	STUB_LOG="$FIX/stubtabs.log" STUB_PORT="$port" python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port" PINCHTAB_TOKEN=tok
+	cbx box work1 >/dev/null 2>&1
+	cbx tabs
+	ok
+	has "would reap muster-gone"
+	eq "$(pt_closed)" "" "a dry run must close nothing"
+	# A live box's own session, and its subagent's, are not orphans.
+	printf '%s' "$OUT" | grep -q "muster-work1" && fail "a live box's session was listed as orphaned"
+	cbx tabs --reap
+	ok
+	has "reaped muster-gone"
+	eq "$(pt_closed)" "tab-ses_dead" "only the orphan's tab"
+	unset BROKER_URL PINCHTAB_TOKEN
+	kill "$pid" 2>/dev/null
+}
+
+# =====================================================================  stopping means stopping
+#
+# `tmux kill-window` kills what is IN the pane and nothing else. pinchtab's child — a `pinchtab bridge`
+# holding a headless Chrome — survived every `muster down` and every crash, reparented, and kept 19
+# tabs alive for 33 hours while `muster ls` reported the service as down.
+test_service_down_kills_the_process_tree() {
+	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
+	cat > "$FIX/services/forker" <<EOF
+description=a service that forks
+command=sleep 600 & echo \$! > $FIX/child.pid; sleep 600
+EOF
+	export TMUX_SESSION="mustertest-tree-$$"
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
+	cbx up forker; ok
+	local child="" n=0
+	while [ "$n" -lt 20 ]; do child="$(cat "$FIX/child.pid" 2>/dev/null || true)"; [ -n "$child" ] && break; sleep 0.25; n=$((n+1)); done
+	[ -n "$child" ] || { tmux kill-session -t "$TMUX_SESSION" 2>/dev/null; unset TMUX_SESSION; fail "the service never forked"; return 0; }
+	[ -d "/proc/$child" ] || fail "the forked child was not running to begin with"
+	cbx down forker; ok; has "stopped forker"
+	[ -d "/proc/$child" ] && fail "the service's child outlived 'muster down' (pid $child)"
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+	unset TMUX_SESSION
+}
+
+# The case no stop-time cleanup can reach: the window is already gone (a tmux server that died, a
+# hub recreate) and only the pid file remembers what was left running.
+test_service_up_reaps_what_the_last_run_left() {
+	command -v tmux >/dev/null || { skip "tmux is not installed"; return 0; }
+	cat > "$FIX/services/dummy2" <<'EOF'
+description=a sleeper
+command=sleep 600
+EOF
+	export TMUX_SESSION="mustertest-leftover-$$"
+	if ! tmux new-session -d -s "$TMUX_SESSION" -c "$FIX" -n shell 2>/dev/null; then
+		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
+	fi
+	# A leftover from an imaginary previous run, recorded the way svc_up records one.
+	sleep 600 & local orphan=$!
+	local st; st="$(sed 's/.*) //' "/proc/$orphan/stat" | awk '{print $20}')"
+	mkdir -p "$FIX/repo/.git/cbx/logs"
+	printf '%s %s\n' "$orphan" "$st" > "$FIX/repo/.git/cbx/logs/dummy2.pid"
+	cbx up dummy2; ok
+	has "had left processes running"
+	local n=0; while [ "$n" -lt 20 ] && [ -d "/proc/$orphan" ]; do sleep 0.25; n=$((n+1)); done
+	[ -d "/proc/$orphan" ] && { kill -9 "$orphan" 2>/dev/null; fail "the leftover process survived 'muster up'"; }
+	# A RECYCLED pid must not be killed: same pid file, a different process's start time.
+	sleep 600 & local innocent=$!
+	printf '%s %s\n' "$innocent" 1 > "$FIX/repo/.git/cbx/logs/dummy2.pid"
+	cbx down dummy2 >/dev/null 2>&1
+	[ -d "/proc/$innocent" ] || fail "a pid whose start time did not match was killed anyway"
+	kill -9 "$innocent" 2>/dev/null
+	tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+	unset TMUX_SESSION
+}
+
+# =====================================================================  --force-new must recover
+#
+# The box entrypoint EXPORTS PINCHTAB_SESSION. Once that session is revoked, every call this script
+# made carried a dead credential — and pinchtab refuses session management for one (403
+# session_scope_forbidden). So `--force-new`, the documented recovery from "401 invalid or expired",
+# failed at `session create` and then blamed a server that was answering fine, because its own `health`
+# probe was refused for the same reason.
+test_pinchtab_session_force_new_survives_a_revoked_session() {
+	stub_pinchtab_sessions
+	pt_sessions "ses_old muster-work1"
+	local home="$FIX/pthome"; mkdir -p "$home"
+	OUT="$(cd "$FIX" && PATH="$FIX/bin:$PATH" HOME="$home" MUSTER_BOX=work1 \
+		PINCHTAB_TOKEN=tok PINCHTAB_SESSION=ses_old bash "$PT_SESSION" --force-new 2>&1)"; RC=$?
+	[ "$RC" = 0 ] || fail "--force-new failed with a revoked session exported: $OUT"
+	printf '%s' "$OUT" | grep -q '^ses_new_' || fail "no new session was printed: $OUT"
+	eq "$(cat "$home/.muster-pinchtab-session" 2>/dev/null)" "$OUT" "the new token was stored"
+	# It also revoked the old one, by SHORT id (the token in the file is a 404 there).
+	pt_log | grep -q 'args=session revoke ses_old' || fail "the stale session was not revoked"
+	# And not one call carried the dead session.
+	pt_log | grep -q '^session=[^ ]' && fail "a call still carried PINCHTAB_SESSION"
+	# The unset case is unchanged, and `ensure` still reuses the file without asking the server.
+	: > "$FIX/pinchtab.log"
+	OUT="$(cd "$FIX" && PATH="$FIX/bin:$PATH" HOME="$home" MUSTER_BOX=work1 PINCHTAB_TOKEN=tok \
+		bash "$PT_SESSION" 2>&1)"; RC=$?
+	[ "$RC" = 0 ] || fail "the plain ensure path broke: $OUT"
+	eq "$(pt_log)" "" "ensure must not call the server when a token is on file"
+}
+
 run "hub: warns about unwritable mount parents"    test_hub_warns_about_unwritable_mount_parents
 run "pinchtab: the hub seeds a token"              test_pinchtab_token
 run "pinchtab: the hub reaps the profile"           test_hub_reaps_the_pinchtab_profile
 run "pinchtab: the broker hands boxes that token"  test_broker_pinchtab_token
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
+run "kill: reaps the box's pinchtab tabs"          test_kill_reaps_the_boxs_tabs
+run "kill: says when nothing was killed"           test_kill_says_when_nothing_was_killed
+run "tabs: sweeps sessions whose box is gone"      test_tabs_sweeps_sessions_whose_box_is_gone
+run "service: down kills the process tree"         test_service_down_kills_the_process_tree
+run "service: up reaps what the last run left"     test_service_up_reaps_what_the_last_run_left
+run "pinchtab-session: --force-new recovers"       test_pinchtab_session_force_new_survives_a_revoked_session
 
 echo
 if [ "$TESTS_FAILED" = 0 ]; then

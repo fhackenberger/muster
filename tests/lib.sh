@@ -67,6 +67,52 @@ EOF
 }
 pt_log() { cat "$FIX/pinchtab.log" 2>/dev/null; }
 
+# A pinchtab that models the SESSION API, which is what tab reaping is built on:
+#   session list          the sessions in $FIX/pt-sessions (one "<id> <agentId>" per line)
+#   session revoke <id>   succeeds and REPORTS the tabs it orphans — pinchtab does not close them
+#   tab close <id>        recorded, so a test can assert exactly which tabs were closed
+# Every session-management call is refused when PINCHTAB_SESSION is set, with pinchtab's real message:
+# those endpoints take the server token only. That is what makes a caller which forgets to drop an
+# inherited session fail here the way it failed on the server.
+stub_pinchtab_sessions() {
+	mkdir -p "$FIX/bin"
+	: > "$FIX/pinchtab.log"
+	: > "$FIX/pt-closed"
+	[ -f "$FIX/pt-sessions" ] || : > "$FIX/pt-sessions"
+	cat > "$FIX/bin/pinchtab" <<EOF
+#!/bin/bash
+printf 'session=%s args=%s\\n' "\${PINCHTAB_SESSION:-}" "\$*" >> "$FIX/pinchtab.log"
+case "\$1 \${2:-}" in
+	"session list"|"session revoke"|"session create"|"health ")
+		if [ -n "\${PINCHTAB_SESSION:-}" ]; then
+			echo "Error 403: agent session is not allowed to access this endpoint (session_scope_forbidden)" >&2
+			exit 1
+		fi
+		# The server credential is what authorises these, so a "fix" that scrubbed the whole
+		# environment rather than just the session would fail here. That is deliberate.
+		[ -n "\${PINCHTAB_TOKEN:-}" ] || { echo "Error 401: unauthorized" >&2; exit 1; }
+		;;
+esac
+case "\$1 \${2:-}" in
+	"session list")
+		awk '{ printf "%s{\\"id\\":\\"%s\\",\\"agentId\\":\\"%s\\",\\"status\\":\\"active\\"}", (NR>1 ? "," : "["), \$1, \$2 } END { print (NR ? "]" : "[]") }' "$FIX/pt-sessions" ;;
+	"session revoke")
+		printf '{"remainingTabIds":["tab-%s"],"status":"ok"}\\n' "\$3" ;;
+	"session create")
+		echo "ses_new_\$\$" ;;
+	"tab close")
+		printf '%s\\n' "\$3" >> "$FIX/pt-closed"; echo OK ;;
+	"health ")
+		echo ok ;;
+esac
+exit 0
+EOF
+	chmod +x "$FIX/bin/pinchtab"
+}
+# What that stub will report: pt_sessions "ses_1 muster-work1" "ses_2 muster-work1-sub"
+pt_sessions() { printf '%s\n' "$@" > "$FIX/pt-sessions"; }
+pt_closed() { cat "$FIX/pt-closed" 2>/dev/null; }
+
 # Give box <name> a pinchtab session token where the hub looks for it.
 box_pt_session() {
 	mkdir -p "$FIX/boxes/$1/home"

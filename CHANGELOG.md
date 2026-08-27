@@ -95,7 +95,37 @@ releases and are not listed here.
   survive its own restart; `--purge` bins the box once the answer is in, never before, and never one
   holding unreviewed work. See "Unattended job boxes" in `README-remote.md`.
 
+- `muster tabs [--reap]` — the pinchtab sessions whose box is **gone**, and the browser tabs they
+  left open. Dry-run unless `--reap`, and it refuses to run at all when the broker cannot say which
+  boxes are live, because then every session would look orphaned.
+
 ### Fixed
+- **A killed box's browser tabs stayed open forever.** A session's lifetime is bounded — 24h, or its
+  box's kill — but its TAB's is not: `pinchtab session revoke` answers with `remainingTabIds`, the
+  tabs it has just orphaned, and nothing read that field. One hub was found holding 19 of them for
+  boxes retired weeks earlier, each at foreground priority (pinchtab disables renderer backgrounding
+  so screenshots are honest), and because port-forward slots are reused a stale tab does not stay
+  pointed at a dead box — it starts loading whatever box takes that slot next. `kill` now revokes a
+  box's sessions, subagent ones included (`muster-<box>-<suffix>`), and closes the tabs revoke
+  reports; `muster tabs --reap` clears the backlog that predates this.
+- **Stopping a service did not stop its processes.** `down` was `tmux kill-window`, which kills what
+  is in the pane and nothing else — so `pinchtab server`'s child, a `pinchtab bridge` holding a
+  headless Chrome, survived every stop and every crash, reparented, and kept its tabs alive. One had
+  outlived its server by 33 hours while `muster ls` reported the service as down, and a restart could
+  not displace it either: the orphan still held `SingletonLock` on the profile the new server wanted.
+  `down` now stops the whole process tree, and `up` first reaps what the previous run left, matched
+  by pid AND process start time so a recycled pid is never killed.
+- **`muster kill <name>` reported success for a box that does not exist.** `docker rm -f` is
+  idempotent, so the broker answered a mistyped name exactly as it answers a real kill — which is how
+  a box named `muster-tabtest` survived `kill tabtest` while the terminal said otherwise, and the
+  cleanup meant to follow silently did not happen. The broker now reports whether the container was
+  there, and the hub fails loudly when it was not.
+- **`muster-pinchtab-session --force-new` could not do the one thing it exists for.** The box
+  entrypoint exports `PINCHTAB_SESSION`, and pinchtab refuses session management for a session
+  credential (`403 session_scope_forbidden`) — so once that session was revoked or expired, the
+  documented recovery from `401 invalid or expired` failed at `session create`, and then blamed an
+  unreachable server, because its own `health` probe was refused for the same reason. Every call it
+  makes now drops the inherited session and authenticates with the box's token.
 - **The `claude_box` role did not parse.** The `MUSTER_CONF_DIR` check added moments earlier used a
   nested-quote `tr -d`, which is valid YAML — it sits inside a block scalar, where anything goes —
   and which ansible's argument splitter rejects outright with "failed at splitting arguments",

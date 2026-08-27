@@ -22,6 +22,10 @@ set -euo pipefail
 # pass a session per call — a wrapper script around every `pinchtab` invocation means a new command
 # line every time, which for an agent means a permission prompt every time. If the server was not up
 # then, re-export it in the shell:  export PINCHTAB_SESSION="$(muster-pinchtab-session)"
+#
+# This script itself ignores that exported session and talks to the server with the box's TOKEN:
+# session management is refused for a session credential, so carrying a dead session is what used to
+# make --force-new fail in exactly the situation it exists for.
 
 # The header block IS the help — printed from line 4 to the first line that is not a comment, so it
 # cannot drift out of step with the file you are reading (a hard-coded line range always does).
@@ -55,12 +59,21 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
+# NEVER AS THE SESSION WE ARE REPLACING. The box entrypoint EXPORTS PINCHTAB_SESSION, so every call
+# below would otherwise carry it — and pinchtab answers session-management endpoints with
+# `403 session_scope_forbidden` for a session credential. Once that session was revoked or expired,
+# `--force-new` therefore failed at `session create`, then reported a DEAD SERVER (because its `health`
+# probe was refused for the same reason) against a server that was answering fine. The one command
+# whose whole purpose is recovering from `401 invalid or expired` could not run in the only situation
+# it exists for. PINCHTAB_TOKEN stays: that is what authorises the create.
+pt() { env -u PINCHTAB_SESSION pinchtab "$@"; }
+
 # Revoke this box's sessions server-side. `pinchtab session revoke` wants the SHORT public id from
 # `session list`, not the long token this file holds — passing the token is a 404 — so the id is
 # looked up by our label. That also reaps whatever earlier --force-new runs left behind.
 revoke_self() {
 	local list ids id
-	list="$(pinchtab session list 2>/dev/null)" || return 0
+	list="$(pt session list 2>/dev/null)" || return 0
 	ids="$(printf '%s' "$list" | python3 -c 'import sys, json
 try:
     sessions = json.load(sys.stdin)
@@ -71,7 +84,7 @@ for s in sessions if isinstance(sessions, list) else []:
     if s.get("agentId") == want and s.get("status") == "active":
         print(s["id"])' "$AGENT_ID" 2>/dev/null)" || return 0
 	for id in $ids; do
-		pinchtab session revoke "$id" >/dev/null 2>&1 || true
+		pt session revoke "$id" >/dev/null 2>&1 || true
 	done
 }
 
@@ -96,7 +109,7 @@ esac
 # Create into a temp file first (mktemp is 0600) and move it into place, so a failed create can never
 # clobber a session that still works.
 tmp="$(mktemp "${FILE}.XXXXXX")" || die "cannot write next to $FILE"
-if ! pinchtab session create --agent-id "$AGENT_ID" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+if ! pt session create --agent-id "$AGENT_ID" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
 	rm -f "$tmp"
 	# WHY THIS ASKS `health` FIRST. "server is not running" is what the pinchtab CLI says when its
 	# PREFLIGHT does not answer in time — which is also what a server that is up, authenticated and
@@ -104,9 +117,10 @@ if ! pinchtab session create --agent-id "$AGENT_ID" > "$tmp" 2>/dev/null || [ ! 
 	# 3.4GB browser profile had taken /health from 303ms to 3s). `health` has no such deadline, so if
 	# it succeeds here the server is up and the problem is latency, and saying so is the difference
 	# between "check the hub's pinchtab" and "check how long the hub's pinchtab takes".
-	if pinchtab health >/dev/null 2>&1; then
-		die "the pinchtab server ANSWERS but was too slow for the session-create preflight.
-     It is up and reachable at ${PINCHTAB_SERVER:-127.0.0.1} — this is latency, not a dead server.
+	if pt health >/dev/null 2>&1; then
+		die "the pinchtab server ANSWERS but would not create a session.
+     It is up and reachable at ${PINCHTAB_SERVER:-127.0.0.1} — not a dead server. Two things do this:
+     the create's own preflight timing out (latency), or a PINCHTAB_TOKEN the server does not accept.
      On the hub: 'muster ready pinchtab' prints the probe time, 'muster logs pinchtab --tail 50' the rest.
      A browser profile that has grown large is the usual cause."
 	fi

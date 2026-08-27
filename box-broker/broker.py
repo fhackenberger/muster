@@ -1522,14 +1522,23 @@ def kill_box(name):
 	deliberately LEFT on disk: they hold any work the agent had not pushed plus its warm caches, and
 	`cbx box <same name>` reattaches to them. The one thing that does go is a `cow` row's private
 	copy — that mode exists to say "this is scratch, throw it away"; `cow-keep` stays, like an upper
-	layer, and is only rebuilt by a --fresh spawn."""
+	layer, and is only rebuilt by a --fresh spawn.
+
+	`existed` is reported because `docker rm -f` is IDEMPOTENT: removing a container that is not there
+	succeeds silently, so a kill for a name nobody ever spawned answered exactly like a kill that
+	worked. That cost an afternoon of watching for a cleanup that could not happen, because the kill
+	meant to trigger it had matched nothing — the box was `muster-tabtest`, the name typed was
+	`tabtest`. Two outcomes that differ must not print the same sentence."""
+	existed = bool(subprocess.run(
+		["docker", "ps", "-a", "--filter", f"name=^{box_container(name)}$", "--format", "{{.Names}}"],
+		capture_output=True, text=True).stdout.strip())
 	stop_forwarders(name)
 	subprocess.run(["docker", "rm", "-f", box_container(name)], capture_output=True, text=True, check=True)
 	for vol in created_volumes(name):
 		subprocess.run(["docker", "volume", "rm", vol], capture_output=True, text=True)
 	for d in created_cow_dirs(name):
 		shutil.rmtree(d, ignore_errors=True)
-	return {"killed": name}
+	return {"killed": name, "existed": existed}
 
 
 def list_boxes(sizes=False):
