@@ -20,6 +20,28 @@ _muster_commands() {
 		| sed -n 's/^[[:space:]]*\([a-z|-]*\))[[:space:]].*/\1/p' | tr '|' '\n' | grep .
 }
 
+# The subcommands of a command that has its OWN dispatch (`golden snapshot`, `golden migrate`, …),
+# read out of its nested `case "$sub" in` for exactly the reason the top-level list is read out of
+# the CLI: a copy kept here is a list that goes stale in silence. It did — the hand-written one said
+# "snapshot seal ls reap" and never learned `migrate` or `retire`, and nothing complained, because a
+# completion that offers four words out of six looks precisely like one that works.
+#
+# Prints nothing for a command with no sub-dispatch, which is how the caller tells the two apart.
+_muster_subcommands() {
+	local bin parent="$2"
+	bin="$(command -v "${1:-muster}" 2>/dev/null)" || return 0
+	[ -n "$bin" ] || return 0
+	# $parent is whatever the user has typed so far, and it goes into an awk regex: let nothing
+	# through but a plain command name.
+	case "$parent" in ''|*[!a-z-]*) return 0 ;; esac
+	awk -v p="$parent" '
+		$0 ~ "^[[:space:]]*" p "\\)[[:space:]]*$" { inparent = 1; next }
+		inparent && /case "\$sub" in/ { insub = 1; next }
+		insub && /esac/ { exit }
+		insub' "$bin" 2>/dev/null \
+		| sed -n 's/^[[:space:]]*\([a-z|-]*\))[[:space:]].*/\1/p' | tr '|' '\n' | grep .
+}
+
 # Every box name we can name without asking anyone: the ones with a container directory, and the ones
 # that have handed off (which may have no container at all — review/merge/drop still apply to them).
 _muster_boxes() {
@@ -54,6 +76,19 @@ _muster_complete() {
 		return 0
 	fi
 
+	# Second word of a command that dispatches again (`golden <sub>`). Ahead of the table below and
+	# driven by the CLI rather than by a list here, so a new sub-dispatch — or a new subcommand under
+	# an existing one — completes the moment it is written, without this file being touched.
+	# …unless a flag is being typed, which is never a subcommand and falls through to the scraper.
+	if [ "$COMP_CWORD" = 2 ] && [ "${cur:0:1}" != - ]; then
+		local subs
+		subs="$(_muster_subcommands "${COMP_WORDS[0]}" "$cmd")"
+		if [ -n "$subs" ]; then
+			mapfile -t COMPREPLY < <(compgen -W "$subs" -- "$cur")
+			return 0
+		fi
+	fi
+
 	case "$cmd" in
 		# <box>
 		review|merge|fix|drop|rebase|kill|box|recreate|prereview|export|import|say|job|peek|point|hold|release)
@@ -64,9 +99,11 @@ _muster_complete() {
 		# <branch>
 		minto|push|pull)
 			mapfile -t COMPREPLY < <(compgen -W "$(_muster_branches)" -- "$cur") ;;
+		# `golden <sub>` is handled above, from the CLI's own nested case.
+		# `golden migrate <box>` — the only sub-dispatch argument worth naming.
 		golden)
-			[ "$COMP_CWORD" = 2 ] &&
-				mapfile -t COMPREPLY < <(compgen -W "snapshot seal ls reap" -- "$cur") ;;
+			[ "${COMP_WORDS[2]:-}" = migrate ] &&
+				mapfile -t COMPREPLY < <(compgen -W "$(_muster_boxes | sort -u)" -- "$cur") ;;
 	esac
 
 	# `--flags` are worth completing wherever they appear, and the header block is where they are
@@ -76,9 +113,21 @@ _muster_complete() {
 	# The block is one `#   $SELF <cmd> …` line plus its indented continuations, so: start at that
 	# line, stop at the next one that names a command.
 	if [ -z "${COMPREPLY[*]}" ] && [ "${cur:0:1}" = - ]; then
-		local bin flags
+		local bin flags what="$cmd"
+		# `golden migrate --<TAB>` must find `--golden-wins`, and those flags are documented on the
+		# SUBCOMMAND's line — matching the parent alone lands on `golden snapshot` and offers `--prep`
+		# for every one of them. Same [a-z-] guard as _muster_subcommands: this goes into a regex.
+		if [ "$COMP_CWORD" -gt 2 ]; then
+			case "${COMP_WORDS[2]:-}" in
+				''|*[!a-z-]*) ;;
+				*) [ -n "$(_muster_subcommands "${COMP_WORDS[0]}" "$cmd")" ] &&
+					what="$cmd[[:space:]]+${COMP_WORDS[2]}" ;;
+			esac
+		fi
 		bin="$(command -v "${COMP_WORDS[0]}" 2>/dev/null)"
-		flags="$(awk -v c="$cmd" '
+		# An empty $bin would make awk read STDIN and hang the terminal on a Tab press.
+		[ -n "$bin" ] || return 0
+		flags="$(awk -v c="$what" '
 			p && /\$SELF/ { exit }
 			$0 ~ "^#.*\\$SELF[[:space:]]+" c "([[:space:]]|$)" { p = 1 }
 			p && /^#/ { print }

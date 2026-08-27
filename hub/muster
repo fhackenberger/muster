@@ -134,10 +134,19 @@ set -euo pipefail
 #                                           #   always expected a box to sit on an older one.
 #   $SELF golden migrate <box>|--all          # move a box onto the CURRENT golden and carry its
 #             [--force] [--dry-run]         #   UNCOMMITTED work across (patch via the box's ~/keep,
-#                                           #   which outlives the overlay; re-applied with a 3-way
+#             [--golden-wins]               #   which outlives the overlay; re-applied with a 3-way
+#             [--discard-retired]           #   (see below for what --discard-retired does)
 #                                           #   merge). Lists what is coming and warns where it
-#                                           #   overlaps the new golden's OWN dirty files. It cannot
+#                                           #   overlaps the new golden's OWN dirty files — then asks
+#                                           #   [y] merge / [g] keep the golden's version / [N] skip.
+#                                           #   --golden-wins answers `g` for every box, --force `y`.
+#                                           #   --all only reaches boxes that are UP, and says which
+#                                           #   retired ones it therefore left behind. It cannot
 #                                           #   carry COMMITS — handoff those first.
+#                                           #   --discard-retired moves the KILLED ones too, by
+#                                           #   bookkeeping alone (no container is started): their
+#                                           #   upper layer is deleted, so unpushed commits and
+#                                           #   local edits go with it and only ~/keep survives.
 #   $SELF golden seal <id>                    # finish a staged golden you fixed up by hand
 #   $SELF golden ls | reap                    # list snapshots / delete unreferenced ones
 #   $SELF golden retire <id>                  # free one that boxes are still on: move them onto the
@@ -347,6 +356,33 @@ term_cols() {
 	case "$c" in ''|*[!0-9]*) c=100 ;; esac
 	[ "$c" -ge 60 ] || c=100
 	printf '%s' "$c"
+}
+
+# The live dashboard's title bar: name and hints on the left, the clock hard against the right
+# margin. Its own function because the pad arithmetic has to agree with the format string character
+# for character, and for a long time it did not. A test measures the rendered width.
+#
+# TWO BUGS, ONE CAUSE. The format is single-quoted, and has to be — it is full of % specifiers and
+# escape bytes — so the `$SELF` that used to sit INSIDE it was never expanded: the title read
+# "$SELF q · live". That ALSO made the line two columns too wide, because the pad subtracted a
+# constant sized for a three-character name while the literal "$SELF" is five. The overflow landed
+# on the clock: `20:48:07` lost its last two characters to the next row, hour and minute on one
+# line and the seconds on the next. The name is an argument now, and the constant is derived from
+# ${#SELF}, which also makes a hub whose CLI is still called `muster` line up.
+#
+# The pad is computed from the PLAIN text, never from the printed string — that one carries
+# attribute bytes that occupy no columns. The visible width is
+#   1 + ${#SELF} + 10 (" q · live ") + 1 + ${#hint} + pad + ${#clock}
+# so pad = cols - ${#SELF} - ${#hint} - ${#clock} - 12 puts the last digit on the last column.
+# (`·` is one column and two bytes; ${#var} counts characters, which is why the image sets a UTF-8
+# LANG — under LANG=C this would measure bytes and the clock would sit two columns shy.)
+watch_title() {
+	local hint="$1" clock="$2" cols pad
+	cols="$(term_cols)"
+	pad=$(( cols - ${#SELF} - ${#hint} - ${#clock} - 12 ))
+	[ "$pad" -ge 1 ] || pad=1
+	printf '%s %s q · live %s %s%s%s%*s%s%s%s\n' \
+		"$C_B$C_CYA" "$SELF" "$C_RESET" "$C_DIM" "$hint" "$C_RESET" "$pad" "" "$C_B" "$clock" "$C_RESET"
 }
 
 # 20011s is not a duration anyone reads — 5h33m is. Keeps two significant units, never wider than 6.
@@ -1518,14 +1554,9 @@ watch_queue() {
 		hint="refresh ${interval}s · Enter now · q quits"
 		[ "$bell" = 1 ] || hint="$hint · bell OFF"
 		clock="$(date +%H:%M:%S)"
-		# Title bar: name + hints on the left, clock hard against the right margin. The pad is computed
-		# from the PLAIN text (15 = " $SELF q · live " plus the space before the hint), never from the
-		# printed string — that one carries attribute bytes that occupy no columns.
-		pad=$(( MUSTER_COLS - ${#hint} - ${#clock} - 15 ))
-		[ "$pad" -ge 1 ] || pad=1
 		printf '\033[H\033[2J'
-		printf '%s $SELF q · live %s %s%s%s%*s%s%s%s\n\n' \
-			"$C_B$C_CYA" "$C_RESET" "$C_DIM" "$hint" "$C_RESET" "$pad" "" "$C_B" "$clock" "$C_RESET"
+		watch_title "$hint" "$clock"
+		printf '\n' 
 		printf '%s\n' "$frame"
 		if [ "${#WATCH_EVENTS[@]}" -gt 0 ]; then
 			hdr "while you were watching"
@@ -3524,7 +3555,25 @@ golden_reap() {
 # ONLY THE FIRST USED TO BE CHECKED, while the refusal told you to "commit + handoff". An agent that
 # finishes a piece of work and commits it without handing off leaves a clean `git status` and commits
 # that exist nowhere else — precisely the case the message warned about and the check waved through.
-box_probe() { broker GET "/box/$1/dirty" 2>/dev/null; }
+# What the broker can tell us about a box's working tree — or NOTHING, which is a different answer
+# from "clean" and has to fail here rather than be mistaken for one further up.
+#
+# THE BUG THIS EXISTS FOR. The broker's box_dirty execs into the container; when that fails, it
+# returns HTTP 200 with {"reachable": false, "dirty": [], "head": ""}. For a RETIRED box the exec
+# always fails, there being no container — so the empty dirty list read as "this box is clean" and
+# the empty head as "VERSION DRIFT: the broker is older than this CLI", and both halves of
+# box_move_blocker waved through a box nobody had looked at. `golden retire`'s move then deleted its
+# upper layer, which for a killed box is exactly where unpushed work lives — the whole reason `kill`
+# keeps the directory instead of purging it. Silence is not consent.
+#
+# Failing HERE, once, means every caller's existing not-reachable path is the one that runs.
+# `.reachable` absent (a broker older than the field) stays truthy, so nothing regresses on drift.
+box_probe() {
+	local resp
+	resp="$(broker GET "/box/$1/dirty" 2>/dev/null)" || return 1
+	[ "$(printf '%s' "$resp" | jqr '.reachable')" != false ] || return 1
+	printf '%s' "$resp"
+}
 box_dirty_of() { printf '%s' "$1" | jqr '.dirty[]?'; }
 
 # Would moving this box lose COMMITS? Uncommitted files are the other half and are recoverable with
@@ -3538,6 +3587,9 @@ box_unpushed_blocker() {
 	local box="$1" resp="$2" head known n
 	head="$(printf '%s' "$resp" | jqr '.head')"
 	if [ -z "$head" ]; then
+		# Genuine drift only. A box that is merely not running no longer reaches this — box_probe
+		# fails on reachable:false — which it used to, and this message then blamed the broker's
+		# version for what was really "there is no container to ask".
 		echo "$SELF: box '$box' — this broker does not report HEAD, so committed-but-unpushed work" >&2
 		echo "       cannot be checked (VERSION DRIFT: the broker is older than this CLI)" >&2
 		return 0
@@ -3561,7 +3613,11 @@ box_unpushed_blocker() {
 box_move_blocker() {
 	local box="$1" resp dirty bad=0
 	resp="$(box_probe "$box")" || {
-		echo "$SELF: box '$box' is not reachable — cannot tell whether its work is safe to discard" >&2
+		echo "$SELF: box '$box' is not running, so nothing can be read out of it — whether its upper" >&2
+		echo "       layer holds work nobody has seen is UNKNOWN, and moving it discards that layer." >&2
+		echo "       '$SELF box $box' brings it back up (on its own golden, layer intact) and then" >&2
+		echo "       '$SELF golden migrate $box' carries its work across. To move it WITHOUT looking:" >&2
+		echo "       '$SELF golden migrate $box --discard-retired'. '$SELF purge $box' bins it." >&2
 		return 1
 	}
 	dirty="$(box_dirty_of "$resp" | head -5)"
@@ -3600,25 +3656,53 @@ golden_dirty_paths() {
 # nothing outside the box has them until `handoff` pushes refs/agents/<box>. So a box with unpushed
 # commits is refused here, exactly as it is by `golden snapshot` — hand off first, then migrate.
 golden_migrate() {
-	local all=0 force=0 dry=0 args=() box boxes resp dirty id files overlap answer moved=0
+	local all=0 force=0 dry=0 goldenwins=0 discardretired=0 args=() box boxes resp dirty id files overlap answer moved=0
+	local rows retired="" cur bgold already=0 apply_action reset=0 rgold
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			--all)     all=1; shift ;;
-			--force)   force=1; shift ;;
-			--dry-run) dry=1; shift ;;
-			-*) die "golden migrate: unknown option '$1' (--all | --force | --dry-run)" ;;
+			--all)         all=1; shift ;;
+			--force)       force=1; shift ;;
+			--dry-run)     dry=1; shift ;;
+			--golden-wins) goldenwins=1; shift ;;
+			--discard-retired) discardretired=1; shift ;;
+			-*) die "golden migrate: unknown option '$1' (--all | --force | --golden-wins | --discard-retired | --dry-run)" ;;
 			*)  args+=("$1"); shift ;;
 		esac
 	done
+	rows="$(broker GET /box 2>/dev/null)" || rows=""
+	cur="$(broker GET /golden 2>/dev/null | jqr '.current')" || cur=""
 	if [ "$all" = 1 ]; then
-		boxes="$(broker GET /box 2>/dev/null | jqr '.boxes[]?.box')"
+		boxes="$(printf '%s' "$rows" | jqr '.boxes[]?.box')"
+		# A RETIRED BOX TAKES THE OTHER PATH ENTIRELY. It has no container, so there is nothing to
+		# read its working tree out of and nothing to carry — `--discard-retired` below is the only
+		# thing that can move it. Splitting them here is also what stopped `--all` being quietly
+		# wrong: it used to consider live boxes only and report "migrated N" while dozens sat on a
+		# month-old golden, with `golden ls` the one place that ever admitted it.
+		retired="$(printf '%s' "$rows" | jqr '.retired[]?.box')"
 	else
 		[ ${#args[@]} -gt 0 ] || die "migrate needs a box name, or --all: $SELF golden migrate work1"
-		boxes="${args[*]}"
+		boxes=""; retired=""
+		for box in ${args[@]+"${args[@]}"}; do
+			if printf '%s' "$rows" | jq -e --arg b "$box" '.retired[]?|select(.box==$b)' >/dev/null 2>&1; then
+				retired="$retired $box"
+			else
+				boxes="$boxes $box"
+			fi
+		done
 	fi
-	[ -n "$boxes" ] || { echo "$SELF: no boxes to migrate"; return 0; }
+	# Both lists: a run that names only retired boxes has nothing in $boxes and is still a run.
+	[ -n "$boxes$retired" ] || { echo "$SELF: no boxes to migrate"; return 0; }
 
 	for box in $boxes; do
+		# Already there: a recreate would cost a container replacement and a cold cache for nothing.
+		bgold="$(printf '%s' "$rows" | jq -r --arg b "$box" '.boxes[]?|select(.box==$b)|.golden' 2>/dev/null)"
+		if [ -n "$cur" ] && [ "$bgold" = "$cur" ]; then
+			already=$((already + 1))
+			# Counted rather than printed under --all: on a stack with forty boxes that is forty lines
+			# of "nothing to do" burying the ones that matter. Named on its own, it IS the answer.
+			[ "$all" = 1 ] || echo "$SELF: '$box' is already on the current golden ($cur) — nothing to do"
+			continue
+		fi
 		resp="$(box_probe "$box")" || { echo "$SELF: box '$box' is not reachable — skipped" >&2; continue; }
 		# Commits first: this command cannot carry them, and finding that out AFTER the recreate would
 		# be the worst possible moment.
@@ -3646,18 +3730,35 @@ golden_migrate() {
 		# them in deliberately), so a path in both lists is one where the agent's version is about to
 		# land on top of a version the new golden already changed. git apply -3 will merge or conflict
 		# rather than clobber, but you should know before, not after.
+		# The apply mode for THIS box. --golden-wins fixes it for all of them; otherwise the prompt
+		# below decides, and a box with no collision never gets asked.
+		apply_action=apply
+		[ "$goldenwins" = 1 ] && apply_action=apply-keep-golden
+
 		overlap="$(comm -12 <(printf '%s\n' "$files" | sed '/^$/d' | sort -u) <(golden_dirty_paths))"
 		if [ -n "$overlap" ]; then
 			echo "$SELF: …and these are ALSO uncommitted in the new golden — the merge may conflict:" >&2
 			printf '%s\n' "$overlap" | sed 's/^/  ! /' >&2
-			if [ "$force" != 1 ] && [ "$dry" != 1 ]; then
+			if [ "$force" != 1 ] && [ "$goldenwins" != 1 ] && [ "$dry" != 1 ]; then
 				if [ -t 0 ]; then
 					tty_flush
-					printf '%s: migrate '"'"'%s'"'"' anyway ? [y/N] ' "$SELF" "$box" > /dev/tty
+					# THREE ANSWERS, because the interesting case is not "merge or don't". These
+					# collisions are usually the golden's own setup work — the hub's dirty tree, baked
+					# into every snapshot on purpose — where the agent's copy is a stale duplicate of
+					# something you have since changed by hand, and three-way merging the two just
+					# produces conflict markers to resolve by taking the golden's side anyway. `g`
+					# takes that side directly; the agent's version is not lost either way, the whole
+					# stash stays in ~/keep.
+					printf '%s: %s%s%s — [y] merge them  [g] keep the GOLDEN'"'"'s version of the %s colliding path(s)  [N] skip ? ' \
+						"$SELF" "$C_B" "$box" "$C_RESET" "$(printf '%s\n' "$overlap" | grep -c .)" > /dev/tty
 					read -r answer < /dev/tty || answer=n
-					case "$answer" in y|Y) ;; *) echo "$SELF: '$box' skipped"; continue ;; esac
+					case "$answer" in
+						y|Y) ;;
+						g|G) apply_action=apply-keep-golden ;;
+						*) echo "$SELF: '$box' skipped"; continue ;;
+					esac
 				else
-					echo "$SELF: '$box' skipped — rerun interactively, or --force" >&2
+					echo "$SELF: '$box' skipped — rerun interactively, --golden-wins, or --force" >&2
 					continue
 				fi
 			fi
@@ -3668,14 +3769,57 @@ golden_migrate() {
 		fi
 
 		broker POST "/recreate/$box?fresh=1" >/dev/null || die "recreating '$box' failed — its work is still in ~/keep/.migrate/$id"
-		resp="$(broker POST "/box/$box/migrate/apply?id=$id")" || {
+		resp="$(broker POST "/box/$box/migrate/$apply_action?id=$id")" || {
 			echo "$SELF: '$box': $(printf '%s' "$resp" | jqr '.error')" >&2
 			die "'$box' was moved but its work did not apply cleanly — it is still in ~/keep/.migrate/$id inside the box"
 		}
 		echo "$SELF: '$box' — $(printf '%s' "$resp" | jqr '.output')"
 		moved=$((moved + 1))
 	done
-	[ "$dry" = 1 ] || echo "$SELF: migrated $moved box(es) onto the current golden"
+	# RETIRED BOXES, WITH --discard-retired. No container means nothing can be read out and nothing
+	# can be carried — so the only way to move one is to accept losing its upper layer, and the flag
+	# is the caller saying that in as many words. The move is then pure bookkeeping in the broker:
+	# delete the upper layers, rewrite the `golden` file, and the next `$SELF box <name>` assembles
+	# the overlay on the current golden. Nothing is started, no agent is woken to be told nothing,
+	# no port slot is taken and given back.
+	#
+	# WHAT IS LOST: every uncommitted file, and every commit the box never handed off (its .git is in
+	# that layer too). WHAT SURVIVES: ~/keep — a bind mount outside the overlay, which is what it is
+	# for — the box's name, branch, claude session and anything it pushed to refs/agents/<box>.
+	if [ -n "$retired" ] && [ "$discardretired" = 1 ]; then
+		for box in $retired; do
+			rgold="$(printf '%s' "$rows" | jq -r --arg b "$box" '.retired[]?|select(.box==$b)|.golden' 2>/dev/null)"
+			if [ -n "$cur" ] && [ "$rgold" = "$cur" ]; then
+				already=$((already + 1))
+				[ "$all" = 1 ] || echo "$SELF: '$box' is already on the current golden ($cur) — nothing to do"
+				continue
+			fi
+			if [ "$dry" = 1 ]; then
+				echo "$SELF: --dry-run: '$box' would be reset onto $cur, discarding its upper layer"
+				continue
+			fi
+			resp="$(broker POST "/box/$box/rebase-golden")" || {
+				echo "$SELF: '$box' not moved — $(broker_err "$resp")" >&2
+				continue
+			}
+			echo "$SELF: '$box' — reset onto $cur, $(human_size "$(printf '%s' "$resp" | jqr '.freed // 0')") of upper layer discarded"
+			reset=$((reset + 1))
+		done
+		retired=""
+	fi
+
+	[ "$dry" = 1 ] || echo "$SELF: migrated $moved box(es) onto the current golden${cur:+ ($cur)}"
+	[ "$reset" = 0 ] || echo "$SELF: reset $reset retired box(es) onto it, discarding their upper layers"
+	[ "$already" = 0 ] || echo "$SELF: $already box(es) were already on it"
+	# NO SILENT CAPS. Saying "migrated 5" while dozens sit on a month-old golden reads as "everything
+	# is on the new base" — which is exactly what it is not.
+	if [ -n "$retired" ]; then
+		echo "$SELF: NOT migrated — $(printf '%s\n' "$retired" | grep -c .) retired box(es) (no container, so their work cannot be read out):" >&2
+		printf '%s\n' "$retired" | sed '/^$/d;s/^/  /' >&2
+		echo "$SELF: --discard-retired moves them anyway, dropping everything outside ~/keep." >&2
+		echo "       Or '$SELF box <name>' brings one back — on its OWN golden, upper layer intact —" >&2
+		echo "       and '$SELF golden migrate <name>' then carries its work across." >&2
+	fi
 	golden_reap
 }
 

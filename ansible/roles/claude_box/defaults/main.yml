@@ -17,6 +17,15 @@ claude_box_source: "{{ playbook_dir }}/docker-compose/muster/"
 # containers simply run with this numeric id, so the bind-mounted data dirs must be owned by it.
 claude_box_uid: 1000
 
+# Where this stack's CONFIG files live, relative to claude_box_dir. Default `.` — beside compose.yml.
+# Set it (e.g. `conf`) to keep the stack root tidy; it covers `mounts`, `service-env`, `box-env`,
+# `port-forwards`, `claude-settings.json`, `hub-services/` and `git-identity/`.
+#
+# IT MUST MATCH MUSTER_CONF_DIR IN THE COMPOSE ENV FILE, which is the caller's template — compose can
+# only learn the variable from `.env`, so the two say the same thing in two places. The role asserts
+# they agree rather than leaving you to find out from a hub whose mounts are all empty directories.
+claude_box_conf_dir: "."
+
 # The compose env file. It is templated by the caller (it carries the vault-backed tokens) and `.env`
 # is symlinked to it so `docker compose` picks it up from the project dir automatically. Named after
 # the project rather than `.env` so it is greppable and can be templated with a sane mode.

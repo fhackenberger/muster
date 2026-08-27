@@ -17,7 +17,18 @@ set -euo pipefail
 # stack's definition rather than of this project's environment.
 
 cd "$(dirname "$0")"
-MOUNTS="${1:-mounts}"
+# MUSTER_CONF_DIR (from .env, relative to the stack dir, default `.`) moves the config files into a
+# subdirectory. Read here too, or Ansible's bare `./gen-hub-mounts.sh` would look for `mounts` in the
+# root of a stack that keeps it in conf/ and abort — which is exactly when the hub loses every
+# project mount. The OUTPUT stays put: compose auto-loads compose.override.yml from the project
+# directory, so moving it would silently drop the hub's half of the table.
+#
+# .env is not sourced (it may hold quoted values, and this script must not execute it): the variable
+# is read out of it, and an explicit $1 still wins.
+if [ -z "${MUSTER_CONF_DIR:-}" ] && [ -f .env ]; then
+	MUSTER_CONF_DIR="$(sed -n 's/^[[:space:]]*MUSTER_CONF_DIR[[:space:]]*=[[:space:]]*//p' .env | tail -1 | tr -d "\"'" )"
+fi
+MOUNTS="${1:-${MUSTER_CONF_DIR:-.}/mounts}"
 OUT="${2:-compose.override.yml}"
 
 [ -f "$MOUNTS" ] || { echo "gen-hub-mounts: no $MOUNTS here" >&2; exit 1; }

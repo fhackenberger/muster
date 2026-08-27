@@ -103,14 +103,28 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/box/") and path.endswith("/dirty"):
             n = path[len("/box/"):-len("/dirty")]
             st = BOX_STATE.get(n, {})
+            # A BOX WITH NO CONTAINER ANSWERS 200 AND SAYS NOTHING. The real broker's box_dirty
+            # execs into the container; when that fails — which for a retired box it always does —
+            # it returns reachable:false with an EMPTY dirty list and an EMPTY head. Modelled here
+            # because the hub used to read those two blanks as "clean" and "the broker is old", and
+            # waved a retired box through a move that deleted the layer its work was in.
+            if n not in BOXES:
+                return self._reply(200, {"box": n, "reachable": False, "dirty": [], "head": "",
+                                         "error": f"No such container: box-test-{n}"})
             return self._reply(200, {"box": n, "reachable": True,
                                      "dirty": st.get("dirty", BOXES.get(n, {}).get("dirty", [])),
                                      "head": st.get("head", "")})
         if path == "/golden":
             cur = current_golden()
             in_use = {}
+            # LIVE AND RETIRED BOTH HOLD A GOLDEN. The real list_goldens walks the box DIRECTORIES,
+            # and `kill` keeps a box's directory on purpose — so a retired box still pins the golden
+            # it was overlaid on, and `retire` still has to deal with it. Counting only live boxes
+            # here made the whole retired-box path untestable, which is where its bugs were.
             for n, b in BOXES.items():
                 in_use.setdefault(b["golden"], []).append(n)
+            for n, g in RETIRED.items():
+                in_use.setdefault(g, []).append(n)
             out = []
             for d in sorted(os.listdir(GOLDEN or ".")):
                 p = os.path.join(GOLDEN, d)
@@ -136,7 +150,7 @@ class H(BaseHTTPRequestHandler):
             os.replace(tmp, link)
             return self._reply(200, {"sealed": gid})
         if path == "/golden/reap":
-            keep = {b["golden"] for b in BOXES.values()} | {current_golden()}
+            keep = {b["golden"] for b in BOXES.values()} | set(RETIRED.values()) | {current_golden()}
             gone = []
             for e in sorted(os.listdir(GOLDEN or ".")):
                 if e == "current" or e in keep or not e.startswith("g-"):
@@ -144,6 +158,17 @@ class H(BaseHTTPRequestHandler):
                 shutil.rmtree(os.path.join(GOLDEN, e))
                 gone.append(e)
             return self._reply(200, {"reaped": gone})
+        # Re-point a RETIRED box at the current golden without docker: the real broker deletes its
+        # upper layers and rewrites its `golden` file. Refuses while a container exists — the running
+        # box would keep its old mount and the file would already be lying.
+        if path.endswith("/rebase-golden"):
+            n = path[len("/box/"):-len("/rebase-golden")]
+            if n in BOXES:
+                return self._reply(409, {"error": f"{n!r} still has a container — it is not retired."})
+            if n not in RETIRED:
+                return self._reply(409, {"error": f"no box directory for {n!r}"})
+            RETIRED[n] = current_golden()
+            return self._reply(200, {"box": n, "golden": current_golden(), "freed": 4321})
         if path == "/forwards" or path.startswith("/forwards/"):
             return self._reply(200, {"forwards": sorted(BOXES)})
         # Recreating respawns a box on whatever golden is CURRENT — which is the whole mechanism behind
@@ -169,6 +194,11 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/box/") and "/migrate/" in path:
             rest = path[len("/box/"):]
             n, _, action = rest.partition("/migrate/")
+            # The real broker allowlists the action, because it becomes argv inside the box. Mirrored
+            # here so a hub that asks for an action the broker does NOT have fails loudly in the
+            # tests, instead of collecting a cheerful 200 from a stub that accepts anything.
+            if action not in ("stash", "apply", "apply-keep-golden", "list"):
+                return self._reply(400, {"ok": False, "error": f"bad migrate action {action!r}"})
             st = BOX_STATE.get(n, {})
             if st.get("migrate_fails"):
                 return self._reply(500, {"ok": False, "error": "pretend the patch did not apply"})
@@ -186,7 +216,11 @@ class H(BaseHTTPRequestHandler):
                 return self._reply(400, {"error": f"box name {n!r} is {len(n)} characters; the limit "
                                                   f"is {limit} for project 'test', because the "
                                                   f"container's hostname (box-test-<name>) must fit in 63"})
-            BOXES[n] = {"golden": current_golden(),
+            # RESURRECTING A RETIRED BOX PUTS IT BACK ON ITS OWN GOLDEN, not on whatever is current:
+            # its directory and upper layer were kept, and an upper layer is only coherent on the
+            # lower layer it was computed against (create_box -> recorded_golden in the broker). So a
+            # box you bring back is still behind, and `golden migrate` is still what moves it.
+            BOXES[n] = {"golden": RETIRED.pop(n, "") or current_golden(),
                         "base": self._param("base") or "", "merge": self._param("merge") or "",
                         "dirty": []}
             return self._reply(201, {"box": n, "container": f"box-test-{n}",

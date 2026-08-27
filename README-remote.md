@@ -90,6 +90,8 @@ cp path/to/myapp/docker-claude/port-forwards.example port-forwards
 cp -r path/to/myapp/docker-claude/hub-services.example hub-services  # YOUR dev services
                                                                      # (pinchtab is built in)
 mkdir -p data/{repo,golden,golden-staging,claude,boxes} data/pinchtab git-identity
+                        # (all of the config files above can live in a subdirectory instead —
+                        #  see MUSTER_CONF_DIR below)
 chown -R 1000:1000 data                                 # boxes + hub run as uid 1000
 $EDITOR .env            # set PROJECT_NAME, STACK_DIR=$(pwd), REPO_URL, tokens, API keys
 ```
@@ -263,6 +265,35 @@ COMPOSE_FILE=compose.yml:compose.project.yml:compose.override.yml
 `compose.override.yml` — the file `gen-hub-mounts.sh` renders the hub's half of the `mounts` table
 into. Leave it out and the hub starts with no `~/.npm`, `~/.gradle` or `~/.m2` at all, and the only
 symptom is a `MOUNT DRIFT` line in its boot log.
+
+### Keeping the stack root tidy: `MUSTER_CONF_DIR`
+
+By default every config file sits beside `compose.yml`. `MUSTER_CONF_DIR` in `.env` — a path relative
+to the stack dir — moves them into a subdirectory:
+
+```sh
+MUSTER_CONF_DIR=conf
+```
+
+It covers `mounts`, `service-env`, `box-env`, `port-forwards`, `claude-settings.json`,
+`hub-services/` and `git-identity/`. Unset, nothing changes: the paths render byte-for-byte as they
+always did, so an existing stack needs no migration.
+
+Three files **cannot** move, and it is worth knowing why rather than trying:
+
+| | |
+|---|---|
+| `.env` | compose reads it from the project directory — it is where this variable is *learned* |
+| `compose.override.yml` | compose auto-loads it from the project directory (or `COMPOSE_FILE` names it) |
+| `compose.project.yml` | likewise |
+
+`./data` does not move either: it is state, not configuration.
+
+Changing it is a `docker compose up -d` followed by `cbx recreate all` — mounts and env are fixed at
+container creation. Deploying with Ansible, set the role's `claude_box_conf_dir` to the same value;
+they are two separate places saying the same thing (compose can only learn the variable from `.env`),
+so the role refuses to run when they disagree rather than leaving you with a hub whose mounts are all
+empty directories docker invented.
 
 Then:
 
@@ -1285,9 +1316,10 @@ because an upper layer is only coherent on the lower layer it was computed again
 ### Carrying uncommitted work across: `golden migrate`
 
 ```sh
-muster golden migrate work1          # one box
-muster golden migrate --all          # every box that can go
+muster golden migrate work1              # one box
+muster golden migrate --all              # every box that is UP and behind
 muster golden migrate work1 --dry-run
+muster golden migrate --all --golden-wins  # …resolving every collision in the golden's favour
 ```
 
 Moving a box is unavoidably a fresh upper layer, so the work travels as a **patch**:
@@ -1303,8 +1335,54 @@ Moving a box is unavoidably a fresh upper layer, so the work travels as a **patc
 
 Before any of that, it prints what is coming across and **warns where those paths overlap the new
 golden's own uncommitted files** — `golden snapshot` bakes the hub's dirty tree into every golden on
-purpose, so that overlap is real and worth seeing before the merge rather than after. Non-interactive
-it skips such a box; `--force` takes it anyway.
+purpose, so that overlap is real and worth seeing before the merge rather than after.
+
+That warning comes with three answers:
+
+| | |
+|---|---|
+| `y` | three-way merge the two versions (`git apply -3`) — conflict markers if they disagree |
+| `g` | keep the **golden's** version of the colliding paths, drop the agent's |
+| `N` | skip this box entirely |
+
+`g` is usually right. These collisions are the golden's own setup work, and the agent is normally
+carrying a stale copy of a file you have since changed by hand — merging the two produces markers you
+resolve by taking the golden's side anyway. Neither answer loses anything: the stash is never
+deleted, so the agent's version stays in `~/keep/.migrate/<id>`.
+
+Non-interactively a colliding box is skipped; `--force` answers `y` for all of them and
+`--golden-wins` answers `g`.
+
+**`--all` only reaches boxes that are up.** A retired box (killed, directory kept) has no container,
+so there is nothing to read its working tree out of — it stays where it is, and `migrate` lists the
+ones it left behind rather than reporting a number that reads as "everything moved". Bring one back
+with `muster box <name>` — it returns on its own golden with its upper layer intact — and migrate it
+then. A box already on the current golden is skipped rather than recreated for nothing.
+
+### Moving killed boxes: `--discard-retired`
+
+```sh
+muster golden migrate --all --discard-retired --dry-run   # what would be dropped
+muster golden migrate --all --discard-retired
+```
+
+When dozens of retired boxes pin a golden you want gone, resurrecting each one to move it is not a
+plan. This moves them **without starting anything**: a box is an overlay whose mount options are
+fixed at container-create time, so for a box that has *no* container the only things tying it to its
+old golden are one file and the existence of its upper layer. The broker deletes the layer, rewrites
+the file, and the next `muster box <name>` assembles the overlay on the current golden. No docker at
+all — and it refuses while a container exists, since a running box would keep its old mount while the
+file already said otherwise.
+
+It is destructive by definition: nothing can be carried out of a box that nothing can talk to.
+
+| | |
+|---|---|
+| **gone** | every uncommitted file; every commit the box never handed off (its `.git` is in that layer) |
+| **kept** | `~/keep`, the box's name and branch, its claude session, and anything it pushed to `refs/agents/<box>` |
+
+`golden reap` runs at the end of `migrate`, so the golden they were holding is freed in the same
+command.
 
 **It cannot carry commits.** They live in `.git`, which is inside the layer being discarded, and
 nothing outside the box has them until `handoff` pushes `refs/agents/<box>`. A box with unpushed

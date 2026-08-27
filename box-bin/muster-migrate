@@ -3,9 +3,11 @@ set -euo pipefail
 
 # muster-migrate — carry a box's UNCOMMITTED work across a change of golden.
 #
-#   muster-migrate stash <id>     capture the working tree into ~/keep/.migrate/<id>
-#   muster-migrate apply <id>     put it back, after the box has been recreated
-#   muster-migrate list <id>      what a stash holds (one path per line), without applying it
+#   muster-migrate stash <id>              capture the working tree into ~/keep/.migrate/<id>
+#   muster-migrate apply <id>              put it back, after the box has been recreated
+#   muster-migrate apply-keep-golden <id>  …but on a path the NEW GOLDEN also carries uncommitted,
+#                                          keep the golden's version and drop the agent's
+#   muster-migrate list <id>               what a stash holds (one path per line), without applying it
 #
 # Run by the broker (docker exec) on behalf of `muster golden migrate`; there is no reason to type it
 # by hand, and doing so around a recreate you are not driving will only confuse the box.
@@ -37,7 +39,7 @@ KEEP="${MUSTER_KEEP:-/home/dev/keep}"
 die() { echo "muster-migrate: $*" >&2; exit 1; }
 
 cmd="${1:-}"; id="${2:-}"
-[ -n "$cmd" ] && [ -n "$id" ] || die "usage: muster-migrate stash|apply|list <id>"
+[ -n "$cmd" ] && [ -n "$id" ] || die "usage: muster-migrate stash|apply|apply-keep-golden|list <id>"
 case "$id" in
 	*/*|..*|"") die "bad stash id '$id'" ;;
 esac
@@ -75,25 +77,60 @@ list)
 	cat "$dir/files"
 	;;
 
-apply)
+apply|apply-keep-golden)
 	[ -d "$dir" ] || die "no stash '$id' in $KEEP/.migrate"
 	rc=0
+	excl=()
+	: > "$dir/dropped"
+	if [ "$cmd" = apply-keep-golden ]; then
+		# THE GOLDEN'S OWN UNCOMMITTED FILES, read from right here. `golden snapshot` bakes the hub's
+		# dirty tree into every golden on purpose — it is how local setup work reaches the boxes — so
+		# immediately after a recreate this checkout is already dirty before the agent has touched
+		# anything, and THAT dirt is the golden's version of those paths. A path the stash also
+		# carries is the collision `golden migrate` warns about; this mode resolves it by keeping the
+		# golden's copy and dropping the agent's, rather than three-way merging the two.
+		#
+		# Computed HERE and not passed in: the hub would have to hand over a path list, and a fixed
+		# `docker exec muster-migrate <action> <id>` with no user-controlled arguments is the whole
+		# reason this script exists as a script.
+		{
+			git -C "$REPO" diff HEAD --name-only
+			git -C "$REPO" ls-files --others --exclude-standard
+		} | sed '/^$/d' | sort -u > "$dir/golden-dirty"
+		comm -12 "$dir/files" "$dir/golden-dirty" > "$dir/dropped"
+		while IFS= read -r p; do
+			[ -n "$p" ] || continue
+			excl+=(--exclude="$p")
+		done < "$dir/dropped"
+	fi
+	# A stash whose every path collides leaves --exclude with nothing to do; `git apply` treats that as
+	# success, so it needs no special case (tested).
 	if [ -s "$dir/changes.patch" ]; then
 		# -3 so git can fall back to a real three-way merge when the file also changed in the new
 		# golden: that leaves conflict markers you can resolve, instead of refusing the whole patch.
 		# It needs the pre-image blobs, which the new golden has whenever the two snapshots share
 		# history — the normal case, and the reason `base` above is recorded for when they do not.
-		git -C "$REPO" apply -3 "$dir/changes.patch" || rc=$?
+		git -C "$REPO" apply -3 ${excl[@]+"${excl[@]}"} "$dir/changes.patch" || rc=$?
 	fi
 	if [ -s "$dir/untracked.tar" ]; then
 		# Untracked files are new by definition, so there is nothing to merge — but do NOT overwrite
 		# something the new golden introduced under the same name. --keep-old-files leaves those and
 		# reports them; the agent's copy stays in the stash, which is not deleted.
+		#
+		# This is also why apply-keep-golden needs no --exclude here: every colliding path EXISTS in
+		# the working tree (that is what made it collide), so --keep-old-files already leaves the
+		# golden's copy alone.
 		tar -C "$REPO" --keep-old-files -xf "$dir/untracked.tar" 2>&1 | sed 's/^/muster-migrate: /' >&2 || true
 	fi
 	[ "$rc" = 0 ] || die "the patch did not apply cleanly (kept at $dir — resolve, then delete it)"
-	echo "applied $(wc -l < "$dir/files" | tr -d ' ') path(s) from $id"
+	echo "applied $(( $(wc -l < "$dir/files") - $(wc -l < "$dir/dropped") )) path(s) from $id"
+	if [ -s "$dir/dropped" ]; then
+		# Named, not counted: "3 files dropped" is unactionable, and the agent's version of each of
+		# these is still in the stash, which is never deleted.
+		echo "kept the GOLDEN's version of $(wc -l < "$dir/dropped" | tr -d ' ') colliding path(s) — the agent's is still in $dir:"
+		sed 's/^/  /' "$dir/dropped"
+	fi
 	;;
 
-*) die "unknown command '$cmd' (stash|apply|list)" ;;
+*) die "unknown command '$cmd' (stash|apply|apply-keep-golden|list)" ;;
 esac

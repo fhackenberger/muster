@@ -236,6 +236,182 @@ test_hub_completion() {
 	OUT=""
 }
 
+# EVERY WORD THE CLI DISPATCHES ON HAS TO TAB-COMPLETE — not "the ones somebody remembered". A
+# completion list is written once and then never looked at again, and one that is four-sixths right
+# is indistinguishable from one that works: you type `cbx golden mig<TAB>`, nothing happens, and you
+# conclude you have the name wrong. `golden migrate` and `golden retire` were missing for months for
+# exactly that reason, behind a hand-kept "snapshot seal ls reap".
+#
+# So: read the dispatch out of the CLI, drive the completion function the way bash does, and compare.
+# Nothing below names `golden` — the nested cases are discovered, so a second command that dispatches
+# again is covered the day it is written rather than the day someone remembers this file.
+
+# The top-level commands. Same parse as test_help_covers_every_command, and `[a-z|]` rather than
+# `[a-z|-]` on purpose: it must not match the `-h|--help|help)` arm.
+dispatch_commands() {
+	awk '/^cmd="\$\{1:-\}"/,0' "$MUSTER_BIN" \
+		| sed -n 's/^[[:space:]]*\([a-z|]*\))[[:space:]].*/\1/p' | tr '|' '\n' | grep . | sort -u
+}
+
+# Commands whose dispatch arm opens a `case "$sub" in` of its own — the arm is a bare `name)` on its
+# own line, and the nested case follows within it.
+dispatch_parents() {
+	awk '/^cmd="\$\{1:-\}"/,0' "$MUSTER_BIN" | awk '
+		/^[[:space:]]*[a-z|-]+\)[[:space:]]*$/ {
+			par = $0; sub(/^[[:space:]]*/, "", par); sub(/\).*/, "", par); next
+		}
+		/case "\$sub" in/ && par != "" { print par; par = "" }'
+}
+
+dispatch_subcommands() {                 # dispatch_subcommands <parent>
+	awk -v p="$1" '
+		$0 ~ "^[[:space:]]*" p "\\)[[:space:]]*$" { inparent = 1; next }
+		inparent && /case "\$sub" in/ { insub = 1; next }
+		insub && /esac/ { exit }
+		insub' "$MUSTER_BIN" \
+		| sed -n 's/^[[:space:]]*\([a-z|]*\))[[:space:]].*/\1/p' | tr '|' '\n' | grep . | sort -u
+}
+
+test_hub_completion_covers_every_subcommand() {
+	fixture
+	local parents missing offered p
+	parents="$(dispatch_parents)"
+	# If this ever comes back empty the parser above has rotted, and every assertion below would pass
+	# by testing nothing at all.
+	[ -n "$parents" ] || fail "no nested 'case \"\$sub\" in' found in the CLI — the parser is broken, not the CLI"
+	OUT="$(MUSTER_PREFIX=cbx PARENTS="$parents" bash -c '
+		PATH="'"$(dirname "$MUSTER_BIN")"'":$PATH
+		source "'"$ROOT"'/hub/muster-completion.bash"
+		try() { COMP_WORDS=("$@"); COMP_CWORD=$(( $# - 1 )); COMPREPLY=(); _muster_complete; echo "${COMPREPLY[*]}"; }
+		echo "TOP: $(try muster "")"
+		for p in $PARENTS; do echo "SUB $p: $(try muster "$p" "")"; done
+		echo "SUBFLAGS: $(try muster golden migrate --)"
+		echo "PARENTFLAGS: $(try muster golden --)"
+	' 2>&1)"; RC=$?
+	ok
+	offered="$(printf '%s\n' "$OUT" | sed -n 's/^TOP: //p' | tr ' ' '\n' | grep . | sort -u)"
+	missing="$(comm -23 <(dispatch_commands) <(printf '%s\n' "$offered"))"
+	eq "$missing" "" "these commands are in the dispatch case but do not tab-complete"
+	for p in $parents; do
+		offered="$(printf '%s\n' "$OUT" | sed -n "s/^SUB $p: //p" | tr ' ' '\n' | grep . | sort -u)"
+		missing="$(comm -23 <(dispatch_subcommands "$p") <(printf '%s\n' "$offered"))"
+		eq "$missing" "" "these '$p' subcommands do not tab-complete"
+	done
+	# And the reason it went stale: a literal word list. Every -W in the hub's completion must be a
+	# substitution that reads the CLI or the filesystem. (muster.bash_aliases is exempt and tested
+	# separately — the laptop cannot read the hub's source, so its literals are a documented
+	# cold-cache floor underneath the list the hub sends.)
+	# A SUBCOMMAND'S FLAGS ARE ON THE SUBCOMMAND'S HELP LINE, not the parent's. Matching the parent
+	# alone offers `golden snapshot`'s --prep for every `golden <anything> --<TAB>`, which is worse
+	# than offering nothing: it is a flag that command does not take.
+	case "$OUT" in
+		*"SUBFLAGS: "*--golden-wins*) ;;
+		*) fail "golden migrate --<TAB> must offer ITS flags, not the parent's" "$OUT" ;;
+	esac
+	case "$(printf '%s\n' "$OUT" | sed -n 's/^SUBFLAGS: //p')" in
+		*--prep*) fail "golden migrate --<TAB> offered --prep, which belongs to golden snapshot" ;;
+	esac
+	# …and the parent's own flags still complete when no subcommand has been typed yet.
+	case "$OUT" in
+		*"PARENTFLAGS: "*--*) ;;
+		*) fail "golden --<TAB> should still offer the parent's flags" "$OUT" ;;
+	esac
+
+	local literal
+	literal="$(grep -n 'compgen -W "[^$]' "$ROOT/hub/muster-completion.bash" || true)"
+	eq "$literal" "" "hard-coded completion word list in hub/muster-completion.bash — derive it from the CLI instead"
+	OUT=""
+}
+
+# MUSTER_CONF_DIR moves this stack's config files out of the stack root (mounts, service-env,
+# box-env, port-forwards, claude-settings.json, hub-services/, git-identity/) into a subdirectory,
+# so the root can hold compose.yml and little else. Relative to the stack dir, default `.`.
+#
+# THE FAILURE MODE IS SILENT, which is why this is tested by enumeration rather than by example. A
+# config path left hard-coded in compose.yml does not error: docker CREATES a missing bind-mount
+# source as an empty directory. So the hub comes up with an empty mounts table, no service manifests
+# and no git identity, and nothing anywhere says why. A new config file added later is exactly when
+# that happens, so the test names the files rather than trusting the diff.
+CONF_FILES="mounts service-env box-env port-forwards claude-settings.json hub-services git-identity"
+
+test_conf_dir_covers_every_config_file() {
+	local f bad="" nl=$'\n'
+	exists "$ROOT/compose.yml" || return 0
+	# Each of these must be reached through ${MUSTER_CONF_DIR} wherever compose names it — both as
+	# a bind-mount source (`./x`) and as a host path for the broker (`${STACK_DIR}/x`).
+	# Only HOST-side paths: a bind-mount source (`- ./x`) or a host path handed to the broker
+	# (`${STACK_DIR}/x`). The mount TARGETS are in-container paths — /work/mounts,
+	# /home/dev/.gitidentity — and they must NOT move, so matching on the bare filename would flag
+	# exactly the lines that are already right.
+	while IFS= read -r line; do
+		for f in $CONF_FILES; do
+			case "$line" in *"/$f"*) ;; *) continue ;; esac
+			case "$line" in
+				*MUSTER_CONF_DIR*) ;;
+				*) bad="$bad$nl  $f: $line" ;;
+			esac
+		done
+	done < <(grep -E '^[[:space:]]*(-[[:space:]]*\./|[A-Z_]+:[[:space:]]*\$\{STACK_DIR\}/)' "$ROOT/compose.yml")
+	eq "$bad" "" "these config paths in compose.yml are not behind MUSTER_CONF_DIR — with the config in a subdirectory docker will invent them as EMPTY DIRECTORIES and the hub will start with nothing"
+	# `:+`, not `:-.`. Both work, but the `:+` form contributes the separator only when the variable
+	# is set, so the DEFAULT rendering is byte-for-byte what it always was — no /srv/stack/./mounts
+	# in every broker env var for the overwhelming majority of stacks that never set this.
+	OUT="$(grep -c 'MUSTER_CONF_DIR:+${MUSTER_CONF_DIR}/' "$ROOT/compose.yml")"
+	[ "$OUT" -ge 9 ] || fail "expected every config path to carry the :+ form, found $OUT"
+	OUT=""
+	# The three that CANNOT move, because compose reads them from the project directory itself — .env
+	# is where the variable is learned in the first place. Documented where the reader is.
+	OUT="$(cat "$ROOT/compose.yml")"
+	has "MUSTER_CONF_DIR"
+	has "compose.override.yml    compose auto-loads it"
+	OUT=""
+	# …and the knob is documented in the file people copy.
+	OUT="$(cat "$ROOT/.env.example")"
+	has "MUSTER_CONF_DIR"
+	OUT=""
+}
+
+# gen-hub-mounts.sh runs on the server as a bare `./gen-hub-mounts.sh` (Ansible does exactly that,
+# right after templating `mounts`), so it has to find the table wherever MUSTER_CONF_DIR put it. If
+# it does not, it aborts — and the hub then keeps whatever compose.override.yml said last, which is
+# the stale-mounts failure the hub's boot-time MOUNT DRIFT warning exists for.
+test_gen_hub_mounts_follows_the_conf_dir() {
+	local d="$FIX/genconf"
+	rm -rf "$d"; mkdir -p "$d/conf"
+	cp "$ROOT/gen-hub-mounts.sh" "$d/"
+	printf './cache .cache rw rw\n' > "$d/conf/mounts"
+	printf 'MUSTER_CONF_DIR=conf\n' > "$d/.env"
+
+	OUT="$(cd "$d" && ./gen-hub-mounts.sh 2>&1)"; RC=$?
+	ok
+	exists "$d/compose.override.yml"
+	OUT="$(cat "$d/compose.override.yml")"
+	has "/home/dev/.cache"
+	OUT=""
+
+	# The OUTPUT does not move with it: compose auto-loads compose.override.yml from the project
+	# directory, so rendering it into conf/ would silently drop the hub's half of the mounts table.
+	absent "$d/conf/compose.override.yml"
+
+	# An explicit argument still wins over the variable — Ansible passes none, but a person debugging
+	# one table against another does.
+	printf './other .other rw rw\n' > "$d/elsewhere"
+	OUT="$(cd "$d" && ./gen-hub-mounts.sh elsewhere 2>&1)"; RC=$?
+	ok
+	OUT="$(cat "$d/compose.override.yml")"
+	has "/home/dev/.other"
+	OUT=""
+
+	# …and with no variable and no argument it is the plain root `mounts`, exactly as before.
+	rm -f "$d/.env"
+	printf './root .root rw rw\n' > "$d/mounts"
+	OUT="$(cd "$d" && env -u MUSTER_CONF_DIR ./gen-hub-mounts.sh 2>&1)"; RC=$?
+	ok
+	OUT="$(cat "$d/compose.override.yml")"
+	has "/home/dev/.root"
+	OUT=""
+}
+
 # THE IMAGE NAME IS A CONTRACT ACROSS TWO REPOSITORIES. A consumer pins muster as a submodule and
 # asks GHCR for `git describe` of the commit it pinned; this workflow has to name the image the same
 # way, or the consumer 404s on a server long after everything here looked green. Only muster's half
@@ -506,15 +682,24 @@ test_golden_migrate() {
 
 	STUB_LOG="$FIX/stub7.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
 		STUB_PORT="$port" \
-		STUB_BOX_STATE="{\"carry\": {\"dirty\": [\" M b.txt\"], \"head\": \"$ahead\"}, \"clash\": {\"dirty\": [\" M a.txt\"], \"head\": \"$ahead\"}, \"unpushed\": {\"head\": \"0000000000000000000000000000000000000000\"}}" \
+		STUB_BOX_STATE="{\"carry\": {\"dirty\": [\" M b.txt\"], \"head\": \"$ahead\"}, \"clash\": {\"dirty\": [\" M a.txt\"], \"head\": \"$ahead\"}, \"clash2\": {\"dirty\": [\" M a.txt\"], \"head\": \"$ahead\"}, \"unpushed\": {\"head\": \"0000000000000000000000000000000000000000\"}}" \
 		python3 "$HERE/stub-broker.py" & pid=$!
 	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
 	export BROKER_URL="http://127.0.0.1:$port"
+
+	# THE BOXES ARE SPAWNED FIRST, THEN THE GOLDEN IS TAKEN. That order is the whole scenario: a box
+	# you migrate is BEHIND the current golden by definition. Spawning them after the snapshot put
+	# them on it, and then "migrate" is a question with no content — which is how this test used to
+	# read, and it hid the fact that the command recreated boxes that had nowhere to go.
+	cbx box unpushed >/dev/null 2>&1
+	cbx box carry    >/dev/null 2>&1
+	cbx box clash    >/dev/null 2>&1
+	cbx box clash2   >/dev/null 2>&1
+	cbx box settled  >/dev/null 2>&1
 	cbx golden snapshot >/dev/null 2>&1                # a golden that carries the hub's dirty a.txt
 
 	# 1. A box with commits nobody has: refused, because a patch cannot carry commits. Finding that
 	#    out AFTER the recreate would be the worst possible moment.
-	cbx box unpushed >/dev/null 2>&1
 	cbx golden migrate unpushed
 	has "never seen"
 	has "handoff in the box first"
@@ -522,29 +707,314 @@ test_golden_migrate() {
 
 	# 2. The ordinary case: stash, recreate FRESH, apply — in that order. The order is the whole
 	#    correctness argument: capture before the layer is deleted, re-apply after.
-	cbx box carry >/dev/null 2>&1
 	cbx golden migrate carry
 	ok
 	has "carrying"
 	has "b.txt"
 	stub_order "$FIX/stub7.log" "/box/carry/migrate/stash" "/recreate/carry?fresh=1" "/box/carry/migrate/apply"
 
+	# …and having arrived, it is not moved again. A recreate costs a container and a cold cache, and
+	# `--all` on a settled stack would otherwise pay that for every box, every time.
+	: > "$FIX/stub7.log"
+	cbx golden migrate carry
+	ok
+	has "already on the current golden"
+	grep -q '"/recreate/carry' "$FIX/stub7.log" && fail "a box already on the current golden was recreated anyway"
+
 	# 3. A path that is ALSO uncommitted in the new golden. Non-interactive and no --force: skipped,
 	#    and named — this collision is what the command exists to show you before it happens.
-	cbx box clash >/dev/null 2>&1
 	cbx golden migrate clash
 	has "ALSO uncommitted in the new golden"
 	has "a.txt"
 	has "skipped"
 	grep -q '"/recreate/clash' "$FIX/stub7.log" && fail "a clashing box was moved without being asked"
 
-	# …and --force takes it across anyway.
-	cbx golden migrate clash --force
+	# …--golden-wins answers it without a tty, and answers it by DROPPING the colliding path rather
+	# than three-way merging it: a different endpoint, which the stub allowlists exactly like the
+	# broker does, so asking for one that does not exist is a failure and not a shrug.
+	: > "$FIX/stub7.log"
+	cbx golden migrate clash --golden-wins
 	ok
-	grep -q '"/recreate/clash' "$FIX/stub7.log" || fail "--force did not move the clashing box"
+	grep -q '"/box/clash/migrate/apply-keep-golden' "$FIX/stub7.log" \
+		|| fail "--golden-wins must apply with the golden's version of the colliding paths"
+
+	# …and --force still means "merge them", which is the OTHER answer and must not silently become
+	# the drop. These two resolve the same collision in opposite directions.
+	: > "$FIX/stub7.log"
+	cbx golden migrate clash2 --force
+	ok
+	grep -q '"/recreate/clash2' "$FIX/stub7.log" || fail "--force did not move the clashing box"
+	grep -q '"/box/clash2/migrate/apply?' "$FIX/stub7.log" \
+		|| fail "--force must MERGE the collision (plain apply), not drop it"
+
+	# 4. --ALL ONLY REACHES BOXES THAT ARE UP, and has to say so. A retired box has no container, so
+	#    its working tree cannot be read out of it — it stays on its old golden, and `golden ls` was
+	#    the only place that ever admitted it. "migrated N" over a stack still sitting on a month-old
+	#    base reads as "everything moved".
+	cbx kill settled >/dev/null 2>&1
+	: > "$FIX/stub7.log"
+	cbx golden migrate --all
+	ok
+	has "NOT migrated"
+	has "settled"
+	grep -q '"/recreate/settled' "$FIX/stub7.log" && fail "a retired box has no container to migrate"
 
 	unset BROKER_URL
 	kill "$pid" 2>/dev/null
+}
+
+# MOVING A KILLED BOX WITHOUT STARTING IT. The problem `--discard-retired` solves: a stack with dozens
+# of retired boxes pinning a months-old golden, which cannot be reaped while anything references it.
+# Every other route needs a container — `recreate --fresh` destroys and builds one, `golden migrate`
+# has to read the working tree out of one — so freeing that golden meant resurrecting forty agents,
+# each with a claude session and a port slot, to tell them nothing.
+#
+# But a box is an overlay, and the mount options are fixed when the container is created. For a box
+# that HAS no container, "which golden am I on" is one file and "why can my layer not go there" is
+# that the layer exists. Delete the layer, rewrite the file: no docker at all, and the next
+# `box <name>` assembles the overlay on the current golden.
+#
+# It is destructive by definition — nothing can be carried out of a box nothing can talk to — so it
+# is opt-in, and the flag says what it costs in its own name.
+test_migrate_discards_retired_boxes_without_starting_them() {
+	fixture
+	local port pid g1
+	port=$(( STUB_PORT + 9 ))
+	STUB_LOG="$FIX/stub9.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" \
+		STUB_BOX_STATE="{\"gone\": {\"head\": \"0000000000000000000000000000000000000000\"}, \"alsogone\": {\"head\": \"0000000000000000000000000000000000000000\"}}" \
+		python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+
+	cbx golden snapshot >/dev/null 2>&1          # g1
+	cbx box gone        >/dev/null 2>&1
+	cbx box alsogone    >/dev/null 2>&1
+	cbx box live        >/dev/null 2>&1
+	cbx golden ls
+	g1="$(printf '%s\n' "$OUT" | sed -n 's/^ *\(g-[0-9-]*\) .*/\1/p' | head -1)"
+	[ -n "$g1" ] || fail "could not read the first golden's id" "$OUT"
+	cbx golden snapshot >/dev/null 2>&1          # g2 — the unpushed pair are left behind on g1
+	cbx kill gone     >/dev/null 2>&1
+	cbx kill alsogone >/dev/null 2>&1
+
+	# --dry-run first: it must say what it would drop and touch nothing.
+	: > "$FIX/stub9.log"
+	cbx golden migrate --all --discard-retired --dry-run
+	ok
+	has "would be reset"
+	grep -q '"/box/gone/rebase-golden' "$FIX/stub9.log" && fail "--dry-run moved a box"
+
+	: > "$FIX/stub9.log"
+	cbx golden migrate --all --discard-retired
+	ok
+	has "reset 2 retired box(es)"
+	# NO CONTAINER IS INVOLVED. That is the whole point — recreating them would have been possible all
+	# along, and is exactly what makes this unusable for forty boxes.
+	grep -q '"/box/gone/rebase-golden' "$FIX/stub9.log" || fail "the retired box was not reset onto the current golden"
+	grep -q '"/recreate/' "$FIX/stub9.log" && fail "--discard-retired must not start or recreate anything"
+	grep -q '/migrate/stash' "$FIX/stub9.log" && fail "there is nothing to stash out of a box with no container"
+
+	# …and now nothing references g1, so it can be freed. This is the outcome the whole command is
+	# for: `golden reap` runs at the end of migrate, and g1 goes.
+	#
+	# ANCHORED, not `hasnt "$g1"`. Two snapshots in the same second are "g-<ts>" and "g-<ts>-2", so
+	# the second id CONTAINS the first and a substring check fails whenever the suite runs fast
+	# enough — which it does, intermittently, and only in a full run.
+	cbx golden ls
+	printf '%s\n' "$OUT" | grep -qE "^ +$g1 " \
+		&& fail "$g1 should have been reaped once nothing referenced it" "$OUT"
+
+	# THE GUARD. A box that still has a container must NOT take this path: its mount is fixed until
+	# something recreates it, so rewriting the pointer would leave the file lying about where it is.
+	: > "$FIX/stub9.log"
+	cbx golden migrate live --discard-retired
+	hasnt "reset onto"
+	grep -q '"/box/live/rebase-golden' "$FIX/stub9.log" && fail "a running box must not be moved by bookkeeping"
+
+	unset BROKER_URL
+	kill "$pid" 2>/dev/null
+}
+
+# A BOX THAT IS NOT RUNNING ANSWERS NOTHING, AND NOTHING IS NOT "CLEAN".
+#
+# The broker's box_dirty execs into the container; when that fails it still replies 200, with
+# {"reachable": false, "dirty": [], "head": ""}. For a RETIRED box the exec always fails — there is
+# no container — so the hub read the empty dirty list as "this box has no uncommitted work" and the
+# empty head as "VERSION DRIFT: the broker is older than this CLI", and `golden retire`'s move went
+# ahead and recreated it with --fresh. That deletes the upper layer, which for a killed box is
+# exactly where unpushed work lives: `kill` keeps the directory for no other reason.
+#
+# Both halves of the check failed open, on a box nobody could look at, and the message blamed the
+# broker's version for it. None of this was reachable in the suite until the stub started counting
+# retired boxes against their golden, the way the real list_goldens does.
+test_retire_will_not_move_a_box_it_cannot_read() {
+	fixture
+	local port pid g1
+	port=$(( STUB_PORT + 8 ))
+	STUB_LOG="$FIX/stub8.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" \
+		STUB_BOX_STATE="{\"parked\": {\"head\": \"0000000000000000000000000000000000000000\"}}" \
+		python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+
+	cbx golden snapshot >/dev/null 2>&1          # g1
+	cbx box parked      >/dev/null 2>&1          # …and a box on it
+	cbx golden ls
+	g1="$(printf '%s\n' "$OUT" | sed -n 's/^ *\(g-[0-9-]*\) .*/\1/p' | head -1)"
+	[ -n "$g1" ] || fail "could not read the first golden's id" "$OUT"
+	# Its HEAD is a commit the hub has never seen, so the snapshot leaves it behind on g1 rather than
+	# taking it along — which is the only way to end up with a box on a golden you later want to free.
+	cbx golden snapshot >/dev/null 2>&1          # g2, now current
+	cbx kill parked     >/dev/null 2>&1          # …and now it has no container at all
+
+	# `retire`, answering [m]ove. It must refuse: it cannot know what is in that layer.
+	: > "$FIX/stub8.log"
+	muster_tty "m" golden retire "$g1"
+	notok
+	has "not running"
+	# The misdiagnosis. This box's broker is the same build as its hub; saying otherwise sends you to
+	# redeploy something that is not broken, and buries the real reason.
+	hasnt "VERSION DRIFT"
+	grep -q '"/recreate/parked' "$FIX/stub8.log" && fail "a box whose work could not be checked was moved anyway"
+	# …and having refused, it must not free the golden either — that is the box's lower layer.
+	# Anchored for the same reason as in the --discard-retired test: "g-<ts>-2" contains "g-<ts>".
+	cbx golden ls
+	printf '%s\n' "$OUT" | grep -qE "^ +$g1 " \
+		|| fail "$g1 was reaped even though the refusal left a box on it" "$OUT"
+
+	# The same refusal from the other direction: naming the box outright. It is not "reachable or
+	# not" any more — a retired box is a different KIND of thing, and migrate says so and points at
+	# the only flag that can move it.
+	: > "$FIX/stub8.log"
+	cbx golden migrate parked
+	has "NOT migrated"
+	has "--discard-retired"
+	hasnt "VERSION DRIFT"
+	grep -q '"/box/parked/migrate/stash' "$FIX/stub8.log" && fail "it tried to stash a box with no container"
+	grep -q '"/box/parked/rebase-golden' "$FIX/stub8.log" && fail "a retired box was moved without --discard-retired"
+
+	# Bring it back and the check works again — the refusal is about evidence, not about the name.
+	cbx box parked >/dev/null 2>&1
+	cbx golden migrate parked
+	has "never seen"                              # now it CAN see the unpushed HEAD, and says so
+	hasnt "not running"
+
+	unset BROKER_URL
+	kill "$pid" 2>/dev/null
+}
+
+# box-bin/muster-migrate, RUN FOR REAL. Everything above stubs the broker, so the script that
+# actually moves the work has never executed in this suite — and it is pure git plus tar, so there is
+# no reason for that. No docker, no box: a repo, a stash, a simulated change of golden.
+#
+# The scenario is the one the collision prompt is about. `golden snapshot` bakes the hub's dirty tree
+# into every golden on purpose, so after a move the box's checkout ALREADY carries the golden's
+# uncommitted version of some paths — and the agent's stash carries its own version of the same file.
+# `apply` three-way merges the two; `apply-keep-golden` drops the agent's and keeps the golden's.
+mig() {
+	OUT="$(MUSTER_WORKDIR="$FIX/mrepo" MUSTER_KEEP="$FIX/mkeep" bash "$ROOT/box-bin/muster-migrate" "$@" 2>&1)"; RC=$?
+	return 0
+}
+
+test_migrate_script_keeps_the_golden_version() {
+	fixture
+	local repo="$FIX/mrepo"
+	mkdir -p "$repo" "$FIX/mkeep"
+	git init -q "$repo"
+	git -C "$repo" config user.email box@test; git -C "$repo" config user.name box
+	git -C "$repo" config commit.gpgsign false
+	printf 'base a\n' > "$repo/a.txt"
+	printf 'base b\n' > "$repo/b.txt"
+	git -C "$repo" add -A; git -C "$repo" commit -qm base
+
+	# The agent's uncommitted work: two tracked edits and one new file.
+	printf 'AGENT a\n' > "$repo/a.txt"
+	printf 'AGENT b\n' > "$repo/b.txt"
+	printf 'agent only\n' > "$repo/new.txt"
+	mig stash s1
+	ok
+	mig list s1
+	has "a.txt"; has "b.txt"; has "new.txt"
+
+	# THE MOVE. A fresh upper layer means the checkout goes back to the golden's tree — which is
+	# itself dirty on a.txt, because that is what the hub had uncommitted when the golden was taken.
+	git -C "$repo" checkout -q -- a.txt b.txt
+	rm -f "$repo/new.txt"
+	printf 'GOLDEN a\n' > "$repo/a.txt"
+
+	mig apply-keep-golden s1
+	ok
+	eq "$(cat "$repo/a.txt")" "GOLDEN a" "a.txt collides, so the GOLDEN's version must survive untouched"
+	eq "$(cat "$repo/b.txt")" "AGENT b" "b.txt does not collide — the agent's version must still arrive"
+	eq "$(cat "$repo/new.txt")" "agent only" "an untracked file that does not collide must still arrive"
+	has "kept the GOLDEN's version"
+	has "a.txt"
+	# The agent's copy is dropped from the TREE, not from the stash: it is the only copy there is.
+	exists "$FIX/mkeep/.migrate/s1/changes.patch"
+	# No conflict markers anywhere — the whole point of choosing a side rather than merging.
+	case "$(cat "$repo/a.txt")" in *'<<<<<<<'*) fail "apply-keep-golden left conflict markers" ;; esac
+
+	# …and plain `apply` takes the OTHER side of the same collision: a three-way merge of two
+	# different versions of a.txt, which cannot merge cleanly and must therefore FAIL loudly rather
+	# than silently pick one.
+	git -C "$repo" checkout -q -- a.txt b.txt
+	rm -f "$repo/new.txt"
+	printf 'GOLDEN a\n' > "$repo/a.txt"
+	mig apply s1
+	notok
+	has "did not apply cleanly"
+
+	# A STASH WHOSE EVERY PATH COLLIDES. Excluding them all leaves `git apply` with an empty
+	# selection, which is an error and not a no-op — so the script has to notice before calling it.
+	git -C "$repo" checkout -q -- a.txt b.txt
+	rm -f "$repo/new.txt"
+	printf 'AGENT a\n' > "$repo/a.txt"
+	mig stash s2
+	ok
+	git -C "$repo" checkout -q -- a.txt
+	printf 'GOLDEN a\n' > "$repo/a.txt"
+	mig apply-keep-golden s2
+	ok
+	eq "$(cat "$repo/a.txt")" "GOLDEN a" "the one colliding path must keep the golden's version"
+	has "applied 0 path(s)"
+}
+
+# THE LIVE DASHBOARD'S TITLE BAR HAS TO BE EXACTLY AS WIDE AS THE TERMINAL. One column over and the
+# clock wraps — which is how it shipped: the format string is single-quoted, so a `$SELF` written
+# inside it was printed literally ("$SELF q · live"), and the pad subtracted a constant sized for a
+# three-character name. Five characters instead of three made every frame two columns too wide, so
+# `20:48:07` lost "07" to the next row.
+#
+# The arithmetic and the format string have to agree character for character, and nothing about
+# reading either tells you whether they do — so measure the rendered line instead. `wc -L` gives
+# display width, which is the thing that matters: `·` is two bytes and one column.
+test_watch_title_fits_the_terminal() {
+	local name w line width
+	for name in cbx muster averylongprefix; do
+		for w in 80 100 200; do
+			line="$(SELF="$name" MUSTER_COLS="$w" bash -c '
+				C_B=""; C_CYA=""; C_RESET=""; C_DIM=""
+				term_cols() { printf "%s" "$MUSTER_COLS"; }
+				eval "$(sed -n "/^watch_title()/,/^}/p" "$1")"
+				watch_title "refresh 5s · Enter now · q quits" "20:48:07"
+			' _ "$MUSTER_BIN")"
+			width="$(printf '%s' "$line" | wc -L)"
+			eq "$width" "$w" "title bar is $width columns wide at COLS=$w (name '$name') — it must be exactly $w or the clock wraps"
+			case "$line" in
+				*'$SELF'*) fail "the title bar prints \$SELF literally instead of the CLI name" ;;
+			esac
+			case "$line" in
+				*"$name q · live"*) ;;
+				*) fail "the title bar does not name the CLI ('$name')" "$line" ;;
+			esac
+			case "$line" in
+				*"20:48:07") ;;
+				*) fail "the clock is not flush against the right margin" "$line" ;;
+			esac
+		done
+	done
 }
 
 # =====================================================================  queue / status
@@ -2054,6 +2524,50 @@ test_aliases_completion() {
 	has "LIVE: work1"
 }
 
+# THE LAPTOP LEARNS SUBCOMMANDS FROM THE HUB'S --help, and that scrape lives in a heredoc that is
+# only ever executed on the server — so nothing else in this suite runs it. Run it here, for real,
+# against the CLI's own --help output: it is the single step that turns a new `golden <sub>` into a
+# completion on the laptop, and if it silently stops matching, the fallback below is all you get.
+test_aliases_completion_learns_subcommands() {
+	alias_fixture
+	local prog subs offered missing
+	prog="$(sed -n '/muster --help 2>\/dev\/null | awk /,/^\t}.$/p' "$ROOT/muster.bash_aliases")"
+	prog="${prog#*awk \'}"; prog="${prog%\'}"
+	[ -n "$prog" ] || fail "could not extract the --help scrape from muster.bash_aliases"
+	subs="$(dispatch_subcommands golden)"
+	cbx --help
+	ok
+	OUT="$(printf '%s\n' "$OUT" | awk "$prog" 2>&1)"
+	offered="$(printf '%s\n' "$OUT" | sed -n 's/^sub golden //p' | sort -u)"
+	missing="$(comm -23 <(printf '%s\n' "$subs") <(printf '%s\n' "$offered"))"
+	eq "$missing" "" "--help does not advertise these golden subcommands, so the laptop cannot learn them"
+	# An alias is not a subcommand. `svcs | services` and `status | st` are two spellings of ONE
+	# command, and offering the second as a word that follows the first is nonsense — which is why the
+	# third column has to be a bare word, not a pipe.
+	hasnt "sub svcs"
+	hasnt "sub status"
+	hasnt "sub q "
+
+	# COLD CACHE — what a fresh terminal has, and the case the literal floor exists for. It is the
+	# list that went stale last time, so assert it against the dispatch too.
+	al "_muster_complete_cache() { :; };
+	    try() { local w=(\$1); COMP_WORDS=(\"\${w[@]}\" \"\$3\"); COMP_CWORD=\${#w[@]};
+	            _muster_complete; echo \"\$2: \${COMPREPLY[*]}\"; };
+	    try 'cbx golden' GSUBS ''"
+	offered="$(printf '%s\n' "$OUT" | sed -n 's/^GSUBS: //p' | tr ' ' '\n' | grep . | sort -u)"
+	missing="$(comm -23 <(printf '%s\n' "$subs") <(printf '%s\n' "$offered"))"
+	eq "$missing" "" "these golden subcommands do not complete on the laptop with a cold cache"
+
+	# WARM CACHE: a subcommand this file has never heard of, sent by the hub. The whole point of
+	# scraping — the aliases file and the hub image travel by different paths and drift for weeks.
+	printf 'sub golden afuturesub\n' > "$FIX/complete-cache"
+	al "_muster_complete_cache() { cat '$FIX/complete-cache'; };
+	    try() { local w=(\$1); COMP_WORDS=(\"\${w[@]}\" \"\$3\"); COMP_CWORD=\${#w[@]};
+	            _muster_complete; echo \"\$2: \${COMPREPLY[*]}\"; };
+	    try 'cbx golden' GSUBS ''"
+	has "afuturesub"
+}
+
 # COMPLETION MUST KNOW WHAT JUST HAPPENED. Spawning or killing a box changes exactly one line of what
 # completion knows, and waiting out the cache TTL to learn it means `kill <TAB>` offering a box you
 # just killed. So those commands patch the cache — and a killed box moves to the RETIRED key rather
@@ -3557,12 +4071,16 @@ run "skills: muster ships its own, and the image carries them" test_skills_ship
 run "config: no project defaults in the source tree" test_no_project_defaults
 run "help: every command is documented"            test_help_covers_every_command
 run "help: an unknown command prints usage"        test_unknown_command_prints_usage
+run "watch: the title bar fits the terminal"       test_watch_title_fits_the_terminal
 
 run "compose: the box build service is profiled"    test_build_only_service_is_profiled
 run "compose: .dockerignore protects the stack dir" test_dockerignore_protects_the_stack_dir
 run "ask: refuses paths, tools and empty prompts" test_ask_refuses_what_it_should
 run "ask: refuses to run without a token"       test_ask_refuses_to_run_without_a_token
 run "hub: tab-completion for both names"           test_hub_completion
+run "hub: every subcommand tab-completes"          test_hub_completion_covers_every_subcommand
+run "conf: MUSTER_CONF_DIR covers every file"      test_conf_dir_covers_every_config_file
+run "conf: gen-hub-mounts follows it"             test_gen_hub_mounts_follows_the_conf_dir
 run "ci: images are named by git describe"         test_images_workflow_names_images_by_describe
 run "status: empty stack"                          test_status_empty
 run "queue: lists a handoff"                       test_queue_lists_a_handoff
@@ -3642,6 +4160,9 @@ run "golden: strips worktrees from the snapshot"   test_golden_snapshot_strips_w
 run "golden: retire one that boxes are still on"   test_golden_retire
 run "golden: leaves unsafe boxes behind"           test_golden_snapshot_leaves_unsafe_boxes_behind
 run "golden: migrate carries uncommitted work"     test_golden_migrate
+run "golden: migrate keeps the golden version"     test_migrate_script_keeps_the_golden_version
+run "golden: retire cannot read a dead box"       test_retire_will_not_move_a_box_it_cannot_read
+run "golden: move killed boxes, no container"     test_migrate_discards_retired_boxes_without_starting_them
 run "q: shows how far the golden has drifted"      test_q_shows_golden_drift
 
 run "svcs: lists the manifests"                    test_svcs_lists_manifests
@@ -3670,6 +4191,7 @@ run "paste: no clipboard reader says which"        test_aliases_paste_without_a_
 run "aliases: refuse an unconfigured stack"        test_aliases_refuse_without_a_server
 run "aliases: cbxcp argument checking"             test_aliases_cbxcp_argument_checking
 run "aliases: completion (cmds, flags, branches)"   test_aliases_completion
+run "aliases: completion learns subcommands"        test_aliases_completion_learns_subcommands
 run "aliases: the cache follows box changes"       test_aliases_cache_follows_boxes
 run "aliases: project helpers"                     test_aliases_project_helpers
 run "aliases: two stacks side by side"             test_aliases_two_stacks_side_by_side

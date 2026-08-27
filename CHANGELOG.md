@@ -14,6 +14,33 @@ releases and are not listed here.
 ## Unreleased
 
 ### Added
+- **`MUSTER_CONF_DIR`** — a stack-dir-relative prefix for every config file this stack reads:
+  `mounts`, `service-env`, `box-env`, `port-forwards`, `claude-settings.json`, `hub-services/` and
+  `git-identity/`. Set `MUSTER_CONF_DIR=conf` in `.env` and the stack root holds compose.yml, .env
+  and `data/` and nothing else. Unset, every path renders byte-for-byte as before (`${VAR:+${VAR}/}`
+  contributes the separator only when set), so no existing stack needs anything done to it.
+
+  `.env`, `compose.override.yml` and `compose.project.yml` stay in the root because compose loads all
+  three from the project directory — `.env` is where the variable is learned in the first place. The
+  Ansible role gains `claude_box_conf_dir` to match, and fails the play when the two disagree: a
+  mismatch is otherwise silent, because docker creates a missing bind-mount source as an empty
+  directory and the hub simply comes up with no mounts, no service manifests and no git identity.
+
+- **`golden migrate --discard-retired`** — move **killed** boxes onto the current golden without
+  starting anything. A box is an overlay whose mount options are fixed when its container is created,
+  so every other route to a new golden needs a container: `recreate --fresh` builds one, `golden
+  migrate` has to read the working tree out of one. That made freeing a golden dozens of retired
+  boxes were pinned to mean resurrecting dozens of agents, each with a claude session and a port
+  slot, to tell them nothing. For a box that has no container, though, "which golden am I on" is one
+  file and the only thing stopping it moving is that its upper layer exists — so the broker deletes
+  the layer, rewrites the file, and the next `box <name>` assembles the overlay on the current
+  golden. No docker involved; it refuses outright while a container exists.
+
+  Destructive by definition — nothing can be carried out of a box nothing can talk to — so it is
+  opt-in and the flag says what it costs. Gone: every uncommitted file and every commit the box never
+  handed off. Kept: `~/keep`, the box's name, branch, claude session, and whatever it pushed to
+  `refs/agents/<box>`.
+
 - **`muster golden migrate <box>|--all`** — move a box onto the current golden and **carry its
   uncommitted work across**. The move is unavoidably a fresh upper layer, so the work travels as a
   patch through the box's `~/keep` (a bind mount outside the overlay, and so the one part of a box
@@ -21,6 +48,21 @@ releases and are not listed here.
   where they overlap the new golden's own uncommitted files — `snapshot` bakes the hub's dirty tree
   into every golden on purpose, so that collision is real. It cannot carry commits, and refuses a box
   with unpushed ones before capturing anything.
+
+  On a collision it now offers **three** answers, not two: `[y]` three-way merge them, `[g]` keep the
+  **golden's** version of the colliding paths and drop the agent's, `[N]` skip the box.
+  `--golden-wins` answers `g` for every box without a tty, `--force` answers `y`. `g` is usually the
+  one you want — these collisions are typically the golden's own setup work, where the agent is
+  carrying a stale copy of a file you have since changed by hand, and merging the two only produces
+  conflict markers you resolve by taking the golden's side anyway. Nothing is lost either way: the
+  stash stays in `~/keep/.migrate/<id>`. The colliding paths are worked out **inside the box** (right
+  after the recreate, the checkout is already dirty with exactly the golden's version of them), so
+  the broker still runs a fixed `muster-migrate <action> <id>` with no caller-supplied arguments.
+
+  `--all` reaches only boxes that are **up** — a retired box has no container, so there is nothing to
+  read its working tree out of — and it now **says which ones it left behind** rather than reporting
+  "migrated N" over a stack still sitting on a month-old golden. A box already on the current golden
+  is skipped instead of being recreated for nothing.
 - **`golden snapshot` leaves boxes behind instead of refusing.** A box whose work is not safe to
   discard stays on the golden it is on, and the snapshot happens anyway; `--force` moves everyone and
   says what that costs. Goldens were always versioned and `reap`/`retire` always expected a box to sit
@@ -54,6 +96,39 @@ releases and are not listed here.
   holding unreviewed work. See "Unattended job boxes" in `README-remote.md`.
 
 ### Fixed
+- **A box that was not running was treated as a box with nothing in it.** The broker's `box_dirty`
+  execs into the container and, when that fails, still answers 200 with `{"reachable": false,
+  "dirty": [], "head": ""}`. For a retired box the exec always fails — there is no container — so the
+  hub read the empty list as "clean" and the empty HEAD as *"VERSION DRIFT: the broker is older than
+  this CLI"*, which was both wrong and a diagnosis pointing at a healthy component. Both halves of
+  `box_move_blocker` therefore failed open, and `golden retire`'s [m]ove recreated the box with
+  `--fresh`, deleting the upper layer — which for a killed box is precisely where unpushed work
+  lives, that being the only reason `kill` keeps the directory. `box_probe` now fails on
+  `reachable: false`, so every caller's existing not-reachable path is the one that runs, and the
+  drift message is left to describe actual drift. `.reachable` absent (a broker predating the field)
+  stays truthy, so nothing regresses. None of this was reachable in the test suite until the stub
+  broker started counting retired boxes against their golden and restoring a resurrected box's own
+  golden, the way the real broker does.
+
+- **`golden migrate` and `golden retire` never tab-completed.** Both completion files kept a
+  hand-written `"snapshot seal ls reap"` and neither had learned the two newer subcommands — a list
+  that is four-sixths right is indistinguishable from one that works, so it reads as "I have the name
+  wrong" rather than "completion is stale". The hub now reads a command's subcommands out of the
+  CLI's own nested `case "$sub" in`, exactly as it already read the top-level list; the laptop, which
+  cannot see the hub's source, learns them from `muster --help` alongside the flags it already
+  scrapes. A test walks the dispatch — top level and every nested case it can find — and fails on any
+  word that does not complete, and another bans literal word lists in the hub's completion outright.
+
+- **The live dashboard's title bar printed `$SELF` and wrapped the clock.** `muster q`'s header read
+  "`$SELF q · live`": the format string is single-quoted — it has to be, being full of `%` specifiers
+  and escape bytes — so the `$SELF` written inside it was never expanded. The same mistake made every
+  frame two columns too wide, because the pad subtracted a constant sized for a three-character name
+  while the literal `$SELF` is five, so `20:48:07` lost its last two characters to the next row: hour
+  and minute on one line, seconds on the next. The name is an argument now and the constant comes
+  from `${#SELF}`, which also lines up a hub whose CLI is still called `muster` (that one was three
+  columns over). Split out as `watch_title` so a test can measure the rendered width instead of
+  hoping the arithmetic and the format string still agree.
+
 - **A resumed box no longer jumps to whatever golden is current.** `create_box` bound
   `current_golden()` unconditionally, which was invisible while `golden snapshot` moved every box at
   once — but the moment one is left behind, an ordinary `recreate` (a new image, say) would silently

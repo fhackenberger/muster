@@ -1586,6 +1586,54 @@ def dir_size(path):
 	return total
 
 
+def rebase_retired_golden(name):
+	"""Move a box that has NO CONTAINER onto the current golden — as bookkeeping, without docker.
+
+	A box is an overlay: lowerdir = the golden, upperdir = the box's own layer, and those options are
+	fixed when the container is created. So moving a RUNNING box means destroying its container and
+	building another one, which is what `recreate --fresh` does. A retired box has no container to
+	destroy. What pins it to its old golden is one file, and what makes its layer incoherent on a new
+	golden is that the layer exists at all — so delete the layer, rewrite the file, and the next
+	`box <name>` assembles the overlay on the current golden. Nothing starts, no agent is woken to be
+	told nothing, no port slot is taken and released.
+
+	THIS DISCARDS THE UPPER LAYER: every uncommitted file, and every commit the box never handed off
+	(its .git is in that layer too). Exactly the loss `recreate --fresh` takes, and the hub has to
+	have asked for it in those words. What survives is what always survives a --fresh: ~/keep, which
+	is a bind mount OUTSIDE the overlay and the whole reason it exists; the box's home anchor, its
+	name, its branch, its claude session id, and whatever it pushed to refs/agents/<box>.
+
+	Refuses while a container exists, rather than quietly doing half a job: the running box would keep
+	its old mount until something recreated it, and the `golden` file would already be lying."""
+	box_dir = os.path.join(BOXROOT, name)
+	if not os.path.isdir(box_dir):
+		raise RuntimeError(f"no box directory for {name!r}")
+	r = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^{box_container(name)}$",
+	                    "--format", "{{.Names}}"], capture_output=True, text=True)
+	if r.stdout.strip():
+		raise RuntimeError(f"{name!r} still has a container — it is not retired. Use "
+		                   f"`recreate {name} --fresh` to move it and discard its work, or "
+		                   f"`golden migrate {name}` to carry the work across.")
+	with _golden_lock:
+		gid = os.path.basename(current_golden())
+	# Every upper layer this box owns: the checkout's, and one per `overlay` row in the mounts table.
+	# Same set --fresh clears (see make_shared_overlay_volume on why it has to be all of them). The
+	# docker volumes are NOT touched: their mount options are fixed at create time, so create_box
+	# removes and recreates each one anyway — a stale volume cannot outlive this.
+	targets = [os.path.join(box_dir, "upper"), os.path.join(box_dir, "work")]
+	for d in sorted(os.listdir(box_dir)):
+		if d.startswith("ovl-"):
+			targets += [os.path.join(box_dir, d, "upper"), os.path.join(box_dir, d, "work")]
+	freed = 0
+	for d in targets:
+		if os.path.isdir(d):
+			freed += dir_size(d)
+			shutil.rmtree(d, ignore_errors=True)
+	with open(os.path.join(box_dir, "golden"), "w") as fh:
+		fh.write(gid)
+	return {"box": name, "golden": gid, "freed": freed}
+
+
 def purge_box(name):
 	"""Remove a box FOR GOOD: container, overlay volumes, and the directory kill deliberately keeps.
 
@@ -1641,9 +1689,12 @@ def box_migrate(name, action, stash_id):
 	work back on the other side. The script itself explains why a patch rather than the old layer.
 
 	`list` is separate from `apply` on purpose: the hub shows you which paths are coming across, and
-	how they overlap with the new golden's OWN uncommitted files, before anything is applied."""
-	if action not in ("stash", "apply", "list"):
-		raise ValueError("action must be stash, apply or list")
+	how they overlap with the new golden's OWN uncommitted files, before anything is applied.
+	`apply-keep-golden` is the answer to that overlap: apply everything EXCEPT the colliding paths, so
+	the golden's version of those wins. Which paths those are is worked out inside the box, not sent
+	from here — the point of this function is that the argument list is fixed."""
+	if action not in ("stash", "apply", "apply-keep-golden", "list"):
+		raise ValueError("action must be stash, apply, apply-keep-golden or list")
 	if not MIGRATE_RE.match(stash_id or ""):
 		raise ValueError("bad stash id")
 	r = subprocess.run(
@@ -1907,6 +1958,17 @@ class Handler(BaseHTTPRequestHandler):
 					return self._reply(400, {"error": bad})
 				return self._reply(200, recreate_box(rname, fresh_upper=fresh))
 			# Deliver review feedback into a box's claude session.
+			# Re-point a RETIRED box at the current golden without docker. Separate from /recreate on
+			# purpose: that one needs a container, this one refuses to run while there is one.
+			if path.startswith("/box/") and path.endswith("/rebase-golden"):
+				rname = path[len("/box/"):-len("/rebase-golden")]
+				bad = name_problem(rname)
+				if bad:
+					return self._reply(400, {"error": bad})
+				try:
+					return self._reply(200, rebase_retired_golden(rname))
+				except RuntimeError as e:
+					return self._reply(409, {"error": str(e)})
 			if path.startswith("/box/") and "/migrate/" in path:
 				rest = path[len("/box/"):]
 				rname, _, action = rest.partition("/migrate/")

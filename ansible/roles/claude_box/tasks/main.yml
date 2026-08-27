@@ -46,8 +46,15 @@
 
 # GitHub deploy key + the hub's gitconfig live here. Created before the config files below so a
 # caller can template its gitconfig straight into it.
+# The config directory itself, when the stack keeps its config out of the root (claude_box_conf_dir).
+# Before the config files, obviously — `template:` will not create a missing parent.
+- name: Ensure the config directory exists
+  file: path={{ claude_box_dir }}/{{ claude_box_conf_dir }} state=directory owner=root group=root mode="u=rwx,g=rx,o=rx"
+  when: claude_box_conf_dir not in ['.', '', './']
+  tags: [containers-claude-box-files]
+
 - name: Ensure git-identity directory exists (holds the deploy key + the hub's gitconfig)
-  file: path={{ claude_box_dir }}/git-identity/ state=directory owner={{ claude_box_uid }} group=root mode="u=rwx,g=,o="
+  file: path={{ claude_box_dir }}/{{ claude_box_conf_dir }}/git-identity/ state=directory owner={{ claude_box_uid }} group=root mode="u=rwx,g=,o="
   tags: [containers-claude-box-files, containers-claude-box-deploy-key]
 
 # The project's config files (compose env, mounts, service-env, port-forwards, hub gitconfig, …).
@@ -80,6 +87,30 @@
 # `.env` is a symlink to the templated compose env file (which holds the vault-backed values), so
 # `docker compose` picks it up automatically from the project dir. A symlink rather than a second
 # copy: one file to review, and no way for the two to drift.
+# TWO PLACES SAY WHERE THE CONFIG LIVES, so make disagreeing loud. compose can only learn
+# MUSTER_CONF_DIR from `.env`, and this role has to know it to put the files there — a mismatch
+# leaves a hub whose mounts are all empty directories docker invented, with nothing to say why.
+- name: Check the compose env file agrees about the config directory
+  shell: |
+    set -o pipefail
+    sed -n 's/^[[:space:]]*MUSTER_CONF_DIR[[:space:]]*=[[:space:]]*//p' {{ claude_box_dir }}/{{ claude_box_env_file }} \
+      | tail -1 | tr -d '"'"'"'"'"'"' || true
+  args: { executable: /bin/bash }
+  register: claude_box_env_conf_dir
+  changed_when: false
+  failed_when: false
+  tags: [containers-claude-box-files]
+
+- name: Fail when MUSTER_CONF_DIR and claude_box_conf_dir disagree
+  fail:
+    msg: >-
+      claude_box_conf_dir is '{{ claude_box_conf_dir }}' but {{ claude_box_env_file }} sets
+      MUSTER_CONF_DIR to '{{ claude_box_env_conf_dir.stdout | default("") | trim or "." }}'.
+      Ansible would template the config files into one directory and compose would mount the other,
+      which docker creates as empty dirs — set both to the same relative path.
+  when: (claude_box_env_conf_dir.stdout | default('') | trim or '.') != (claude_box_conf_dir | regex_replace('/$', '') or '.')
+  tags: [containers-claude-box-files]
+
 - name: Symlink .env to the compose env file so docker compose picks it up
   file: path={{ claude_box_dir }}/.env src={{ claude_box_env_file }} state=link force=yes
   tags: [containers-claude-box-files]
@@ -96,19 +127,19 @@
   command: >
     ssh-keygen -t ed25519 -N ''
     -C '{{ claude_box_deploy_key_comment }}'
-    -f {{ claude_box_dir }}/git-identity/id_ed25519
+    -f {{ claude_box_dir }}/{{ claude_box_conf_dir }}/git-identity/id_ed25519
   args:
-    creates: "{{ claude_box_dir }}/git-identity/id_ed25519"
+    creates: "{{ claude_box_dir }}/{{ claude_box_conf_dir }}/git-identity/id_ed25519"
   tags: [containers-claude-box-deploy-key]
 - name: Fix ownership/permissions on the deploy key
   file: path={{ item.path }} owner={{ claude_box_uid }} group=root mode={{ item.mode }}
   with_items:
-    - { path: "{{ claude_box_dir }}/git-identity/id_ed25519", mode: "u=rw,g=,o=" }
-    - { path: "{{ claude_box_dir }}/git-identity/id_ed25519.pub", mode: "u=rw,g=r,o=r" }
+    - { path: "{{ claude_box_dir }}/{{ claude_box_conf_dir }}/git-identity/id_ed25519", mode: "u=rw,g=,o=" }
+    - { path: "{{ claude_box_dir }}/{{ claude_box_conf_dir }}/git-identity/id_ed25519.pub", mode: "u=rw,g=r,o=r" }
   tags: [containers-claude-box-deploy-key]
 - name: Read the deploy public key
   slurp:
-    src: "{{ claude_box_dir }}/git-identity/id_ed25519.pub"
+    src: "{{ claude_box_dir }}/{{ claude_box_conf_dir }}/git-identity/id_ed25519.pub"
   register: claude_box_deploy_pubkey
   tags: [containers-claude-box-deploy-key]
 - name: Show the deploy public key and how to register it on GitHub

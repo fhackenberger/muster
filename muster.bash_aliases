@@ -892,8 +892,24 @@ docker exec "$hub" git -C /home/dev/repo for-each-ref --format='branch %(refname
 #
 # One `<self> <cmd>` line opens a block; its indented continuation lines belong to the same command,
 # which is where flags like [--reword|-r] live.
+#
+# A command that dispatches AGAIN (`golden snapshot`, `golden migrate`) documents each subcommand on
+# its own line, so a bare word in the third column is one — `sub golden migrate`. The hub reads its
+# subcommands straight out of the dispatch case; over ssh the help block is the closest thing to
+# that, and it beats the list that used to sit in the completion below and had never heard of
+# `migrate` or `retire`. The third word must be bare: `svcs | services` and `status | st` are
+# aliases, not subcommands, and their third column is the pipe.
 docker exec "$hub" muster --help 2>/dev/null | awk '
-	match($0, /^[[:space:]]+muster[[:space:]]+[a-z][a-z0-9]*/) { split($0, w, " "); cmd = w[2]; print "cmd", cmd }
+	match($0, /^[[:space:]]+muster[[:space:]]+[a-z][a-z0-9]*/) {
+		split($0, w, " "); cmd = w[2]; print "cmd", cmd
+		# w[3], then any `| word` alternatives after it (`golden ls | reap`). Stops at the first
+		# token that is not a plain word, which is where the arguments start (`<id>`, `[--prep]`).
+		for (i = 3; i in w; i++) {
+			if (w[i] == "|" && i > 3) continue
+			if (w[i] !~ /^[a-z][a-z0-9-]*$/) break
+			print "sub", cmd, w[i]
+		}
+	}
 	cmd != "" {
 		line = $0
 		while (match(line, /--[a-z][a-z-]*/)) {
@@ -970,6 +986,8 @@ _muster_complete_cache() {
 _muster_names() { _muster_complete_cache | awk -v k="$1" '$1==k {print $2}' | sort -u; }
 # Flags are cached as `flag <cmd> <--flag>`, so they need the extra column.
 _muster_flags() { _muster_complete_cache | awk -v c="$1" '$1=="flag" && $2==c {print $3}' | sort -u; }
+# Same shape for the subcommands of a command that dispatches again (`golden <sub>`).
+_muster_subs()  { _muster_complete_cache | awk -v c="$1" '$1=="sub"  && $2==c {print $3}' | sort -u; }
 
 # KEEP THE CACHE HONEST WITHOUT A ROUND TRIP. Spawning or killing a box changes exactly one line of
 # what completion knows, and waiting out the TTL to learn it means `kill <TAB>` offering a box you just
@@ -1042,7 +1060,10 @@ _muster_complete() {
 			recreate)  flags="$flags --fresh" ;;
 			q|queue)   flags="$flags --text --once --no-bell -n" ;;
 			pull)      flags="$flags --rebase" ;;
-			golden)    [ "${COMP_WORDS[2]:-}" = snapshot ] && flags="$flags --prep" ;;
+			golden)    case "${COMP_WORDS[2]:-}" in
+			               snapshot) flags="$flags --prep --force" ;;
+			               migrate)  flags="$flags --all --dry-run --force" ;;
+			           esac ;;
 		esac
 		COMPREPLY=($(compgen -W "$flags" -- "$cur" | sort -u))
 		return
@@ -1062,7 +1083,14 @@ _muster_complete() {
 		           COMPREPLY=($(compgen -W "$(_muster_names box) all" -- "$cur")) ;;
 		# Branch arguments. `minto <branch>` merges dev INTO it, `push`/`pull` name one explicitly.
 		minto|push) COMPREPLY=($(compgen -W "$(_muster_names branch)" -- "$cur")) ;;
-		golden)    [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "snapshot seal ls reap" -- "$cur")) ;;
+		# `golden <sub>` from the hub's own help (see the fetch above). The literal is the cold-cache
+		# floor only — it is the list that went stale last time, so it is never the whole answer.
+		golden)    case "$COMP_CWORD" in
+		               2) COMPREPLY=($(compgen -W "$(_muster_subs golden)
+		                      snapshot seal ls reap retire migrate" -- "$cur" | sort -u)) ;;
+		               3) [ "${COMP_WORDS[2]:-}" = migrate ] &&
+		                      COMPREPLY=($(compgen -W "$(_muster_names box)" -- "$cur")) ;;
+		           esac ;;
 		expose|hide) COMPREPLY=($(compgen -f -- "$cur")) ;;
 	esac
 	return 0    # a case arm whose last test failed would otherwise make readline see an error
