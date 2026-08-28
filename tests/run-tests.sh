@@ -3480,6 +3480,64 @@ PYEOF
 	ok; has ok
 }
 
+# THE PROMPT NOBODY IS THERE TO ANSWER. claude asks "Is this a project you trust?" on the first use
+# of a directory and BLOCKS — which in an unattended box is forever, and does not even look like a
+# hang: `muster job` sees a claude that started fine and never proceeds, so it reads as a slow spawn
+# until the timeout. That is what the first research box on a freshly logged-in stack did.
+test_broker_claude_json_trust() {
+	fixture
+	mkdir -p "$FIX/claude"
+	# The real file also holds the login and the account — hence the assertions that the rest of it
+	# survives untouched, and that an unparseable one is never rewritten.
+	cat > "$FIX/claude/.claude.json" <<-'EOF'
+		{
+		  "oauthAccount": {"emailAddress": "someone@example.com"},
+		  "projects": {
+		    "/some/other/repo": {"hasTrustDialogAccepted": true, "history": ["x"]},
+		    "/home/dev/repo": {"history": ["earlier work"]}
+		  }
+		}
+	EOF
+	OUT="$(CLAUDE_HOME="$FIX/claude" CHECKOUT_DST=/home/dev/repo BOX_UID=4242 BOX_GID=4242 \
+		python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, json, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+C = os.path.join(os.environ["CLAUDE_HOME"], ".claude.json")
+load = lambda: json.load(open(C))
+
+b.ensure_claude_json()
+d = load()
+assert d["projects"]["/home/dev/repo"]["hasTrustDialogAccepted"] is True, d
+# MERGED, not replaced: this project's other state, the other project, and the login all survive.
+assert d["projects"]["/home/dev/repo"]["history"] == ["earlier work"], d
+assert d["projects"]["/some/other/repo"] == {"hasTrustDialogAccepted": True, "history": ["x"]}, d
+assert d["oauthAccount"]["emailAddress"] == "someone@example.com", d
+
+# Idempotent, and it must not even REWRITE the file once the flag is there: claude owns this file and
+# saves it itself, so every needless rewrite is a chance to lose what it was writing.
+before = os.stat(C).st_mtime_ns
+b.ensure_claude_json()
+assert load() == d, (d, load())
+assert os.stat(C).st_mtime_ns == before, "a file already in the wanted state was rewritten anyway"
+
+# A file we cannot parse is left completely alone — it holds the login, and a box that has to be
+# asked about trust is a far smaller problem than a clobbered credential.
+open(C, "w").write("{ not json at all")
+b.ensure_claude_json()
+assert open(C).read() == "{ not json at all", "an unparseable .claude.json must be left alone"
+
+# No file at all: nothing has logged in here yet, so claude will write it — and ask — itself.
+os.remove(C)
+b.ensure_claude_json()
+assert not os.path.exists(C), "a .claude.json must never be invented"
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 # THE PROJECT'S PER-BOX ENVIRONMENT. muster must not know what FRONTEND_DEV_BACKEND_URL means — it
 # used to build a sibling of it here, under a name it could only have copied from one project. What
 # it does know is forward names and port numbers; box-env is where a project turns those into its own
@@ -4276,6 +4334,7 @@ run "broker: the spawn route checks for it first"   test_broker_spawn_route_reat
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: the stack's claude settings merge in" test_broker_claude_settings
+run "broker: a box is not asked about trust"      test_broker_claude_json_trust
 run "broker: messages target claude's pane"        test_broker_box_target
 run "broker: a killed box frees its port slot"     test_broker_slot_reuse
 run "broker: the mounts table grammar"             test_broker_parse_mounts

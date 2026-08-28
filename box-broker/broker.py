@@ -1096,6 +1096,68 @@ def ensure_claude_settings():
 		os.replace(tmp, stamp_path)
 
 
+# ---------------------------------------------------------- claude's own config (.claude.json)
+#
+# NOT settings.json. `.claude.json` is where claude keeps the login and its PER-PROJECT state, keyed
+# by absolute path — and with CLAUDE_CONFIG_DIR pointing at the shared home it lives there too, so
+# one entry serves every box: they all mount their checkout at CHECKOUT_DST.
+#
+# THE TRUST PROMPT IS WHY THIS EXISTS. On the first use of a directory claude asks "Is this a project
+# you trust?" and BLOCKS on the answer. A box is unattended by definition, so it waits at that modal
+# forever — and it does not read as a hang: `muster job` sees a claude that started fine and simply
+# never proceeds, so it looks like a slow spawn until the timeout expires. The first research box on
+# a freshly logged-in stack did exactly that. The tree in question is an overlay of a golden the hub
+# snapshotted from its own repo, so what is missing is not a judgement, it is somebody to type it.
+#
+# Written as an OVERRIDE DOCUMENT merged with _merge_into, exactly like the project's
+# claude-settings.json: same merge semantics (objects key by key, so nothing else in the file or in
+# that project's entry is disturbed), same "a file we cannot parse is left completely alone" rule,
+# and a second key later is one line rather than another hand-rolled walk of the document.
+def claude_json_overrides():
+	return {"projects": {CHECKOUT_DST: {"hasTrustDialogAccepted": True}}}
+
+
+def ensure_claude_json():
+	"""Merge claude_json_overrides() into the shared .claude.json, idempotently."""
+	if not CLAUDE_HOME:
+		return
+	over = claude_json_overrides()
+	path = os.path.join(CLAUDE_HOME, ".claude.json")
+	# Absent means nothing has logged in here yet. claude writes this file itself on first run, and a
+	# person sits through that run — inventing a skeleton would be guessing at the shape of the file
+	# that holds the login.
+	if not os.path.exists(path):
+		return
+	try:
+		with open(path) as fh:
+			data = json.load(fh)
+	except (ValueError, OSError) as e:  # noqa: BLE001
+		print(f"box-broker: not touching {path} ({e}) — a box may then be asked whether it trusts "
+		      f"{CHECKOUT_DST}, which an unattended box cannot answer", flush=True)
+		return
+	if not isinstance(data, dict):
+		return
+	before = json.dumps(data, sort_keys=True)
+	_merge_into(data, over)
+	# Already so: do not rewrite a file claude owns and rewrites itself. In practice this makes the
+	# write happen once per stack, which is also the cheapest protection against racing a claude that
+	# is saving its own config at the same moment.
+	if json.dumps(data, sort_keys=True) == before:
+		return
+	tmp = path + ".muster-tmp"
+	with open(tmp, "w") as fh:
+		json.dump(data, fh, indent=2)
+		fh.write("\n")
+	os.replace(tmp, path)
+	try:
+		os.chown(path, int(BOX_UID), int(BOX_GID))
+	except OSError as e:  # noqa: BLE001
+		print(f"box-broker: could not chown {path} to {BOX_UID}:{BOX_GID} ({e}) — "
+		      f"harmless unless boxes cannot write it", flush=True)
+	print(f"box-broker: applied {', '.join('.'.join(p) for p, _ in _leaves(over))} to {path}",
+	      flush=True)
+
+
 MEMO_START = "<!-- muster:box start -->"
 MEMO_END = "<!-- muster:box end -->"
 
@@ -1360,6 +1422,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
 		ensure_claude_settings()      # first: the hooks below are re-asserted on top of it
 		ensure_activity_hooks()
+		ensure_claude_json()          # a different file: claude's own config, not settings.json
 		ensure_box_memo()
 	# Per-project port forwards: each box gets a slot, and every forward is published on the hub at
 	# 127.0.0.1:(HUB_BASE_PORT + slot). The box gets PORT_FORWARDS + PORT_FORWARD_<NAME>_FROM/_TO_HUB so

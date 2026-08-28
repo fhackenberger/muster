@@ -100,6 +100,16 @@ releases and are not listed here.
   boxes are live, because then every session would look orphaned.
 
 ### Fixed
+- **The first box on a new stack hung at claude's trust prompt.** claude asks "Is this a project you
+  trust?" on the first use of a directory and blocks on the answer — which in an unattended box is
+  forever, and does not read as a hang: `muster job` sees a claude that started normally and simply
+  never proceeds, so it looks like a slow spawn until the timeout. The broker now merges
+  `projects.<CHECKOUT_DST>.hasTrustDialogAccepted` into the shared `.claude.json` at spawn, using the
+  same override-document merge as the stack's `claude-settings.json` — so nothing else in the file is
+  disturbed, a file it cannot parse is left completely alone, and a file already in that state is not
+  rewritten at all. One entry covers every box, because they all mount their checkout at the same
+  path. Only the FIRST box on a stack ever saw this: after somebody answers by hand, the shared
+  config remembers.
 - **A killed box's browser tabs stayed open forever.** A session's lifetime is bounded — 24h, or its
   box's kill — but its TAB's is not: `pinchtab session revoke` answers with `remainingTabIds`, the
   tabs it has just orphaned, and nothing read that field. One hub was found holding 19 of them for
