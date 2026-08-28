@@ -108,8 +108,22 @@ install_pinchtab() {
 	rm -rf /tmp/pt
 	npm rm -g pinchtab >/dev/null 2>&1 || true      # a rolled-back attempt may still be registered
 	HOME=/tmp/pt npm install -g "pinchtab@${PINCHTAB_VERSION:-latest}" || return 1
-	_pt_bin="$(find /tmp/pt/.pinchtab -name 'pinchtab-linux-amd64' -type f | head -1)"
-	[ -n "$_pt_bin" ] || { echo "common-setup: pinchtab installed but shipped no linux-amd64 binary" >&2; return 1; }
+	# TWO PLACES, because pinchtab's postinstall moved the binary in 0.15.2. It used to download into
+	# $HOME/.pinchtab/bin/<version>/ — which is the only reason HOME is redirected here at all — and
+	# now writes a PACKAGE-RELATIVE .managed-bin/<version>/ inside the installed module instead. Its
+	# own platform.js still calls the old path "legacy" and falls back to it, so both are live. Looking
+	# only in the old one failed the entire image build with "shipped no linux-amd64 binary" when the
+	# install had in fact worked perfectly — we were reading an empty directory. Newest layout first,
+	# and the legacy one kept, so pinning an older PINCHTAB_VERSION for a rollback still works.
+	_pt_root="$(HOME=/tmp/pt npm root -g 2>/dev/null || true)"
+	_pt_bin="$(find "${_pt_root:-/nonexistent}/pinchtab" /tmp/pt/.pinchtab \
+		-name 'pinchtab-linux-amd64' -type f 2>/dev/null | head -1 || true)"
+	[ -n "$_pt_bin" ] || {
+		echo "common-setup: pinchtab installed but no linux-amd64 binary landed in" >&2
+		echo "  ${_pt_root:-<npm root -g failed>}/pinchtab/.managed-bin/ or /tmp/pt/.pinchtab/bin/" >&2
+		echo "  — its postinstall may have moved again: install it by hand and find the binary." >&2
+		return 1
+	}
 }
 retry install_pinchtab
 cp "$_pt_bin" /usr/local/bin/pinchtab

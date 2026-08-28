@@ -100,6 +100,13 @@ releases and are not listed here.
   boxes are live, because then every session would look orphaned.
 
 ### Fixed
+- **Every image build failed once pinchtab 0.15.2 was out.** Its postinstall stopped downloading the
+  binary to `$HOME/.pinchtab/bin/<version>/` — the reason `common-setup.sh` redirects `HOME` at all —
+  and now writes a package-relative `.managed-bin/<version>/` inside the installed module. The install
+  kept succeeding; the `find` that followed it was reading an empty directory, and reported "pinchtab
+  installed but shipped no linux-amd64 binary", which is not what had happened. Both layouts are
+  searched now (pinchtab's own code still falls back to the old one), so pinning an older
+  `PINCHTAB_VERSION` keeps working, and the message names the directories it looked in.
 - **The first box on a new stack hung at claude's trust prompt.** claude asks "Is this a project you
   trust?" on the first use of a directory and blocks on the answer — which in an unattended box is
   forever, and does not read as a hang: `muster job` sees a claude that started normally and simply
