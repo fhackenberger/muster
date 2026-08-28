@@ -225,9 +225,10 @@ test_no_project_defaults() {
 # Driven by calling _muster_complete the way bash does — COMP_WORDS + COMP_CWORD in, COMPREPLY out.
 test_hub_completion() {
 	fixture
-	mkdir -p "$FIX/boxes/work1" "$FIX/services"
+	mkdir -p "$FIX/boxes/work1" "$FIX/services" "$FIX/repo/.git/cbx"
 	: > "$FIX/services/backend"
 	git_ update-ref refs/agents/handed-off HEAD
+	: > "$FIX/repo/.git/cbx/minto-staging.mergeinto"      # a box resolving a minto merge
 	OUT="$(MUSTER_PREFIX=cbx bash -c '
 		PATH="'"$(dirname "$MUSTER_BIN")"'":$PATH
 		source "'"$ROOT"'/hub/muster-completion.bash"
@@ -237,6 +238,9 @@ test_hub_completion() {
 		echo "BOXES: $(try muster review "")"
 		echo "SVCS: $(try muster up "")"
 		echo "FLAGS: $(try muster merge work1 --)"
+		echo "LAND: $(try muster minto staging --accept "")"
+		echo "BRANCH: $(try muster minto "")"
+		echo "INTENT: $(try muster minto staging --intent "")"
 	' 2>&1)"; RC=$?
 	ok
 	# Both names complete: `muster` from the script itself, the stack's prefix from MUSTER_PREFIX.
@@ -249,6 +253,12 @@ test_hub_completion() {
 	case "$OUT" in *"SVCS: backend"*) ;; *) fail "service manifests should complete" ;; esac
 	# Flags are scraped from the header block, which is also what --help prints.
 	case "$OUT" in *--squash*--reword*|*--reword*--squash*) ;; *) fail "merge flags should complete" ;; esac
+	# `minto <target> --accept <TAB>` takes a BOX — and only one that is resolving that merge, which is
+	# neither the branch names the command's own arm offers nor the full box list.
+	case "$OUT" in *"LAND: minto-staging"*) ;; *) fail "--accept should complete the minto boxes" ;; esac
+	case "$OUT" in *"LAND: "*work1*) fail "--accept must not offer boxes that resolve no merge" ;; *) ;; esac
+	case "$OUT" in *"BRANCH: "*dev*) ;; *) fail "minto itself still completes branches" ;; esac
+	case "$OUT" in *"INTENT: "?*) fail "--intent takes prose; nothing should be offered" ;; *) ;; esac
 	OUT=""
 }
 
@@ -1487,6 +1497,92 @@ test_merge_failure_is_not_always_a_conflict() {
 	eq "$(git_ ls-files --unmerged)" "" "nothing may be left half-merged"
 }
 
+# AN EMPTY MESSAGE COSTS NOTHING. `git merge --edit` opens the editor after the merge is already in
+# the index, so leaving the buffer empty aborted the COMMIT and left a staged merge with MERGE_HEAD
+# set — which the error path read as "NOTHING was merged" and the next `merge` then read as "you have
+# uncommitted changes to these files, commit them first". The message is composed FIRST now, so an
+# empty one stops before anything is touched and the same command works on the second try.
+test_merge_edit_empty_message_touches_nothing() {
+	local before flavour
+	cat > "$TMP/ed-empty.sh" <<'EOF'
+#!/bin/bash
+: > "$1"
+EOF
+	cat > "$TMP/ed-write.sh" <<'EOF'
+#!/bin/bash
+printf 'my own wording\n' > "$1"
+EOF
+	chmod +x "$TMP/ed-empty.sh" "$TMP/ed-write.sh"
+	# Both flavours: a 2-commit branch (merge commit, `git merge --edit`) and a 1-commit one (which
+	# merge lands directly, through `git commit`). They failed the same way and must recover the same.
+	handoff work1 2 >/dev/null; box_up work1
+	# work2's single commit is written by hand rather than with `handoff`: handoff's commits are
+	# deterministic, so its first one IS work1's first one, and merging work1 would leave work2
+	# already contained in dev.
+	local solo; solo="$(commit_on dev - "agent: a solo change" solo.txt "solo")"
+	git_ update-ref refs/agents/work2 "$solo"
+	git_ notes --ref=cbx add -f -m "work from work2" "$solo"
+	box_up work2
+	for flavour in work1 work2; do
+		before="$(at dev)"
+		EDITOR="$TMP/ed-empty.sh" cbx merge "$flavour" --edit
+		notok
+		has "empty message"
+		eq "$(at dev)" "$before" "$flavour: dev must not move"
+		absent "$FIX/repo/.git/MERGE_HEAD"
+		eq "$(git_ status --porcelain)" "" "$flavour: nothing may be left staged"
+		ne "$(at "refs/agents/$flavour")" "" "$flavour: the branch must stay in the queue"
+		# And the same command, tried again, just works.
+		EDITOR="$TMP/ed-write.sh" cbx merge "$flavour" --edit
+		ok
+		ne "$(at dev)" "$before" "$flavour: the retry must land it"
+		OUT="$(git_ log -1 --format=%B dev)"
+		has "my own wording"
+		has "Cbx-Box: $flavour"                 # re-appended: `merge --undo` finds the merge by it
+	done
+}
+
+# The safety net for every other way a merge can be written but not committed — here a commit-msg
+# hook that says no. Nothing is conflicted, so there is nothing to resolve: roll it back rather than
+# report "NOTHING was merged" over a fully staged merge.
+test_merge_uncommittable_merge_is_rolled_back() {
+	local before
+	handoff work1 2 >/dev/null; box_up work1
+	before="$(at dev)"
+	printf '#!/bin/bash\nexit 1\n' > "$FIX/repo/.git/hooks/commit-msg"
+	chmod +x "$FIX/repo/.git/hooks/commit-msg"
+	cbx merge work1
+	notok
+	has "would not commit"
+	eq "$(at dev)" "$before" "dev must not move"
+	absent "$FIX/repo/.git/MERGE_HEAD"
+	eq "$(git_ status --porcelain)" "" "nothing may be left staged"
+	# With the hook gone the same command lands it.
+	rm -f "$FIX/repo/.git/hooks/commit-msg"
+	cbx merge work1; ok
+	ne "$(at dev)" "$before" "the retry must land it"
+}
+
+# The other half of the same bug: a merge git wrote and never committed, from an older cbx or from a
+# `git merge` by hand. Merging on top of it would commit somebody else's staged merge under this
+# box's message, so it is refused with both ways out named.
+test_merge_refuses_an_uncommitted_merge() {
+	local before
+	handoff work1 1 >/dev/null; box_up work1
+	local sha; sha="$(commit_on dev - "side: c" c.txt "side version")"
+	git_ branch side "$sha"
+	before="$(at dev)"
+	git_ merge --no-commit --no-ff side >/dev/null 2>&1 || true
+	exists "$FIX/repo/.git/MERGE_HEAD"
+	cbx merge work1
+	notok
+	has "never committed"
+	has "merge --abort"
+	eq "$(at dev)" "$before" "dev must not move"
+	git_ merge --abort
+	cbx merge work1; ok
+}
+
 # ASK BEFORE THE MESS. A merge that will conflict is worth knowing about while dev is still untouched:
 # the usual answer is "stop and rebase the agent first", and that decision is much cheaper before a
 # half-merged worktree than after one.
@@ -2530,6 +2626,7 @@ test_aliases_completion() {
 		branch dev
 		branch release/2025
 		rbox wasKilled
+		mbox minto-staging
 		cmd minto
 		cmd afutureverb
 		flag merge --squash
@@ -2546,6 +2643,8 @@ test_aliases_completion() {
 	    try 'cbx'              FIRSTWORD   'mint';
 	    try 'cbx minto'        BRANCHES    '';
 	    try 'cbx minto'        MINTOFLAGS  '--';
+	    try 'cbx minto staging --accept' ACCEPT '';
+	    try 'cbx minto staging --intent' INTENT '';
 	    try 'cbx merge'        FLAGSBEFORE '--';
 	    try 'cbx merge work1'  FLAGSAFTER  '--';
 	    try 'cbx afutureverb'  FROMHUB     '--';
@@ -2554,6 +2653,16 @@ test_aliases_completion() {
 	has "FIRSTWORD: minto"
 	has "BRANCHES: dev release/2025"
 	case "$OUT" in *"MINTOFLAGS: "*--here*) ;; *) fail "minto flags should complete" ;; esac
+	# `--accept <TAB>` takes a BOX resolving that merge — not the branch names minto's own arm offers,
+	# and not every box either. `--intent` takes prose, so nothing at all belongs there.
+	has "ACCEPT: minto-staging"
+	case "$(printf '%s\n' "$OUT" | sed -n 's/^ACCEPT: //p')" in
+		*work1*|*dev*) fail "--accept should offer only the boxes resolving a minto merge" ;;
+	esac
+	has "INTENT: "
+	case "$(printf '%s\n' "$OUT" | sed -n 's/^INTENT: //p')" in
+		?*) fail "--intent takes prose; nothing should be offered" ;;
+	esac
 	# BOTH orders: `merge --squash <box>` and `merge <box> --squash` are both valid command lines.
 	case "$OUT" in *"FLAGSBEFORE: "*--reword*) ;; *) fail "flags must complete BEFORE the box name" ;; esac
 	case "$OUT" in *"FLAGSAFTER: "*--reword*) ;; *) fail "flags must complete after the box name" ;; esac
@@ -2840,6 +2949,28 @@ test_minto_box_spawn_and_brief() {
 	case "$brief" in *"hub/staging"*) ;; *) fail "the briefing must name both branches" ;; esac
 }
 
+# WAIT FOR CLAUDE BEFORE BRIEFING IT. A minto box is the slowest of all to come up — muster-box-init
+# checks the target out and runs the merge before claude is started — and a paste that lands during
+# startup half-arrives: the text reaches the composer, the Enter behind it is swallowed by whatever
+# claude was still drawing, and the briefing sits there unsent while the box looks idle.
+test_minto_box_waits_for_claude() {
+	setup_minto_conflict
+	cbx minto staging --box
+	ok
+	has "waiting for claude to start"
+	hasnt "never reported a session start"
+	stub_saw POST /box/minto-staging/paste || fail "the briefing was never pasted"
+	# No .cbx-state at all (a box image without the activity hooks): say so and brief it anyway, which
+	# is what the old behaviour was for everybody.
+	rm -rf "$FIX/boxes/minto-staging"
+	git_ update-ref -d refs/agents/minto-staging 2>/dev/null || true
+	rm -f "$FIX/repo/.git/cbx/minto-staging.mergeinto"
+	cbx minto staging --box
+	ok
+	has "never reported a session start"
+	stub_saw POST /box/minto-staging/paste || fail "it must still brief a box it cannot hear from"
+}
+
 test_minto_box_queue_review_and_land() {
 	setup_minto_conflict
 	cbx minto staging --box --intent "the staging line"
@@ -2860,7 +2991,7 @@ test_minto_box_queue_review_and_land() {
 	has "THE RESOLUTION"
 	has "the staging line"
 	# Land it.
-	cbx minto staging --land minto-staging
+	cbx minto staging --accept minto-staging
 	ok
 	has "staging is now"
 	ne "$(at staging)" "$tsha" "staging should have moved"
@@ -2875,20 +3006,20 @@ test_minto_land_guards() {
 	setup_minto_conflict
 	cbx minto staging --box
 	minto_agent_resolves staging minto-staging
-	cbx minto other-branch --land minto-staging
+	cbx minto other-branch --accept minto-staging
 	notok; has "not 'other-branch'"
-	cbx minto staging --land nosuchbox
+	cbx minto staging --accept nosuchbox
 	notok; has "not resolving a merge"
 	# Target moved under us.
 	local tsha; tsha="$(at staging)"
 	commit_on staging refs/heads/staging "staging moved" z.txt z >/dev/null
-	cbx minto staging --land minto-staging
+	cbx minto staging --accept minto-staging
 	notok; has "moved since the merge started"
 	git_ update-ref refs/heads/staging "$tsha"
 	# A branch that does not contain dev (the agent squashed or rebased the merge away).
 	local bad; bad="$(commit_on staging - "not a merge" b.txt whatever)"
 	git_ update-ref refs/agents/minto-staging "$bad"
-	cbx minto staging --land minto-staging
+	cbx minto staging --accept minto-staging
 	notok; has "does not contain dev"
 }
 
@@ -2898,6 +3029,10 @@ setup_minto_conflict() {
 	git_ push -q origin staging
 	commit_on staging refs/heads/staging "staging: b" b.txt "staging version" >/dev/null
 	commit_on dev refs/heads/dev "dev: b" b.txt "dev version" >/dev/null
+	# --box waits for the box's claude to announce itself before it pastes the briefing (see
+	# test_minto_box_waits_for_claude), so the fixture states that it did.
+	export MUSTER_JOB_BRIEF_SETTLE=0 MUSTER_JOB_START_TIMEOUT=2
+	box_state minto-staging idle 60
 }
 
 # What the resolving agent does in its box, done here with a worktree: merge dev into the target,
@@ -4217,6 +4352,9 @@ run "merge: already-contained closes out"          test_merge_already_contained_
 run "merge: a conflict leaves a way out"           test_merge_conflict_leaves_a_way_out
 run "merge: refuses over dirty files it would overwrite" test_merge_refuses_over_dirty_files
 run "merge: a failed merge is not always a conflict" test_merge_failure_is_not_always_a_conflict
+run "merge: --edit with an empty message changes nothing" test_merge_edit_empty_message_touches_nothing
+run "merge: an uncommittable merge is rolled back" test_merge_uncommittable_merge_is_rolled_back
+run "merge: refuses an uncommitted merge"          test_merge_refuses_an_uncommitted_merge
 run "merge: a conflict asks before touching dev"   test_merge_conflict_asks_first
 run "merge: --reword rewrites messages only"       test_merge_reword_rewrites_messages_only
 run "merge: --reword keeps edits when you quit"    test_merge_reword_keeps_edits_when_you_quit
@@ -4314,8 +4452,9 @@ run "minto: a conflict is non-interactive safe"    test_minto_conflict_is_nonint
 run "minto: --here worktree round trip"            test_minto_here_worktree_roundtrip
 run "minto: --abort leaves nothing behind"         test_minto_abort_leaves_nothing_behind
 run "minto: --box spawns and briefs the agent"     test_minto_box_spawn_and_brief
+run "minto: --box waits for claude before briefing" test_minto_box_waits_for_claude
 run "minto: --box queue, review and land"          test_minto_box_queue_review_and_land
-run "minto: --land guards"                         test_minto_land_guards
+run "minto: --accept guards"                         test_minto_land_guards
 
 run "box-init: a minto box opens on the conflict"  test_box_init_minto_sets_up_the_conflict
 run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box

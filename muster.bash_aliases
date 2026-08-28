@@ -884,6 +884,10 @@ docker exec "$hub" muster ls 2>/dev/null | awk '
 docker exec "$hub" git -C /home/dev/repo for-each-ref --format='box %(refname:strip=2)' refs/agents/ 2>/dev/null
 # Branches, for the commands that take one (minto, push, pull).
 docker exec "$hub" git -C /home/dev/repo for-each-ref --format='branch %(refname:strip=2)' refs/heads/ 2>/dev/null
+# The boxes RESOLVING a minto merge — one <box>.mergeinto state file each. `minto <target> --accept`
+# takes only these, and it is a much smaller set than the boxes: offering all of them there names the
+# one thing the command must refuse.
+docker exec "$hub" sh -c 'for f in /home/dev/repo/.git/cbx/*.mergeinto; do [ -f "$f" ] || continue; f=${f##*/}; echo "mbox ${f%.mergeinto}"; done' 2>/dev/null
 # SUBCOMMANDS AND FLAGS, FROM THE HUB'S OWN HELP. Not from a list kept here: this file and the hub
 # image are deployed by different paths and drift apart for weeks at a time, and a completion that
 # has never heard of `minto` is worse than none — it looks like the command does not exist. `muster
@@ -1024,8 +1028,9 @@ _muster_cache_box() {
 _muster_refresh() { rm -f "$(_muster_cache_file)"; _muster_complete_cache >/dev/null; echo "${_MUSTER_SELF:-cbx}: completion cache refreshed"; }
 
 _muster_complete() {
-	local cur cmd sub
+	local cur prev cmd sub
 	cur="${COMP_WORDS[COMP_CWORD]}"
+	prev="${COMP_WORDS[COMP_CWORD-1]:-}"
 	cmd="${COMP_WORDS[1]:-}"
 	COMPREPLY=()
 
@@ -1053,7 +1058,7 @@ _muster_complete() {
 		case "$cmd" in
 			merge)     flags="$flags --squash --edit --landed --reword -r" ;;
 			review)    flags="$flags --full --net --tui --plain" ;;
-			minto)     flags="$flags --here --box --intent --land --landed --abort --pull" ;;
+			minto)     flags="$flags --here --box --intent --accept --landed --abort --pull" ;;
 			fix)       flags="$flags -m --force" ;;
 			prereview) flags="$flags --force" ;;
 			rebase)    flags="$flags --force" ;;
@@ -1067,6 +1072,16 @@ _muster_complete() {
 		esac
 		COMPREPLY=($(compgen -W "$flags" -- "$cur" | sort -u))
 		return
+	fi
+
+	# The argument of a flag that takes one, which the per-command table cannot see: it keys on the
+	# command alone, so `minto <target> --accept <TAB>` would go on offering branch names. --intent
+	# takes prose, where anything offered is noise.
+	if [ "$cmd" = minto ]; then
+		case "$prev" in
+			--accept) COMPREPLY=($(compgen -W "$(_muster_names mbox)" -- "$cur")); return ;;
+			--intent) return ;;
+		esac
 	fi
 
 	case "$cmd" in

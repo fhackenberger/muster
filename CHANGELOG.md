@@ -99,7 +99,43 @@ releases and are not listed here.
   left open. Dry-run unless `--reap`, and it refuses to run at all when the broker cannot say which
   boxes are live, because then every session would look orphaned.
 
+### Changed
+- **`muster minto <target> --land <box>` is now `--accept <box>`** (no alias — the old spelling is
+  gone). `--land` sat one letter away from `merge --landed`, which means the opposite: `--landed` is
+  bookkeeping for work that is *already* in the branch, while this is the step that actually moves
+  `<target>` onto the agent's resolved merge. `minto --landed` (the `--here` worktree counterpart)
+  keeps its name.
+- **`minto <target> --accept <TAB>` completes box names**, on the hub and through the laptop aliases,
+  and only the boxes that are actually resolving a merge (one `<box>.mergeinto` state file each) —
+  offering every box there names the one thing the command must refuse. Before, both completions kept
+  offering branch names after the flag, because they key on the command alone. `--intent <TAB>` now
+  offers nothing, which is the right answer for a flag that takes prose.
+
 ### Fixed
+- **`muster merge --edit` with an empty message left a merge you could not retry.** `git merge --edit`
+  opens the editor *after* the merge is in the index and the worktree, so leaving the buffer empty
+  aborts the **commit**, not the merge: git keeps `MERGE_HEAD` and a fully staged merge. Nothing is
+  conflicted in that state, which is the signal `merge` uses to tell a real conflict from a merge git
+  refused outright — so it reported "git refused the merge and NOTHING was merged", and the next
+  `muster merge` found its own half-finished merge and refused again, this time as "you have
+  uncommitted changes to the files this box touches, commit them first". Two commands, both saying
+  the opposite of what had happened, and no way to simply try again.
+
+  The message is composed **before** anything is merged now: `--edit` opens the editor on the same
+  seeded buffer as before, and an empty one cancels while `dev`, the index and the worktree are still
+  untouched — so the same command works on the second try. The `Cbx-Box:` trailer is re-appended after
+  editing rather than trusted to survive it, because `merge --undo` finds the merge by it. As a net
+  for every *other* way a merge can be written but not committed (a `commit-msg` hook that says no),
+  `merge` now recognises that state and rolls it back with `git merge --abort` instead of claiming
+  nothing happened — and a merge left uncommitted by an older version or by hand is refused up front,
+  naming both ways out.
+- **A `minto` conflict box got its briefing but never sent it.** `minto --box` pasted the briefing the
+  moment the broker returned, while the box was still starting — and that box is the slowest of all,
+  because `muster-box-init` checks the target out and merges `dev` into it before claude is even
+  started. The text reached the composer but the Enter behind it was swallowed by whatever claude was
+  still drawing, so the prompt sat there unsent and the box looked idle. It now waits for the box's
+  claude to announce itself (the same `.cbx-state` wait `muster job` has always done) before pasting,
+  and says so while it waits; a box that never reports one is briefed anyway, with a warning.
 - **Every image build failed once pinchtab 0.15.2 was out.** Its postinstall stopped downloading the
   binary to `$HOME/.pinchtab/bin/<version>/` — the reason `common-setup.sh` redirects `HOME` at all —
   and now writes a package-relative `.managed-bin/<version>/` inside the installed module. The install

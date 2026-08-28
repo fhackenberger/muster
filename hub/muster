@@ -77,7 +77,8 @@ set -euo pipefail
 #                                           #   at a different box). Lists them; --reap closes them
 #   $SELF merge  <box> [--squash] [--edit]    # merge the agent branch into dev
 #                                           #   --squash = one commit, --edit = reword it yourself
-#                                           #   (--edit on a 1-commit branch: no merge commit)
+#                                           #   (--edit on a 1-commit branch: no merge commit; an
+#                                           #   EMPTY message cancels and nothing is touched)
 #             [--reword|-r]                 #   KEEP every commit and rewrite each MESSAGE, in a little
 #                                           #   editor loop: lists the commits, [n] edits one, [a] all,
 #                                           #   [d<n>] shows its diff, [r<n>] reverts to the agent's
@@ -103,7 +104,7 @@ set -euo pipefail
 #                                           #   --here = a linked worktree under .git/cbx/wt you resolve
 #             [--intent "..."]              #   what the branch is FOR ("integration for staging") —
 #                                           #   remembered per branch, and handed to the agent
-#             --land <box>                  #   take the agent's resolved merge, move the branch onto it
+#             --accept <box>                #   take the agent's resolved merge, move the branch onto it
 #             --landed                      #   you finished the --here worktree: verify + tear it down
 #             --abort                       #   drop whatever minto has open for that branch
 #             --pull                        #   fast-forward the branch to origin first
@@ -1118,6 +1119,20 @@ merge_failed() {
 	if [ -n "$(git_ ls-files --unmerged)" ]; then
 		die "merge conflicts — resolve them in $REPO and commit, then run: $SELF merge '$1'${2:+ $2}   (to retire the branch and tell the box)"
 	fi
+	# THE THIRD STATE: git merged cleanly and then refused to COMMIT — an empty message is how, and a
+	# rejecting commit-msg hook is the other. Nothing is conflicted, but MERGE_HEAD and a fully staged
+	# merge are sitting in the worktree, so "NOTHING was merged" would be a lie and the next
+	# `$SELF merge` would report its own half-finished merge back at you as "uncommitted changes you
+	# must commit first" — with no way out that does not involve knowing git's merge state by heart.
+	# Undo it: no conflicts and (per merge_blockers) no local change in the merge's way, so --abort
+	# restores exactly what was there before.
+	if git_ rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+		echo "$SELF: git merged but would not commit it (an empty message does this) — nothing is" >&2
+		echo "$SELF: conflicted, so the merge has been rolled back and $DEV is untouched." >&2
+		git_ merge --abort \
+			|| die "could not roll it back — finish or abort it by hand in $REPO (git merge --abort)"
+		die "the merge was not committed and has been undone — run the same command again"
+	fi
 	echo "$SELF: git refused the merge and NOTHING was merged — $DEV is untouched and there is" >&2
 	echo "$SELF: nothing to resolve and nothing to close out. Read git's message above; if it" >&2
 	echo "$SELF: names files, commit those paths yourself (not 'git add -A', not 'git stash')" >&2
@@ -1334,7 +1349,7 @@ status_overview() {
 			# No conflict scan: a merge box collides with $DEV and with every other box by construction.
 			case "$st" in
 				new|re-review) todo+=("$SELF review $box            # the conflict resolution for $mtgt") ;;
-				*)             todo+=("$SELF minto $mtgt --land $box   # land the resolved merge") ;;
+				*)             todo+=("$SELF minto $mtgt --accept $box   # land the resolved merge") ;;
 			esac
 			continue
 		fi
@@ -1896,7 +1911,7 @@ review() {
 		mark_reviewed "$box" "$sha"
 		echo
 		echo "$SELF: reviewed $(git_ rev-parse --short "$sha")."
-		echo "$SELF: land it     — $SELF minto $mtgt --land $box"
+		echo "$SELF: land it     — $SELF minto $mtgt --accept $box"
 		echo "$SELF: or fix it   — $SELF fix $box -m 'take the ... side in <file>, because ...'"
 		echo "$SELF: or drop it  — $SELF minto $mtgt --abort"
 		return 0
@@ -2754,6 +2769,38 @@ reword_apply() {
 	printf '%s' "$parent"
 }
 
+# Open $EDITOR on the message a merge is ABOUT TO make, and refuse an empty one while the tree is
+# still untouched. $1 = seed file (rewritten in place with the final message), $2 = box.
+# Non-zero means "empty message" — and because nothing has been merged yet, that costs nothing.
+#
+# WHY NOT `git merge --edit` / `git commit -e`: git opens the editor AFTER it has written the merge
+# into the index and the worktree, so an empty message aborts the COMMIT and not the MERGE. What it
+# leaves behind is a fully staged merge with MERGE_HEAD set and no conflicts — which merge_failed
+# read as "nothing happened", and which the next `$SELF merge` then found as "you have uncommitted
+# changes to the files this box touches, commit them first". Two commands, both telling you the
+# opposite of what had happened, and no way to simply try again. Editing first removes the state
+# entirely: with no message there is no merge.
+merge_edit_msg() {
+	local f="$1" box="$2" body
+	# The editor talks to the terminal, but --edit from a script or a test has no controlling tty and
+	# must still work — $EDITOR is then whatever that caller set it to. The test is a real open, not
+	# `[ -c /dev/tty ]`: the device node exists in a container with no controlling terminal too, and
+	# redirecting to it there fails and would leave the editor unrun with the buffer untouched.
+	if { : >/dev/tty; } 2>/dev/null; then
+		"${EDITOR:-${VISUAL:-vim}}" "$f" </dev/tty >/dev/tty 2>&1 || true
+	else
+		"${EDITOR:-${VISUAL:-vim}}" "$f" || true
+	fi
+	# --cleanup=strip semantics, done here because nothing is committed yet: drop comment lines and
+	# leading/trailing blank lines.
+	body="$(grep -v '^#' "$f" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac)"
+	[ -n "${body//[[:space:]]/}" ] || return 1
+	printf '%s\n' "$body" > "$f"
+	# The trailer is what `$SELF merge --undo` finds the merge by, so it is re-appended rather than
+	# trusted to survive the editor.
+	grep -q "^Cbx-Box: $box\$" "$f" || printf '\nCbx-Box: %s\n' "$box" >> "$f"
+}
+
 merge() {
 	argsort "" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
 	[ $# -ge 1 ] || die "merge needs a box name"
@@ -2785,7 +2832,7 @@ merge() {
 		echo "$SELF: '$box' is resolving a merge of $DEV INTO $mtgt — it does not belong in $DEV." >&2
 		echo "$SELF: merging it here would pull all of $mtgt's history into $DEV." >&2
 		echo "$SELF: review it — $SELF review $box" >&2
-		echo "$SELF: land it   — $SELF minto $mtgt --land $box" >&2
+		echo "$SELF: land it   — $SELF minto $mtgt --accept $box" >&2
 		echo "$SELF: drop it   — $SELF minto $mtgt --abort" >&2
 		die "refusing to merge a minto box into $DEV"
 	fi
@@ -2801,6 +2848,16 @@ merge() {
 		echo "$SELF: finish it   — resolve them, 'git add' + 'git commit', then: $SELF merge $box${squash:+ --landed}" >&2
 		echo "$SELF: or drop it  — git -C $REPO merge --abort   (then '$SELF merge $box' from scratch)" >&2
 		die "refusing to merge on top of an unfinished merge"
+	fi
+	# The same thing without the conflicts: a merge that git wrote and never committed (an empty
+	# message in the editor is how you get one). Merging again on top of it would commit somebody
+	# else's staged merge under this box's message, so name it and both ways out.
+	if git_ rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+		echo "$SELF: $REPO has a merge of $(git_ log -1 --format=%s MERGE_HEAD 2>/dev/null || echo 'another branch') that was never committed." >&2
+		echo "$SELF: nothing is conflicted — it just has no commit message yet." >&2
+		echo "$SELF: finish it  — git -C $REPO commit          (then: $SELF merge $box)" >&2
+		echo "$SELF: or drop it — git -C $REPO merge --abort   (then: $SELF merge $box from scratch)" >&2
+		die "refusing to merge on top of an uncommitted merge"
 	fi
 
 	# Already in $DEV? Then the merge happened — most likely you resolved a conflicted one by hand.
@@ -2919,57 +2976,63 @@ merge() {
 		[ -z "$squash" ] && echo "$SELF: one commit — landing it directly (no merge commit); its message is what you'll edit"
 		squash=1 single=1
 	fi
+	# --edit opens an editor seeded with what the agent actually wrote, never a blank buffer — one
+	# commit gives you its own message, several give you all of them (see the branches below).
+	# WRITTEN BEFORE ANYTHING IS MERGED, which is the whole point: see merge_edit_msg.
+	local msgf=""
+	if [ -n "$edit" ]; then
+		msgf="$(mktemp --suffix=.MUSTER_MERGE_MSG)"
+		if [ -n "$single" ]; then
+			# One commit: git's SQUASH_MSG preamble ("Squashed commit of the following:") is noise, so
+			# open the commit's own message instead — you are editing that commit, not summarising.
+			git_ log -1 --format=%B "$ref" > "$msgf"
+		elif [ -n "$squash" ]; then
+			# SEVERAL commits: compose the buffer ourselves rather than using git's SQUASH_MSG, which
+			# indents every message by four spaces under a full `commit <sha> / Author: / Date:`
+			# header — a log to read, not a message to edit: you reflow all of it before you can write
+			# anything. Here each message appears VERBATIM and unindented, separated by a '#' banner
+			# giving position and sha; the banners are stripped with the rest of the comment lines.
+			local c i=0
+			: > "$msgf"
+			while read -r c; do
+				i=$((i + 1))
+				if [ "$i" = 1 ]; then
+					printf '# ── %s/%s · %s ── these ── lines are dropped; write the squashed message below\n' \
+						"$i" "$ncommits" "$(git_ log -1 --format=%h "$c")" >> "$msgf"
+				else
+					printf '\n# ── %s/%s · %s ──\n' "$i" "$ncommits" "$(git_ log -1 --format=%h "$c")" >> "$msgf"
+				fi
+				git_ log -1 --format=%B "$c" >> "$msgf"
+			done < <(git_ rev-list --reverse "$DEV..$ref")
+		else
+			printf '%s\n' "$msg" > "$msgf"
+		fi
+		printf '\n#\n# Lines starting with %s are dropped. An EMPTY message CANCELS the merge, and\n# nothing is touched — %s is left exactly as it is now.\n' "'#'" "$DEV" >> "$msgf"
+		merge_edit_msg "$msgf" "$box" \
+			|| { rm -f "$msgf"; die "empty message — nothing was merged and $DEV is untouched; run the same command again when you have one"; }
+	fi
 	git_ checkout -q "$DEV"
 	before="$(git_ rev-parse HEAD)"
-	# --edit opens an editor seeded with what the agent actually wrote, never a blank buffer — one
-	# commit gives you its own message, several give you all of them (see the two branches below).
-	# git falls back to `vi` when nothing is configured; common-setup.sh puts vim in both images, so
-	# name it explicitly.
-	local -a ed=()
-	[ -n "$edit" ] && ed=(env GIT_EDITOR="${EDITOR:-${VISUAL:-vim}}")
 	if [ -n "$squash" ]; then
 		git_ merge --squash "$ref" || merge_failed "$box" --landed
-		if [ -n "$edit" ]; then
-			if [ -n "$single" ]; then
-				# One commit: SQUASH_MSG's "Squashed commit of the following:" preamble is noise, so
-				# open the commit's own message instead — you are editing that commit, not summarising.
-				"${ed[@]}" git -C "$REPO" commit -e \
-					--author="$(git_ log -1 --format='%an <%ae>' "$ref")" \
-					-m "$(git_ log -1 --format=%B "$ref")" -m "Cbx-Box: $box" \
-					|| die "commit aborted (empty message?) — the change is staged, finish it in $REPO"
-			else
-				# SEVERAL commits: compose the buffer ourselves rather than using git's SQUASH_MSG.
-				# SQUASH_MSG opens with "Squashed commit of the following:" and indents every message
-				# by four spaces under a full `commit <sha> / Author: / Date:` header — a log to read,
-				# not a message to edit: you reflow all of it before you can write anything. Here each
-				# message appears VERBATIM and unindented, separated by a '#' banner giving position
-				# and sha. git strips '#' lines on save (--cleanup=strip), so leaving the buffer as-is
-				# yields the messages one blank line apart, and the banners never reach the commit.
-				local msgf="$REPO/.git/MUSTER_SQUASH_MSG" c i=0
-				: > "$msgf"
-				while read -r c; do
-					i=$((i + 1))
-					if [ "$i" = 1 ]; then
-						printf '# ── %s/%s · %s ── these ── lines are dropped; write the squashed message below\n' \
-							"$i" "$ncommits" "$(git_ log -1 --format=%h "$c")" >> "$msgf"
-					else
-						printf '\n# ── %s/%s · %s ──\n' "$i" "$ncommits" "$(git_ log -1 --format=%h "$c")" >> "$msgf"
-					fi
-					git_ log -1 --format=%B "$c" >> "$msgf"
-				done < <(git_ rev-list --reverse "$DEV..$ref")
-				printf '\nCbx-Box: %s\n' "$box" >> "$msgf"
-				"${ed[@]}" git -C "$REPO" commit --cleanup=strip -e -F "$msgf" \
-					|| { rm -f "$msgf"; die "commit aborted (empty message?) — the squash is staged, finish it in $REPO"; }
-				rm -f "$msgf"
-			fi
+		if [ -n "$msgf" ]; then
+			# --author only for the single-commit case: that commit IS the agent's, so it keeps its
+			# author. A squash of several is a new commit of yours over their work. An ARRAY, because
+			# an author name has spaces in it and `${single:+--author=…}` would word-split it.
+			local -a auth=()
+			[ -n "$single" ] && auth=(--author="$(git_ log -1 --format='%an <%ae>' "$ref")")
+			git_ commit -F "$msgf" ${auth[0]+"${auth[@]}"} \
+				|| { rm -f "$msgf"; die "commit failed — the change is staged, finish it in $REPO"; }
+			rm -f "$msgf"
 		else
 			git_ commit -m "$msg" -m "Cbx-Box: $box" || die "nothing to commit"
 		fi
-	else
+	elif [ -n "$msgf" ]; then
 		# $mref, not $ref: with --reword this is the rewritten chain (same trees, new messages).
-		"${ed[@]+"${ed[@]}"}" git -C "$REPO" merge --no-ff ${edit:+--edit} "$mref" \
-			-m "$msg" -m "Cbx-Box: $box" \
-			|| merge_failed "$box"
+		git_ merge --no-ff -F "$msgf" "$mref" || { rm -f "$msgf"; merge_failed "$box"; }
+		rm -f "$msgf"
+	else
+		git_ merge --no-ff "$mref" -m "$msg" -m "Cbx-Box: $box" || merge_failed "$box"
 	fi
 	after="$(git_ rev-parse HEAD)"
 	[ "$before" != "$after" ] || die "nothing was merged — $DEV is unchanged (already up to date?)"
@@ -3153,7 +3216,7 @@ minto_prepare() {
 	local other; other="$(minto_box_for "$target")"
 	if [ -n "$other" ]; then
 		echo "$SELF: box '$other' is already resolving a merge into $target." >&2
-		echo "$SELF: land it    — $SELF review $other   then   $SELF minto $target --land $other" >&2
+		echo "$SELF: land it    — $SELF review $other   then   $SELF minto $target --accept $other" >&2
 		echo "$SELF: or drop it — $SELF minto $target --abort" >&2
 		die "refusing to start a second merge into $target"
 	fi
@@ -3225,12 +3288,14 @@ EOF
 # exists, so a spawn that fails halfway still leaves something `--abort` can clean up.
 minto_spawn() {
 	local target="$1" tsha="$2" dsha="$3" intent="$4" conflicts="$5"
-	local box resp container
+	local box resp container since
 	box="minto-$(branch_slug "$target")"
 	box="$(printf '%s' "$box" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | cut -c1-31)"
 	mkdir -p "$STATE"
 	printf '%s\n%s\n%s\n%s\n' "$target" "$tsha" "$dsha" "$intent" > "$STATE/$box.mergeinto"
 	echo "$SELF: spawning box '$box' on $target, with $DEV merged in and conflicted"
+	# Read BEFORE the spawn: job_wait_session waits for a session start no older than this.
+	since="$(date +%s)"
 	# base + merge: the broker hands them to muster-box-init, which does the checkout AND the merge in the
 	# box's tmux window BEFORE claude starts. That part must not be a prompt — a prompt is advisory and
 	# asynchronous, and "the agent did not actually run the setup commands" is not a failure you want to
@@ -3240,6 +3305,17 @@ minto_spawn() {
 		die "spawning box '$box' failed: $(broker_err "$resp")"
 	fi
 	container="$(printf '%s' "$resp" | jqr '.container // empty')"
+	# WAIT FOR CLAUDE FIRST, exactly as `$SELF job` does. This box is slower to come up than any
+	# other — muster-box-init checks the target out and runs the merge before claude is even started —
+	# and a paste that arrives during startup half-lands: the text reaches the composer but the Enter
+	# behind it is swallowed by whatever claude was still drawing, so the briefing sits there unsent
+	# and the box looks idle while it waits for a keypress nobody is there to make.
+	echo "$SELF: waiting for claude to start in '$box' before briefing it" >&2
+	if job_wait_session "$box" "$since" "$JOB_START_TIMEOUT"; then
+		sleep "$JOB_BRIEF_SETTLE"
+	else
+		echo "$SELF: '$box' never reported a session start in ${JOB_START_TIMEOUT}s — briefing anyway (are the activity hooks installed in this box image?)" >&2
+	fi
 	if paste_to_box "$box" "$(minto_prompt "$target" "$intent" "$conflicts" "$box")"; then
 		echo "$SELF: briefed $box (both branches, both histories, and what $target is for)"
 	else
@@ -3248,7 +3324,7 @@ minto_spawn() {
 	fi
 	echo "$SELF: next — $SELF q            # watch for the handoff"
 	echo "$SELF:        $SELF review $box  # the resolution alone (combined diff)"
-	echo "$SELF:        $SELF minto $target --land $box"
+	echo "$SELF:        $SELF minto $target --accept $box"
 }
 
 # The by-hand path: a LINKED WORKTREE, so the hub's own checkout stays on $DEV. It lives under
@@ -3299,7 +3375,7 @@ minto_land() {
 		|| die "$box's branch does not contain $DEV — it committed a resolution but dropped the merge (rebased or squashed it?)"
 	n="$(minto_own_count "$box" "$target")"
 	[ "$n" = 1 ] || echo "$SELF: note — the box added $n commit(s), not just the merge ('$SELF review $box --full' shows them)"
-	git_ update-ref -m "$SELF minto --land $box" "refs/heads/$target" "$(git_ rev-parse "$ref")" "$tsha"
+	git_ update-ref -m "$SELF minto --accept $box" "refs/heads/$target" "$(git_ rev-parse "$ref")" "$tsha"
 	# No note copying needed: refs/heads/<target> and refs/agents/<box> now name the SAME commit, and a
 	# cbx note is attached to the commit, not to the ref — deleting the ref leaves the summary in place
 	# (`git log --notes=cbx $target`).
@@ -3363,7 +3439,7 @@ minto_abort() {
 }
 
 minto() {
-	argsort "--intent --land" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	argsort "--intent --accept" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
 	[ $# -ge 1 ] || die "minto needs a target branch: $SELF minto <branch>"
 	local target="$1" intent="" land="" abort="" landed="" dopull="" mode="" a
 	shift
@@ -3372,14 +3448,14 @@ minto() {
 		case "$a" in
 			--intent)   shift; intent="${1:-}"; [ -n "$intent" ] || die "minto: --intent needs text" ;;
 			--intent=*) intent="${a#--intent=}" ;;
-			--land)     shift; land="${1:-}"; [ -n "$land" ] || die "minto: --land needs a box name" ;;
-			--land=*)   land="${a#--land=}" ;;
+			--accept)   shift; land="${1:-}"; [ -n "$land" ] || die "minto: --accept needs a box name" ;;
+			--accept=*) land="${a#--accept=}" ;;
 			--abort)    abort=1 ;;
 			--landed)   landed=1 ;;
 			--pull)     dopull=1 ;;
 			--box)      mode=box ;;
 			--here)     mode=here ;;
-			*) die "minto: unknown option '$a' (--intent '…' | --box | --here | --land <box> | --landed | --abort | --pull)" ;;
+			*) die "minto: unknown option '$a' (--intent '…' | --box | --here | --accept <box> | --landed | --abort | --pull)" ;;
 		esac
 		shift
 	done

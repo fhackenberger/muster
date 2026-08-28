@@ -883,8 +883,12 @@ cbx q — live  (refresh 5s · Enter now · q quits)   14:02:11
   indents it four spaces under a `commit`/`Author:`/`Date:` header — a log to read, not a message to
   edit). A **one-commit** branch opens that commit's own message, so you start typing straight away;
   this holds with or without `--squash`, and the agent stays the author. **Several commits** open all
-  of them verbatim and unindented, separated by a `# ── 2/3 · <sha> ──` banner; git drops `#` lines on
-  save, so leaving the buffer untouched gives you the messages one blank line apart and no banners.
+  of them verbatim and unindented, separated by a `# ── 2/3 · <sha> ──` banner; `#` lines are dropped
+  on save, so leaving the buffer untouched gives you the messages one blank line apart and no banners.
+  The editor runs **before anything is merged**, so an **empty message cancels**: `dev`, the index and
+  the worktree are exactly as they were, and the same command works when you try it again. (`git merge
+  --edit` cannot do that — it opens the editor with the merge already written into the index, so an
+  empty message leaves a staged merge with no commit and nothing conflicted to resolve.)
 - **`cbx merge <box> --reword` keeps every commit and rewrites only the messages.** `--squash --edit`
   gives you one commit you can word yourself, but a branch that is genuinely three changes should land
   as three. `--reword` opens a small loop over the commits instead:
@@ -1092,17 +1096,21 @@ The agent gets both branches (`hub/<target>`, `hub/dev`), `merge.conflictstyle=z
 shows the common **base** and not just the two sides, and a briefing built around `git log --merge`,
 which lists the commits *from both sides* behind each conflicted file. It is told to flag a conflict
 it can't resolve rather than guess, and that its golden came from `dev` so the tree may not compile
-if `<target>` differs in build config.
+if `<target>` differs in build config. The briefing is pasted only once that box's claude has
+announced itself — the same `.cbx-state` wait `cbx job` does, and this box is the slowest of all to
+come up, because the checkout and the merge happen before claude is started. A paste that lands
+during startup half-arrives: the text reaches the composer and the Enter behind it is swallowed, so
+the briefing sits there unsent while the box looks idle.
 
 ```sh
 cbx q                              # BOX  ... STATUS  SUMMARY: [minto -> staging] resolved 3 conflicts…
 cbx review minto-staging           # the RESOLUTION alone — `git show --cc`, hunks matching neither side
 cbx fix minto-staging -m '…'       # not convinced? send it back, same as any box
-cbx minto staging --land minto-staging
+cbx minto staging --accept minto-staging
 cbx push staging
 ```
 
-`--land` verifies before it moves anything: the target is still where it was, and the agent's commit
+`--accept` verifies before it moves anything: the target is still where it was, and the agent's commit
 contains **both** `<target>` and `dev` (i.e. it really is that merge, not a rebase or a squash). Then
 it fast-forwards the branch, keeps the handoff summary as a `cbx` note on the merge commit, drops the
 agent ref and retires the box. **`cbx merge` refuses a minto box outright** — merging it into `dev`

@@ -52,6 +52,19 @@ _muster_boxes() {
 	git -C "${CHECKOUT:-/home/dev/repo}" for-each-ref --format='%(refname:strip=2)' refs/agents/ 2>/dev/null
 }
 
+# The boxes that are resolving a `minto` merge — one `<box>.mergeinto` state file each, written when
+# the box is spawned and removed when it lands or is aborted. A DIFFERENT set from _muster_boxes on
+# purpose: `minto <target> --accept` takes only these, and offering every agent box there names the one
+# thing the command must refuse (a box that never resolved that merge).
+_muster_minto_boxes() {
+	local f
+	for f in "${CHECKOUT:-/home/dev/repo}"/.git/cbx/*.mergeinto; do
+		[ -f "$f" ] || continue
+		f="${f##*/}"
+		printf '%s\n' "${f%.mergeinto}"
+	done
+}
+
 _muster_services() {
 	local f
 	for f in "${HUB_SERVICES_DIR:-/work/hub-services}"/*; do
@@ -87,6 +100,16 @@ _muster_complete() {
 			mapfile -t COMPREPLY < <(compgen -W "$subs" -- "$cur")
 			return 0
 		fi
+	fi
+
+	# THE ARGUMENT OF A FLAG, which the per-command table below cannot see: it keys on the command
+	# alone, so `minto <target> --accept <TAB>` would go on offering branch names where only a box is
+	# accepted. --intent takes prose, and completing anything at all into it is noise.
+	if [ "$cmd" = minto ]; then
+		case "$prev" in
+			--accept) mapfile -t COMPREPLY < <(compgen -W "$(_muster_minto_boxes)" -- "$cur"); return 0 ;;
+			--intent) return 0 ;;
+		esac
 	fi
 
 	case "$cmd" in
