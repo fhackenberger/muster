@@ -112,6 +112,18 @@ releases and are not listed here.
   offers nothing, which is the right answer for a flag that takes prose.
 
 ### Fixed
+- **The role's `MUSTER_CONF_DIR` check failed every `--check` run.** The probe that reads the variable
+  out of the deployed env file is a `shell:` task, and Ansible skips those in check mode — a skipped
+  probe registers no stdout, which the comparison cannot tell apart from an env file that says
+  nothing, so a stack with `claude_box_conf_dir: conf` was reported as disagreeing with itself. It is
+  a read-only `sed`, so it now runs in check mode too (`check_mode: false`).
+
+  The disagreement is also no longer fatal in a check run. `template:` has not written the new env
+  file at that point, so the file being read is guaranteed stale: a stack being *moved* into a conf
+  dir — or deployed for the first time — still reads as the old value or as none, and failing there
+  is a check run that cannot pass until the change it is checking has been applied. Check mode says
+  it and carries on; a real run still stops the play.
+
 - **`muster merge --edit` with an empty message left a merge you could not retry.** `git merge --edit`
   opens the editor *after* the merge is in the index and the worktree, so leaving the buffer empty
   aborts the **commit**, not the merge: git keeps `MERGE_HEAD` and a fully staged merge. Nothing is

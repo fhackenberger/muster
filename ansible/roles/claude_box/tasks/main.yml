@@ -102,16 +102,37 @@
   register: claude_box_env_conf_dir
   changed_when: false
   failed_when: false
+  # READ-ONLY, so it must run in `--check` too. Ansible skips `shell:` in check mode, and a skipped
+  # probe registers no stdout at all — which the comparison below cannot tell apart from an env file
+  # that says nothing, i.e. every check run would report a mismatch against '.'.
+  check_mode: false
   tags: [containers-claude-box-files]
 
+# A CHECK RUN COMPARES AGAINST THE DEPLOYED FILE, which is the one thing check mode guarantees is
+# stale: `template:` has not written the new env file, so a stack that is being MOVED into a conf dir
+# (or deployed for the first time) still reads as the old value, or as nothing. Failing there would
+# be a check run that cannot succeed until the change it is checking has been applied — the wrong way
+# round. So the disagreement is still said, and only a real run treats it as fatal.
 - name: Fail when MUSTER_CONF_DIR and claude_box_conf_dir disagree
   fail:
-    msg: >-
+    msg: "{{ claude_box_conf_dir_mismatch }}"
+  when: claude_box_conf_dir_disagrees | bool and not ansible_check_mode
+  vars: &claude_box_conf_dir_check
+    claude_box_conf_dir_mismatch: >-
       claude_box_conf_dir is '{{ claude_box_conf_dir }}' but {{ claude_box_env_file }} sets
       MUSTER_CONF_DIR to '{{ claude_box_env_conf_dir.stdout | default("") | trim or "." }}'.
       Ansible would template the config files into one directory and compose would mount the other,
       which docker creates as empty dirs — set both to the same relative path.
-  when: (claude_box_env_conf_dir.stdout | default('') | trim or '.') != (claude_box_conf_dir | regex_replace('/$', '') or '.')
+    claude_box_conf_dir_disagrees: >-
+      {{ (claude_box_env_conf_dir.stdout | default('') | trim or '.')
+         != (claude_box_conf_dir | regex_replace('/$', '') or '.') }}
+  tags: [containers-claude-box-files]
+
+- name: Note the disagreement in check mode (the deployed env file is the stale one here)
+  debug:
+    msg: "{{ claude_box_conf_dir_mismatch }} (--check: comparing against the file already on the host)"
+  when: claude_box_conf_dir_disagrees | bool and ansible_check_mode
+  vars: *claude_box_conf_dir_check
   tags: [containers-claude-box-files]
 
 - name: Symlink .env to the compose env file so docker compose picks it up
