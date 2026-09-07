@@ -1311,6 +1311,31 @@ docker compose logs box-broker | grep claude-settings   # what the merge did, or
 cbx recreate all                                        # boxes read settings.json at session start
 ```
 
+#### The 30 days that used to eat the conversations
+
+A box **is** its conversation: its session id is pinned in the box dir and resumed across every kill,
+recreate and golden move, so a box you come back to months later still knows how it got there. But
+the transcripts live in the one `~/.claude` the whole stack shares, and claude prunes that directory
+**at startup**, against `cleanupPeriodDays` — 30 days by default, and it prunes *all* of it, not just
+the session it is opening. So the boxes that had been quiet longest were deleted by whichever box
+started that morning, and their next `recreate` fell back to a new conversation under the same id: a
+box back on its own branch, with its work, remembering nothing. The only trace was one line in the
+broker's log.
+
+Two things changed. The broker writes `cleanupPeriodDays` (`CLAUDE_RETENTION_DAYS`, default 3650)
+into the shared `settings.json` whenever nothing else has — your `claude-settings.json` is merged
+first, so a number you name wins, and `CLAUDE_RETENTION_DAYS=0` opts out entirely. And a resume that
+could not find its transcript is now reported to the hub, so `cbx box` and `cbx recreate` say
+**NO CONVERSATION RESTORED** instead of "each resumes its own session".
+
+```sh
+# what is actually on disk for a box, when one comes back looking blank
+sid=$(cat data/boxes/<box>/session-id); ls -l data/claude/projects/-home-dev-repo/$sid.jsonl
+grep -n cleanupPeriodDays data/claude/settings.json
+```
+
+Transcripts already deleted are gone — this stops the next month's, not the last one's.
+
 
 ### A box may sit on an older golden
 

@@ -3615,6 +3615,95 @@ PYEOF
 	ok; has ok
 }
 
+# THE 30 DAYS THAT ATE THE BOXES. claude prunes ~/.claude/projects at startup against
+# cleanupPeriodDays (default 30) — the WHOLE directory, not just the session it is opening — and every
+# box in a stack shares that directory. So the boxes left idle longest were deleted by whichever box
+# started that morning, and their next recreate resumed nothing: a box back on its branch with its
+# work and no memory. The broker asserts a long retention when nothing else has.
+test_broker_transcript_retention() {
+	fixture
+	mkdir -p "$FIX/claude"
+	echo '{"model": "opus"}' > "$FIX/claude/settings.json"
+	OUT="$(CLAUDE_HOME="$FIX/claude" BOX_UID=4242 BOX_GID=4242 \
+		python3 - "$BROKER_PY" "$FIX" <<'PYEOF' 2>&1
+import importlib.util, json, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+S = os.path.join(os.environ["CLAUDE_HOME"], "settings.json")
+load = lambda: json.load(open(S))
+
+b.ensure_transcript_retention()
+assert load()["cleanupPeriodDays"] == 3650, load()
+assert load()["model"] == "opus", load()          # and takes nothing else with it
+
+# Idempotent: it runs on every single spawn.
+before = open(S).read()
+b.ensure_transcript_retention()
+assert open(S).read() == before, "rewrote a file it had nothing to change"
+
+# A NUMBER SOMEONE ELSE CHOSE IS THEIRS — the project's claude-settings.json (merged first) or a hand
+# edit. This is a floor for stacks that never thought about it, not a policy.
+d = load(); d["cleanupPeriodDays"] = 7; json.dump(d, open(S, "w"))
+b.ensure_transcript_retention()
+assert load()["cleanupPeriodDays"] == 7, load()
+
+# Opt out entirely and claude keeps its own default.
+os.remove(S)
+open(S, "w").write("{}")
+b.CLAUDE_RETENTION_DAYS = 0
+b.ensure_transcript_retention()
+assert "cleanupPeriodDays" not in load(), load()
+b.CLAUDE_RETENTION_DAYS = 3650
+
+# settings.json is the file with the LOGIN in it: one we cannot parse is not rewritten.
+open(S, "w").write("{ not json at all")
+b.ensure_transcript_retention()
+assert open(S).read() == "{ not json at all", "an unparseable settings.json must be left alone"
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
+# A LOST CONVERSATION MUST NOT BE SILENT. session_args falls back to a new conversation under the same
+# id when the transcript is gone — the right call — and for a month the only trace of it was a line in
+# the broker log nobody reads, while `recreate` cheerfully said "each resumes its own session". The
+# broker reports the fact now and the hub prints it, for one box and for all of them.
+test_recreate_reports_a_lost_session() {
+	local port pid
+	port=$(( STUB_PORT + 21 ))
+	STUB_LOG="$FIX/stub21.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" STUB_SESSION_LOST="amnesiac" \
+		python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+
+	cbx box amnesiac >/dev/null 2>&1
+	cbx box remembers >/dev/null 2>&1
+
+	cbx recreate amnesiac
+	ok
+	has "NO CONVERSATION RESTORED"
+	has "cleanupPeriodDays"
+
+	# The box that kept its session says nothing — a warning printed for every recreate is one nobody
+	# reads by the second week.
+	cbx recreate remembers
+	ok
+	grep -q "NO CONVERSATION RESTORED" <<<"$OUT" && fail "warned about a box whose session was fine"
+
+	# `recreate all` answers with a LIST, not a boolean, and forty boxes at once is exactly where this
+	# must not be swallowed.
+	cbx recreate all
+	ok
+	has "NO CONVERSATION RESTORED"
+	has "amnesiac"
+
+	kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+	unset BROKER_URL
+}
+
 # THE PROMPT NOBODY IS THERE TO ANSWER. claude asks "Is this a project you trust?" on the first use
 # of a directory and BLOCKS — which in an unattended box is forever, and does not even look like a
 # hang: `muster job` sees a claude that started fine and never proceeds, so it reads as a slow spawn
@@ -4473,6 +4562,8 @@ run "broker: the spawn route checks for it first"   test_broker_spawn_route_reat
 run "broker: permission mode passes through"       test_broker_box_mode
 run "broker: activity hooks, stale ones pruned"    test_broker_activity_hooks
 run "broker: the stack's claude settings merge in" test_broker_claude_settings
+run "broker: transcripts outlive claude's 30 days" test_broker_transcript_retention
+run "recreate: a lost conversation is reported"    test_recreate_reports_a_lost_session
 run "broker: a box is not asked about trust"      test_broker_claude_json_trust
 run "broker: messages target claude's pane"        test_broker_box_target
 run "broker: a killed box frees its port slot"     test_broker_slot_reuse

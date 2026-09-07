@@ -918,6 +918,7 @@ box_new() {
 			echo "$SELF: box '$name' up as '$container' on branch agent/$name (golden $(printf '%s' "$resp" | jqr '.golden // empty'))."
 			;;
 	esac
+	session_lost_warning "$resp"
 	echo "  docker exec -it -u dev $container tmux attach -t main      # Ctrl-b d to detach"
 }
 
@@ -952,6 +953,23 @@ box_recreate() {
 		resp="$(broker POST "/recreate/${target}${q}")" || die "recreate '$target' failed: $resp"
 		echo "$SELF: box '$target' recreated as '$(printf '%s' "$resp" | jqr '.container // empty')'."
 	fi
+	session_lost_warning "$resp"
+}
+
+# "Each resumes its own session" is a PROMISE, and this is what says so when it was not kept: the box
+# had a session id, a resume was asked for, and the transcript was not on disk any more — so the agent
+# is back on its branch, with its work, and no memory of any of it. Nothing said so before, which is
+# how a month of boxes lost their conversations one at a time without anyone noticing. An older broker
+# sends no such field and this prints nothing.
+session_lost_warning() {
+	local lost
+	# One box answers with a boolean, `recreate all` with the list of names — one reader for both.
+	lost="$(printf '%s' "$1" | jqr 'if (.session_lost|type) == "array" then (.session_lost|join(", ")) elif .session_lost then .box else empty end')"
+	[ -n "$lost" ] || return 0
+	printf '%s%s: NO CONVERSATION RESTORED for: %s%s\n' "$C_B$C_YEL" "$SELF" "$lost" "$C_RESET"
+	echo   "  the transcript was gone, so this is a NEW conversation under the same session id — brief it again."
+	echo   "  If that was not deliberate, check cleanupPeriodDays in ~/.claude/settings.json: claude deletes"
+	echo   "  transcripts older than 30 days BY DEFAULT, for every box at once, whenever any box starts."
 }
 
 forwards_refresh() {

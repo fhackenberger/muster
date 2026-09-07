@@ -116,6 +116,15 @@ MUSTER_SCRIPT = os.environ.get("MUSTER_SCRIPT", "/usr/local/bin/muster-box.sh")
 # into the shared ~/.claude/settings.json on every spawn. Optional; see ensure_claude_settings() and
 # claude-settings.example.json.
 CLAUDE_SETTINGS_FILE = os.environ.get("CLAUDE_SETTINGS_FILE", "")
+# How long a box's CONVERSATION is kept, in days — asserted into the shared ~/.claude/settings.json as
+# `cleanupPeriodDays` when nothing else sets it. claude's own default is 30 days and it prunes on
+# startup; see ensure_transcript_retention() for why that default is wrong for a stack of boxes. 0
+# opts out and leaves claude to its default. EMPTY is not 0: compose passes `${CLAUDE_RETENTION_DAYS:-}`
+# and a stack that never sets it would otherwise switch the protection off by saying nothing.
+try:
+	CLAUDE_RETENTION_DAYS = int(os.environ.get("CLAUDE_RETENTION_DAYS", "").strip() or "3650")
+except ValueError:
+	CLAUDE_RETENTION_DAYS = 3650
 
 # Which muster this is, baked into the image (see the Dockerfiles). Reported over /version so the hub
 # can tell you when the two have drifted apart — three images, three build paths, and otherwise
@@ -1096,6 +1105,55 @@ def ensure_claude_settings():
 		os.replace(tmp, stamp_path)
 
 
+def ensure_transcript_retention():
+	"""Stop claude deleting the boxes' conversations out from under them.
+
+	A BOX IS ITS CONVERSATION. session_args() pins a session id per box and resumes it across every
+	kill, recreate and golden move, precisely so a box you come back to after a month still knows how
+	it got where it is. But the transcripts live in the ONE ~/.claude that the hub and every box share,
+	and claude prunes that directory at STARTUP against `cleanupPeriodDays` — 30 days by default, and
+	it prunes the whole directory, not just the session it is opening. So the boxes that had been
+	quiet longest were deleted by whichever box happened to start that morning, and the resume then
+	fell back to --session-id with the same id: a box that comes back looking right, on its own branch,
+	with its work intact, remembering nothing. Which is how this was found — one box at a time, long
+	after the transcript that would have explained it was gone.
+
+	Set only when nobody else has. The project's claude-settings.json is merged BEFORE this (see the
+	call order in create_box), so a stack that names cleanupPeriodDays keeps its own number, and a
+	value someone edited in by hand is theirs. This is a floor for stacks that never thought about it,
+	not a policy — CLAUDE_RETENTION_DAYS=0 turns it off and leaves claude to its default.
+
+	An unparseable settings.json is left completely alone, for the same reason as everywhere else in
+	this file: it is where the login lives."""
+	if not CLAUDE_HOME or CLAUDE_RETENTION_DAYS <= 0:
+		return
+	path = os.path.join(CLAUDE_HOME, "settings.json")
+	data = {}
+	if os.path.exists(path):
+		try:
+			with open(path) as fh:
+				data = json.load(fh)
+		except (ValueError, OSError) as e:  # noqa: BLE001
+			print(f"box-broker: not touching {path} ({e}) — claude's transcript retention stays at "
+			      "its 30-day default, which DELETES idle boxes' conversations", flush=True)
+			return
+	if not isinstance(data, dict) or "cleanupPeriodDays" in data:
+		return
+	data["cleanupPeriodDays"] = CLAUDE_RETENTION_DAYS
+	tmp = path + ".muster-tmp"
+	with open(tmp, "w") as fh:
+		json.dump(data, fh, indent=2)
+		fh.write("\n")
+	os.replace(tmp, path)
+	# Same best-effort hand-over as the settings above: the broker is root, the boxes are not.
+	try:
+		os.chown(path, int(BOX_UID), int(BOX_GID))
+	except OSError:
+		pass
+	print(f"box-broker: set cleanupPeriodDays={CLAUDE_RETENTION_DAYS} in {path} — claude's 30-day "
+	      "default deletes the conversations of boxes left idle", flush=True)
+
+
 # ---------------------------------------------------------- claude's own config (.claude.json)
 #
 # NOT settings.json. `.claude.json` is where claude keeps the login and its PER-PROJECT state, keyed
@@ -1421,6 +1479,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		os.makedirs(CLAUDE_HOME, exist_ok=True)
 		os.chown(CLAUDE_HOME, int(BOX_UID), int(BOX_GID))
 		ensure_claude_settings()      # first: the hooks below are re-asserted on top of it
+		ensure_transcript_retention()  # …and second: a stack that sets it itself keeps its own number
 		ensure_activity_hooks()
 		ensure_claude_json()          # a different file: claude's own config, not settings.json
 		ensure_box_memo()
@@ -1434,7 +1493,13 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 	rows, checkout_dst, checkout_ro = parse_mounts(golden)
 	# Before docker gets the chance to invent them as root — see ensure_home_parents.
 	ensure_home_parents(anchor, [r[1] for r in rows] + [checkout_dst])
+	# HAD it a session before this spawn? Then a spawn that comes back with --session-id rather than
+	# --resume is one whose transcript went missing, and the box is about to greet you knowing nothing.
+	# session_args logs that, but a broker log is not where anyone looks when a box "seems a bit lost",
+	# so the fact travels back to the hub, which prints it. See ensure_transcript_retention().
+	had_session = os.path.exists(os.path.join(box_dir, "session-id"))
 	claude_args = session_args(box_dir, resume, checkout_dst)
+	session_lost = bool(had_session and resume and claude_args.startswith("--session-id"))
 	job = box_job(box_dir, base, merge)
 	# Project policy for how this box's claude comes up (MUSTER_CLAUDE_PERMISSION_MODE / MUSTER_BOX_PROMPT).
 	# The mode is a flag, so it joins the claude args; the prompt travels separately, base64-encoded,
@@ -1575,6 +1640,7 @@ def create_box(name, resume=False, fresh_upper=False, base=None, merge=None):
 		raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "muster-box.sh failed")
 	start_forwarders(name, slot, forwards)  # after the box exists
 	return {"box": name, "container": container, "workdir": checkout_dst, "session": claude_args,
+	        "session_lost": session_lost,
 	        "golden": os.path.basename(golden), "branch": f"agent/{name}",
 	        "base": job.get("base", DEV_BRANCH), "merge": job.get("merge", ""),
 	        "slot": slot, "forwards": forward_ports, "mounts": mounts}
@@ -1933,14 +1999,20 @@ def recreate_box(name, fresh_upper=False):
 
 
 def recreate_all(fresh_upper=False):
-	"""Recreate every box (newest image, each resuming its own session). Pulls once for all."""
+	"""Recreate every box (newest image, each resuming its own session). Pulls once for all.
+
+	`lost` names the boxes whose session did NOT come back — see create_box. A recreate of one box
+	prints that on its own line; a recreate of forty must not be the one place it goes unsaid."""
 	pull_box_image(wait=True)
-	done = []
+	done, lost = [], []
 	for r in list_boxes()["boxes"]:
 		name = r["box"]
 		subprocess.run(["docker", "rm", "-f", r["container"]], capture_output=True, text=True)
-		done.append(create_box(name, resume=True, fresh_upper=fresh_upper)["box"])
-	return {"recreated": done}
+		res = create_box(name, resume=True, fresh_upper=fresh_upper)
+		done.append(res["box"])
+		if res.get("session_lost"):
+			lost.append(res["box"])
+	return {"recreated": done, "session_lost": lost}
 
 
 class Handler(BaseHTTPRequestHandler):

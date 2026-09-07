@@ -36,6 +36,11 @@ BOXES = {}       # name -> {"golden": …, "base": …, "merge": …, "dirty": [
 # The real broker reads both out of the container; here they are whatever the fixture is pretending.
 BOX_STATE = json.loads(os.environ.get("STUB_BOX_STATE", "{}"))
 
+# Which boxes come back from a recreate having LOST their conversation (comma-separated names): the
+# real broker sets this when the box had a session id, a resume was asked for, and the transcript was
+# not on disk any more. Empty for every other test, which is also how an older broker answers.
+SESSION_LOST = [n for n in os.environ.get("STUB_SESSION_LOST", "").split(",") if n]
+
 
 def record(method, path, body=""):
     with open(LOG, "a") as fh:
@@ -176,13 +181,15 @@ class H(BaseHTTPRequestHandler):
         if path == "/recreate":
             for b in BOXES.values():
                 b["golden"] = current_golden()
-            return self._reply(200, {"recreated": sorted(BOXES)})
+            return self._reply(200, {"recreated": sorted(BOXES),
+                                     "session_lost": [b for b in sorted(BOXES) if b in SESSION_LOST]})
         if path.startswith("/recreate/"):
             n = path[len("/recreate/"):]
             if n not in BOXES:
                 return self._reply(500, {"error": f"no such box {n}"})
             BOXES[n]["golden"] = current_golden()
-            return self._reply(200, {"box": n, "container": f"box-test-{n}"})
+            return self._reply(200, {"box": n, "container": f"box-test-{n}",
+                                     "session_lost": n in SESSION_LOST})
         for verb in ("say", "paste"):
             if path.startswith("/box/") and path.endswith("/" + verb):
                 n = path[len("/box/"):-len(verb) - 1]

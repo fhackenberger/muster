@@ -31,4 +31,11 @@
   // Anything else claude takes in settings.json can go here too, e.g.:
   // "model": "opus",
   // "permissions": { "defaultMode": "acceptEdits" }
+  //
+  // ONE KEY YOU DO NOT HAVE TO SET: `cleanupPeriodDays`. claude deletes transcripts older than 30
+  // days at startup, across the WHOLE shared claude home rather than just the session it opens — so
+  // an idle box's conversation was deleted by whichever box started that morning, and its next
+  // recreate came back with the right branch, the right work, and no memory. The broker now writes a
+  // long retention (CLAUDE_RETENTION_DAYS, default 3650) whenever nothing else has. Name the key here
+  // and your number wins; this file is merged first.
 }

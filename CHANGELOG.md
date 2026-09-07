@@ -112,6 +112,25 @@ releases and are not listed here.
   offers nothing, which is the right answer for a flag that takes prose.
 
 ### Fixed
+- **A box left idle for a month came back remembering nothing.** claude prunes its transcript
+  directory at startup against `cleanupPeriodDays` — 30 days by default, and it prunes the *whole*
+  directory, not just the session it is opening. That directory is the one `~/.claude` the hub and
+  every box share, so the boxes that had been quiet longest were deleted by whichever box happened to
+  start that morning. The next `recreate` then found no transcript for the box's pinned session id,
+  fell back to `--session-id` (correctly: `--resume` against an id claude has never seen fails at
+  startup), and handed back a box on its own branch, with its work, and no memory of producing any of
+  it. On the stack where this was found, every conversation older than exactly 30 days was gone.
+
+  The broker now writes `cleanupPeriodDays` into the shared `settings.json` when nothing else has —
+  `CLAUDE_RETENTION_DAYS`, default 3650 days, `0` to opt out; the stack's own `claude-settings.json`
+  is merged first, so a number you name there still wins. It is a floor for stacks that never thought
+  about it, not a policy.
+
+  And the fallback is no longer silent. It logged one line in the broker, which is not where anyone
+  looks when a box "seems a bit lost", while `recreate` said "each resumes its own session" either
+  way. `create_box` reports it, `recreate all` reports the whole list, and the hub prints **NO
+  CONVERSATION RESTORED** with the names.
+
 - **The role's `MUSTER_CONF_DIR` check failed every `--check` run.** The probe that reads the variable
   out of the deployed env file is a `shell:` task, and Ansible skips those in check mode — a skipped
   probe registers no stdout, which the comparison cannot tell apart from an env file that says
