@@ -100,6 +100,16 @@ releases and are not listed here.
   boxes are live, because then every session would look orphaned.
 
 ### Changed
+- **`muster-box.sh` refuses to start when the repo's mount point is not empty inside the box.** A bind
+  mount never merges — it shadows, silently and with no way to notice from the inside — so a box would
+  come up looking like it was in the tree it expected while the tree already at that path (a
+  shared-anchor bind of the same project, a leftover checkout, a half-copied one) was hidden, and any
+  work done against the hidden one was invisible on the host. The launcher now says what is in the way
+  instead. It checks before the sudo mount and the X grant, so a refusal costs nothing and leaves
+  nothing behind, and it reads the mount point from the SHARED_DIR anchor for paths under the box's
+  home and from the image itself for anything else. The image pull moved ahead of that check, because
+  answering it may mean looking inside the image.
+
 - **`muster minto <target> --land <box>` is now `--accept <box>`** (no alias — the old spelling is
   gone). `--land` sat one letter away from `merge --landed`, which means the opposite: `--landed` is
   bookkeeping for work that is *already* in the branch, while this is the step that actually moves

@@ -72,7 +72,8 @@ echo
 # =====================================================================  basics
 
 test_syntax() {
-	for f in "$MUSTER_BIN" "$BOX_INIT" "$PT_SESSION" "$ROOT/gen-hub-mounts.sh" "$ROOT/entrypoint.sh" \
+	for f in "$MUSTER_BIN" "$BOX_INIT" "$PT_SESSION" "$ROOT/muster-box.sh" \
+	         "$ROOT/gen-hub-mounts.sh" "$ROOT/entrypoint.sh" \
 	         "$ROOT/hub/entrypoint.sh" "$ROOT/box-bin/handoff"; do
 		[ -f "$f" ] || continue
 		OUT="$(bash -n "$f" 2>&1)"; RC=$?
@@ -3089,6 +3090,93 @@ test_box_init_ordinary_box() {
 	OUT="$(git -C "$box" remote 2>&1)"; has "hub"; hasnt "origin"
 }
 
+# =====================================================================  muster-box.sh (the laptop launcher)
+
+# muster-box.sh talks to nothing but external commands, so the harness is stubs for all of them on
+# $FIX/bin: what a test asserts on is the `docker run` it WOULD have issued (recorded in
+# $FIX/docker.log), exactly like the alias tests assert on the ssh command line.
+#
+# The image-side emptiness probe is `docker run --entrypoint /bin/sh` — the stub answers it with
+# whatever is in $FIX/image-listing, so a test can say "that path is not empty inside the image".
+box_sh_fixture() {
+	mkdir -p "$FIX/bin" "$FIX/anchor"
+	: > "$FIX/docker.log"; : > "$FIX/image-listing"
+	cat > "$FIX/bin/docker" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$FIX/docker.log"
+case "\$1" in
+	info|image) exit 0 ;;
+	run) for a in "\$@"; do [ "\$a" = --entrypoint ] && { cat "$FIX/image-listing"; exit 0; }; done ;;
+esac
+exit 0
+EOF
+	# The X grant, the shared-anchor mount and its mountpoint test: none of them may run for real in
+	# a test, and none of them is what is under test here.
+	printf '#!/bin/bash\nexit 0\n'  > "$FIX/bin/xhost"
+	printf '#!/bin/bash\nexit 0\n'  > "$FIX/bin/sudo"
+	printf '#!/bin/bash\nexit 0\n'  > "$FIX/bin/mountpoint"
+	# The clipboard-proxy account the launcher insists on, at the uid it insists on.
+	printf '#!/bin/bash\necho "muster-clip:x:60001:60001::/nonexistent:/usr/sbin/nologin"\n' > "$FIX/bin/getent"
+	# The repo it would mount: a path of the test's choosing, so the container-home branch of the
+	# check can be exercised without the fixture having to live under /home/dev.
+	cat > "$FIX/bin/git" <<EOF
+#!/bin/bash
+printf '%s\n' "\${MUSTER_TEST_CODE_DIR:-$FIX/repo}"
+EOF
+	chmod +x "$FIX/bin"/docker "$FIX/bin"/xhost "$FIX/bin"/sudo "$FIX/bin"/mountpoint \
+		"$FIX/bin"/getent "$FIX/bin"/git
+}
+
+box_sh() {                               # box_sh [env…] — run muster-box.sh against the stubs
+	OUT="$(cd "$FIX" && env PATH="$FIX/bin:$PATH" HOME="$FIX" DISPLAY=:0 \
+		MUSTER_SHARED="$FIX/anchor" MUSTER_USER=dev MUSTER_TEST_CODE_DIR=/home/dev/proj \
+		"$@" bash "$ROOT/muster-box.sh" --shell </dev/null 2>&1)"; RC=$?
+	return 0
+}
+
+# A BIND MOUNT SHADOWS WHAT IS UNDER IT. If the repo's mount point already has content inside the
+# box, mounting over it hides that content for the life of the container — the agent then works in a
+# tree that looks right and is not the one on the host. The launcher must refuse, not shadow.
+test_box_sh_refuses_a_nonempty_mount_target() {
+	box_sh_fixture
+	mkdir -p "$FIX/anchor/proj"                    # /home/dev inside the box == the anchor
+	: > "$FIX/anchor/proj/leftover.txt"
+	box_sh
+	notok
+	has "refusing to start"
+	has "/home/dev/proj is not empty"
+	has "leftover.txt"
+	has "$FIX/anchor/proj"                         # where to go and clear it, on the host
+	# Refused BEFORE anything is done to the host or to docker: no X grant, no container.
+	OUT="$(cat "$FIX/docker.log")"; hasnt "run --init"
+}
+
+# The same check, for a repo path that is NOT under the container's home: nothing on the host can
+# answer for it, so the image is asked instead.
+test_box_sh_asks_the_image_outside_the_home() {
+	box_sh_fixture
+	printf 'usr\nlocal\n' > "$FIX/image-listing"
+	box_sh MUSTER_TEST_CODE_DIR=/srv/proj
+	notok
+	has "/srv/proj is not empty"
+	OUT="$(cat "$FIX/docker.log")"; has "--entrypoint /bin/sh"
+}
+
+# An empty (or absent) mount point is the normal case and must still launch, mounting the repo at
+# its real path — otherwise the check above would have broken every laptop box.
+test_box_sh_mounts_an_empty_target() {
+	box_sh_fixture
+	box_sh
+	ok
+	OUT="$(cat "$FIX/docker.log")"
+	has "-v /home/dev/proj:/home/dev/proj:rw"
+	# ...and an existing-but-empty dir is just as fine as a missing one.
+	mkdir -p "$FIX/anchor/proj"
+	box_sh
+	ok
+	OUT="$(cat "$FIX/docker.log")"; has "-v /home/dev/proj:/home/dev/proj:rw"
+}
+
 # =====================================================================  broker.py units
 
 # THE REBASE VERDICT IS CACHED, because it is the expensive question on the dashboard: two
@@ -4547,6 +4635,9 @@ run "minto: --accept guards"                         test_minto_land_guards
 
 run "box-init: a minto box opens on the conflict"  test_box_init_minto_sets_up_the_conflict
 run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
+run "box.sh: refuses to shadow a non-empty mount point" test_box_sh_refuses_a_nonempty_mount_target
+run "box.sh: asks the image outside the box home"  test_box_sh_asks_the_image_outside_the_home
+run "box.sh: an empty mount point still launches"  test_box_sh_mounts_an_empty_target
 
 run "broker: branch-name validation"               test_broker_branch_validation
 run "broker: box-name limit follows the hostname"  test_broker_box_name_limit_follows_the_hostname

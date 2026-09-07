@@ -5,8 +5,10 @@ set -euo pipefail
 #
 # The container never sees your real home: only ~/.claude (sessions/config/creds, so resume
 # works), ~/.gitconfig (your commit identity), and the nearest enclosing git repo are bind-
-# mounted in at their real paths. It starts as root, recreates your host user inside, then
-# drops to it. Clipboard access is brokered through an unprivileged proxy user so the tool
+# mounted in at their real paths. The repo's mount point must be EMPTY inside the box — a bind
+# mount shadows whatever is already there instead of merging with it, so rather than hide a tree
+# nobody can see any more, the launcher refuses and says what is in the way. It starts as root,
+# recreates your host user inside, then drops to it. Clipboard access is brokered through an unprivileged proxy user so the tool
 # can paste images but cannot keylog / screenshot / inject input.
 #
 # Usage:
@@ -170,6 +172,64 @@ EOF
 	fi
 fi
 
+DOCKER="docker"
+docker info >/dev/null 2>&1 || DOCKER="sudo docker"
+
+# Ensure the image is present: pull it when it's missing locally (or when MUSTER_PULL=1 forces a
+# refresh to the latest push). A tag that's already present — which the default local
+# muster:stable normally is — skips the pull entirely. Done here, before the repo mount is
+# validated below, because that check may have to look inside the image.
+if [ "${MUSTER_PULL:-0}" = 1 ] || ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
+	echo "muster: pulling $IMAGE ..." >&2
+	if ! $DOCKER pull "$IMAGE"; then
+		if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
+			echo "muster: pull failed — using the local copy of $IMAGE." >&2
+		else
+			echo "muster: cannot pull $IMAGE and no local copy exists." >&2
+			echo "muster:   - for a registry-qualified MUSTER_IMAGE, run: docker login <registry>" >&2
+			echo "muster:   - or build it locally with build.sh (tags muster; see $CONFIG_FILE)" >&2
+			exit 1
+		fi
+	fi
+fi
+
+# A BIND MOUNT NEVER MERGES — IT SHADOWS. Whatever already lives at the mount point inside the
+# container simply disappears for as long as the box runs, silently and with no way to notice from
+# the inside. For the repo that is the worst possible failure: the box looks like it is in the tree
+# it expects while the tree that was there (a shared-anchor bind of the same project, a leftover
+# checkout, a half-copied tree) is hidden, and any work done against the hidden one is invisible on
+# the host. So we refuse rather than shadow: the mount point must be empty, or not exist at all.
+#
+# Where "already lives" is read from depends on the path: anything under the container's home comes
+# from the SHARED_DIR anchor (inspectable right here on the host), anything else comes from the
+# image, which only the image itself can answer for.
+refuse_if_mount_target_not_empty() {
+	local target="$1" probe listing
+	if [ "$target" = "$HOME_IN" ] || [ "${target#"$HOME_IN"/}" != "$target" ]; then
+		probe="$SHARED_DIR"
+		[ "$target" = "$HOME_IN" ] || probe="$SHARED_DIR/${target#"$HOME_IN"/}"
+		[ -d "$probe" ] || return 0
+		listing="$(ls -A "$probe" 2>/dev/null | head -5 || true)"
+	else
+		listing="$($DOCKER run --rm --entrypoint /bin/sh "$IMAGE" \
+			-c 'ls -A -- "$1" 2>/dev/null | head -5' sh "$target" 2>/dev/null || true)"
+	fi
+	[ -n "$listing" ] || return 0
+	# Indented HERE, not by word-splitting the list in the message — entry names may contain spaces.
+	listing="$(printf '%s\n' "$listing" | sed 's/^/  /')"
+	cat >&2 <<EOF
+muster: refusing to start — $target is not empty inside the box.
+
+Mounting the repo there would hide what is already at that path (docker bind mounts shadow,
+they do not merge), so the box would work against a tree you cannot see from the host:
+
+$listing
+${probe:+  (on the host: $probe)}
+Empty or move that directory, or run muster from a different repo path, then try again.
+EOF
+	exit 1
+}
+
 # Mount the nearest enclosing git repo (walk up for .git) at its REAL path, then launch inside
 # the original cwd — gives Claude the whole repo + working git, paths copy/paste 1:1. In server
 # mode there is no single repo to auto-mount: the broker curates what the box sees (typically the
@@ -183,6 +243,8 @@ if [ "$HEADLESS" != 1 ]; then
 	else
 		echo "muster: mounting git repo  $CODE_DIR  (launching in $ORIG_PWD)" >&2
 	fi
+	# Before the sudo mount and the X grant below, so a refusal costs nothing and leaves nothing.
+	refuse_if_mount_target_not_empty "$CODE_DIR"
 fi
 
 mkdir -p "$SHARED_DIR"
@@ -425,26 +487,6 @@ done <<< "${MUSTER_EXTRA_ENV:-}"
 
 WORKDIR="$ORIG_PWD"
 [ "$HEADLESS" = 1 ] && WORKDIR="${MUSTER_WORKDIR:-$HOME_IN}"
-
-DOCKER="docker"
-docker info >/dev/null 2>&1 || DOCKER="sudo docker"
-
-# Ensure the image is present: pull it when it's missing locally (or when MUSTER_PULL=1 forces a
-# refresh to the latest push). A tag that's already present — which the default local
-# muster:stable normally is — skips the pull entirely.
-if [ "${MUSTER_PULL:-0}" = 1 ] || ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
-	echo "muster: pulling $IMAGE ..." >&2
-	if ! $DOCKER pull "$IMAGE"; then
-		if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
-			echo "muster: pull failed — using the local copy of $IMAGE." >&2
-		else
-			echo "muster: cannot pull $IMAGE and no local copy exists." >&2
-			echo "muster:   - for a registry-qualified MUSTER_IMAGE, run: docker login <registry>" >&2
-			echo "muster:   - or build it locally with build.sh (tags muster; see $CONFIG_FILE)" >&2
-			exit 1
-		fi
-	fi
-fi
 
 $DOCKER run "${RUN_FLAGS[@]}" \
 	--hostname "${MUSTER_NAME:-claudebox}" \
