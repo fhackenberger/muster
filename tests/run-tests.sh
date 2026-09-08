@@ -2164,9 +2164,13 @@ test_service_output_is_captured() {
 		unset TMUX_SESSION; skip "no usable tmux server here"; return 0
 	fi
 	cbx up failer; ok
-	# pipe-pane copies asynchronously, so give the file a moment to appear.
+	# pipe-pane copies asynchronously, and it copies the pane AS IT PAINTS — so a non-empty file means
+	# the FIRST line arrived, not the last. Waiting on `-s` therefore let the assertions below read a
+	# log that still ended at "compiling", but only when the machine was busy enough for the rest to
+	# lag: a flake that passed on its own and failed in a full run. Wait for the wrapper's exit line,
+	# which is written after everything this test asserts on.
 	local f i; f="$FIX/repo/.git/cbx/logs/failer.log"
-	for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$f" ] && break; sleep 0.3; done
+	for i in $(seq 1 20); do grep -q "exited (status" "$f" 2>/dev/null && break; sleep 0.3; done
 	cbx logs failer --tail 50
 	ok
 	has "BUILD FAILED in 18s"          # the error itself, with nothing to attach to
