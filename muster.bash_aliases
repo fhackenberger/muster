@@ -1090,7 +1090,9 @@ _muster_complete() {
 		# `box <name>` is either a NEW name (nothing to complete) or one that was killed and can be
 		# brought back — the directory and its upper layer are still there. Those are worth offering;
 		# a name that is already running is not, since `box` on it is a no-op you did not mean.
-		box|purge) COMPREPLY=($(compgen -W "$(_muster_names rbox)" -- "$cur")) ;;
+		# `reclaim` is on the same list for a different reason: a retired box is the ONLY thing it
+		# accepts, since a live one still has those layers mounted into a container.
+		box|purge|reclaim) COMPREPLY=($(compgen -W "$(_muster_names rbox)" -- "$cur")) ;;
 		# `import`/`export` and every review-queue verb take an existing one.
 		kill|forwards|review|fix|prereview|merge|drop|export|import|say|peek|point|hold|release)
 		           COMPREPLY=($(compgen -W "$(_muster_names box)" -- "$cur")) ;;

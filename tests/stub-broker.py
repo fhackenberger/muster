@@ -174,6 +174,17 @@ class H(BaseHTTPRequestHandler):
                 return self._reply(409, {"error": f"no box directory for {n!r}"})
             RETIRED[n] = current_golden()
             return self._reply(200, {"box": n, "golden": current_golden(), "freed": 4321})
+        # Take a retired box's disk back and keep the box. Same "no container" rule as above, and the
+        # itemised `items` the hub prints under each box.
+        if path.endswith("/reclaim"):
+            n = path[len("/box/"):-len("/reclaim")]
+            if n in BOXES:
+                return self._reply(409, {"error": f"{n!r} still has a container — it is not retired."})
+            if n not in RETIRED:
+                return self._reply(409, {"error": f"no box directory for {n!r}"})
+            RETIRED[n] = current_golden()
+            return self._reply(200, {"box": n, "golden": current_golden(), "freed": 2097152,
+                                     "items": {f"{n}/upper": 1048576, f"{n}/cow-gradle": 1048576}})
         if path == "/forwards" or path.startswith("/forwards/"):
             return self._reply(200, {"forwards": sorted(BOXES)})
         # Recreating respawns a box on whatever golden is CURRENT — which is the whole mechanism behind

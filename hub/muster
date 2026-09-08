@@ -23,6 +23,14 @@ set -euo pipefail
 #   $SELF kill <name>                         # remove an agent box (its upper layer is kept)
 #   $SELF purge <name> [--force]              # …and remove it FOR GOOD: upper layer, caches, session.
 #                                           #   Refuses while its handoff is still unreviewed.
+#   $SELF reclaim <name>|--all [-y]           # TAKE A KILLED BOX'S DISK BACK BUT KEEP THE BOX: drops
+#                                           #   its upper layers and private caches, keeps its claude
+#                                           #   SESSION, ~/keep, name and pushed branch — so
+#                                           #   '$SELF box <name>' brings the same agent back, on the
+#                                           #   current golden, still remembering. Goes with it:
+#                                           #   uncommitted files and commits never handed off.
+#                                           #   --all does every retired box, biggest first. Lists
+#                                           #   what it would free and asks; -y skips the question.
 #   $SELF recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = drop its
 #                                             # upper layers: the checkout AND every overlay row)
 #   $SELF ls                                  # list services + boxes (broker)
@@ -1020,6 +1028,101 @@ human_size() {
 	elif [ "$b" -ge 1048576 ]    2>/dev/null; then printf '%sM' "$((b/1048576))"
 	elif [ "$b" -ge 1024 ]       2>/dev/null; then printf '%sK' "$((b/1024))"
 	else printf '%sB' "$b"; fi
+}
+
+# TAKE THE DISK BACK, KEEP THE BOX. Between `kill` (frees the container and nothing else — the upper
+# layer is what holds the gigabytes) and `purge` (frees everything and ends the box, session included)
+# there was nothing for the ordinary case: this one is finished for now, I want its space, I want to be
+# able to bring it back. So boxes were purged for disk, and with them went the one thing that cannot be
+# rebuilt — the agent's conversation.
+#
+# GOES: the upper layers (every uncommitted file, and every commit never handed off — the box's .git is
+# in that layer too) and the private caches, which are copies of the hub's and are re-made on the next
+# spawn. STAYS: the name, the port slot, ~/keep, the claude SESSION, and everything pushed to
+# refs/agents/<box>. `$SELF box <name>` afterwards brings the agent back on the current golden,
+# remembering the conversation, with muster-box-init restoring agent/<box> from the hub.
+#
+# Retired boxes only — a live one has a container holding those very mounts open. It says `kill` rather
+# than killing anything itself: stopping someone's agent is not a side effect of asking for disk.
+box_reclaim() {
+	argsort "" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
+	local all=0 force=0 arg
+	for arg in "$@"; do
+		case "$arg" in
+			--all) all=1 ;;
+			-y|--force) force=1 ;;
+			-*) die "reclaim: unknown option '$arg' (--all | -y)" ;;
+		esac
+	done
+	local box="${1:-}"
+	[ "$box" = "--all" ] && box=""
+	[ -n "$box" ] || [ "$all" = 1 ] || die "reclaim needs a box name, or --all ('$SELF ls' lists them)"
+
+	local rows targets total=0
+	rows="$(box_list)" || die "the broker did not answer"
+	if [ "$all" = 1 ]; then
+		# EVERY RETIRED BOX, biggest first — the listing is the whole point of --all, and the sizes are
+		# why it is worth typing. ?sizes=1 walks each directory, so this is the slow listing on purpose.
+		rows="$(broker GET "/box?sizes=1")" || die "the broker did not answer"
+		targets="$(printf '%s' "$rows" | jqr '[.retired[]?]|sort_by(-(.size // 0))|.[]|"\(.box)\t\(.size // 0)"')"
+	else
+		# INTO VARIABLES FIRST, then match. `jq | grep -q` looks tidier and is a SIGPIPE waiting to
+		# happen: grep leaves on its first match, jq dies of the closed pipe, and pipefail hands the
+		# whole command 141 — a box that exists reads as a failure. Nothing upstream of grep here.
+		local live retired_names
+		live="$(printf '%s' "$rows" | jqr '.boxes[]?.box')"
+		retired_names="$(printf '%s' "$rows" | jqr '.retired[]?.box')"
+		# A name that is LIVE is not a name that is wrong: say which it is, and what to type.
+		if grep -qx -- "$box" <<< "$live"; then
+			echo "$SELF: '$box' is still up — reclaiming would pull the disk out from under a running agent." >&2
+			die "kill it first ('$SELF kill $box'), then '$SELF reclaim $box'"
+		fi
+		grep -qx -- "$box" <<< "$retired_names" \
+			|| die "no retired box '$box' ('$SELF ls' lists them; a live box must be killed first)"
+		# jq DIRECTLY, not jqr: that helper takes a single filter argument, so `jqr --arg b …` hands jq
+		# the flag as its filter, prints nothing, and the `|| true` inside swallows the error — an
+		# empty target list that reads exactly like "this box is already empty".
+		targets="$(broker GET "/box?sizes=1" | jq -r --arg b "$box" \
+			'.retired[]?|select(.box==$b)|"\(.box)\t\(.size // 0)"' 2>/dev/null || true)"
+	fi
+	[ -n "$targets" ] || { echo "$SELF: no retired boxes — nothing to reclaim"; return 0; }
+
+	# WHAT IT COSTS, BEFORE IT HAPPENS. A retired box has no container, so nothing can read its working
+	# tree: the hub cannot tell you whether the layer about to go holds an hour's work or nothing. It
+	# can tell you the size and it can tell you the rule, and then you decide.
+	local n; n="$(printf '%s\n' "$targets" | grep -c .)"
+	echo "$SELF: reclaim $n retired box(es):"
+	while IFS=$'\t' read -r b sz; do
+		[ -n "$b" ] || continue
+		total=$((total + sz))
+		printf '  %-28s %8s\n' "$b" "$(human_size "$sz")"
+	done <<< "$targets"
+	echo "  ------------------------------------"
+	printf '  %-28s %8s\n' "up to" "$(human_size "$total")"
+	echo "  GOES:  uncommitted files, commits never handed off, warm caches"
+	echo "  STAYS: the claude session, ~/keep, the branch pushed to refs/agents/<box>, the name"
+	if [ -t 0 ] && [ "$force" = 0 ]; then
+		tty_flush
+		printf "%s: reclaim their disk? [y/N] " "$SELF" > /dev/tty
+		local answer=""; read -r answer < /dev/tty || answer=n
+		case "$answer" in y|Y|yes|YES) ;; *) die "nothing was reclaimed" ;; esac
+	fi
+
+	local freed=0 done_n=0 resp b sz
+	while IFS=$'\t' read -r b sz; do
+		[ -n "$b" ] || continue
+		resp="$(broker POST "/box/$b/reclaim")" || {
+			echo "$SELF: '$b' not reclaimed — $(broker_err "$resp")" >&2
+			continue
+		}
+		freed=$((freed + $(printf '%s' "$resp" | jqr '.freed // 0')))
+		done_n=$((done_n + 1))
+		# ITEMISED, because "4.2G" does not say which 4.2G — and the answer decides whether the next
+		# thing to look at is a build output or a cache row in the mounts table.
+		echo "$SELF: reclaimed '$b' — $(human_size "$(printf '%s' "$resp" | jqr '.freed // 0')") freed, session kept"
+		printf '%s' "$resp" | jqr '.items // {} | to_entries[] | "    \(.key)"' | sed 's/$//'
+	done <<< "$targets"
+	echo "$SELF: reclaimed $done_n box(es), $(human_size "$freed") freed — '$SELF box <name>' brings one back"
 }
 
 # Remove a box FOR GOOD — container, volumes, upper layer, caches, session. The one irreversible thing
@@ -4395,6 +4498,7 @@ case "$cmd" in
 	box)      box_new "$@" ;;
 	kill)     box_kill "$@" ;;
 	purge)    box_purge "$@" ;;
+	reclaim)  box_reclaim "$@" ;;
 	recreate) box_recreate "$@" ;;
 	ls)       box_ls ;;
 	forwards) forwards_refresh "${1:-}" ;;

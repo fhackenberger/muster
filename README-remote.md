@@ -436,6 +436,23 @@ That gives you:
   keeps all of that so `cbx box <same name>` can reattach; `cbx ls` now lists what has accumulated
   (with its size on disk) under **retired**. Purge refuses while the box's handoff is still unreviewed
   — `--force` overrides, and `cbx drop` is the deliberate way to bin the work first.
+- **`cbx reclaim <box>` / `cbx reclaim --all`** — take a **retired** box's disk back and keep the box.
+  Between `kill` (frees the container, and the upper layer is where the gigabytes are) and `purge`
+  (frees it all and ends the box) there was nothing for the ordinary case — *this one is finished for
+  now, I want its space, I want it back later* — so boxes were purged for disk and their conversations
+  went with them.
+
+  | goes | stays |
+  |---|---|
+  | the upper layers — uncommitted files, and commits never handed off (the box's `.git` is in that layer) | the claude **session**, so the agent comes back remembering |
+  | the private `cow`/`cow-keep` caches — copies of the hub's, re-made on the next spawn | `~/keep`, the name, the port slot, and everything pushed to `refs/agents/<box>` |
+
+  `cbx box <name>` afterwards brings the same agent back on the current golden, with `muster-box-init`
+  restoring `agent/<box>` from the hub. Retired boxes only: a live one still has those layers mounted
+  into a container, so it says `kill it first` rather than stopping someone's agent as a side effect of
+  a disk request. `--all` takes every retired box, biggest first; both list what they would free and
+  ask, and `-y` skips the question.
+
 - **`cbx golden retire <id>`** — free a golden that boxes are still overlaid on. `reap` skips those on
   purpose (a golden is the lowerdir of every box on it), so the question is what happens to its boxes,
   and it asks: **[m]ove** them onto the current golden — `recreate` respawns a box on whatever golden
@@ -1524,7 +1541,7 @@ Every box gets one directory whose lifetime is the **box's**, not the container'
 |---|---|
 | in the box | `~/keep`, and `$MUSTER_KEEP` for scripts |
 | on the host | `data/boxes/<box>/keep` |
-| survives | `cbx recreate`, `cbx kill` + re-`box`, and `--fresh` |
+| survives | `cbx recreate`, `cbx kill` + re-`box`, `--fresh`, and `cbx reclaim` |
 | removed by | `cbx purge` only — the one irreversible command, and it asks first |
 
 Everything else an agent writes is either in the repo (reviewed, or gone with the branch) or in a

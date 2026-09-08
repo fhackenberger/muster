@@ -1724,6 +1724,90 @@ def dir_size(path):
 	return total
 
 
+def retired_box_dir(name, verb, alternatives):
+	"""The box's directory, once we know it exists and nothing is running out of it.
+
+	Both callers below rewrite what a box is made of while nothing is looking at it, and both are
+	wrong the moment a container is: it would keep its old mounts until something recreated it, and
+	the files on disk would already describe a different box. `verb` and `alternatives` are the
+	caller's, because "kill it first" and "use recreate --fresh" are different advice."""
+	box_dir = os.path.join(BOXROOT, name)
+	if not os.path.isdir(box_dir):
+		raise RuntimeError(f"no box directory for {name!r}")
+	r = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^{box_container(name)}$",
+	                    "--format", "{{.Names}}"], capture_output=True, text=True)
+	if r.stdout.strip():
+		raise RuntimeError(f"{name!r} still has a container — it is not retired, so it cannot be "
+		                   f"{verb}. {alternatives}")
+	return box_dir
+
+
+def box_layer_dirs(box_dir):
+	"""Every upper layer the box owns: the checkout's, and one per `overlay` row in the mounts table.
+
+	The same set `--fresh` clears (see make_shared_overlay_volume on why it has to be all of them, not
+	just the checkout's). The docker volumes are NOT in here: their mount options are fixed at create
+	time, so create_box removes and recreates each one anyway — a stale volume cannot outlive this."""
+	dirs = [os.path.join(box_dir, "upper"), os.path.join(box_dir, "work")]
+	for d in sorted(os.listdir(box_dir)):
+		if d.startswith("ovl-"):
+			dirs += [os.path.join(box_dir, d, "upper"), os.path.join(box_dir, d, "work")]
+	return dirs
+
+
+def box_cache_dirs(box_dir):
+	"""The box's private `cow`/`cow-keep` copies — a whole gradle home, a node_modules, per box.
+
+	NOT read from `cow-temp`: that file lists only the delete-on-kill (`cow`) rows, and the rows that
+	survive a kill are exactly the ones still holding disk by the time anyone goes looking for space.
+	The naming rule (cow_dir) is what makes them enumerable instead."""
+	return [os.path.join(box_dir, d) for d in sorted(os.listdir(box_dir)) if d.startswith("cow-")
+	        and os.path.isdir(os.path.join(box_dir, d))]
+
+
+def _remove_all(dirs):
+	"""Delete each directory, returning {name: bytes} for the ones that were actually there."""
+	freed = {}
+	for d in dirs:
+		if os.path.isdir(d):
+			freed[os.path.relpath(d, BOXROOT)] = dir_size(d)
+			shutil.rmtree(d, ignore_errors=True)
+	return freed
+
+
+def reclaim_box(name):
+	"""Give a RETIRED box's disk back without losing the box.
+
+	Between `kill` (which keeps everything and frees nothing but the container) and `purge` (which
+	frees everything and ends the box) there was no way to say the obvious thing: this box is finished
+	for now, take its gigabytes, keep who it is. Boxes accumulate — the upper layer is a checkout plus
+	its build output, and a `cow-keep` row is an entire gradle home or node_modules per box — so the
+	honest answer to "I need the space" was `purge`, which also takes the one thing that cannot be
+	rebuilt: the agent's conversation.
+
+	GOES: the upper layers (every uncommitted file, and every commit never handed off — the box's .git
+	is in that layer too) and the warm caches, which are copies of the hub's and are re-made on the
+	next spawn. STAYS: the box's name, its port slot, ~/keep (a bind mount outside the overlay, which
+	is the whole reason it exists), its claude SESSION, and whatever it pushed to refs/agents/<box> —
+	so `box <name>` brings back an agent that remembers the conversation, on the current golden, with
+	muster-box-init restoring agent/<box> from the hub. What comes back is the box, minus the work it
+	never handed off.
+
+	The itemised breakdown is returned rather than one total because "4.2 GB" does not tell you which
+	4.2 GB, and the answer is usually one cache."""
+	box_dir = retired_box_dir(name, "reclaimed",
+	                          f"Kill it first (`kill {name}`), then reclaim it.")
+	with _golden_lock:
+		gid = os.path.basename(current_golden())
+	freed = _remove_all(box_layer_dirs(box_dir) + box_cache_dirs(box_dir))
+	# The box now has no layer at all, so it is coherent on ANY golden: point it at the current one,
+	# exactly as rebase_retired_golden does, rather than leaving it claiming a golden `reap` could
+	# delete under it.
+	with open(os.path.join(box_dir, "golden"), "w") as fh:
+		fh.write(gid)
+	return {"box": name, "golden": gid, "freed": sum(freed.values()), "items": freed}
+
+
 def rebase_retired_golden(name):
 	"""Move a box that has NO CONTAINER onto the current golden — as bookkeeping, without docker.
 
@@ -1742,34 +1826,19 @@ def rebase_retired_golden(name):
 	name, its branch, its claude session id, and whatever it pushed to refs/agents/<box>.
 
 	Refuses while a container exists, rather than quietly doing half a job: the running box would keep
-	its old mount until something recreated it, and the `golden` file would already be lying."""
-	box_dir = os.path.join(BOXROOT, name)
-	if not os.path.isdir(box_dir):
-		raise RuntimeError(f"no box directory for {name!r}")
-	r = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^{box_container(name)}$",
-	                    "--format", "{{.Names}}"], capture_output=True, text=True)
-	if r.stdout.strip():
-		raise RuntimeError(f"{name!r} still has a container — it is not retired. Use "
-		                   f"`recreate {name} --fresh` to move it and discard its work, or "
-		                   f"`golden migrate {name}` to carry the work across.")
+	its old mount until something recreated it, and the `golden` file would already be lying.
+
+	It does NOT touch the warm caches, unlike `reclaim`: this is a move, and a box that is being moved
+	so a golden can be freed should still come back with a cache. Same layers, different intent."""
+	box_dir = retired_box_dir(name, "moved by bookkeeping",
+	                          f"Use `recreate {name} --fresh` to move it and discard its work, or "
+	                          f"`golden migrate {name}` to carry the work across.")
 	with _golden_lock:
 		gid = os.path.basename(current_golden())
-	# Every upper layer this box owns: the checkout's, and one per `overlay` row in the mounts table.
-	# Same set --fresh clears (see make_shared_overlay_volume on why it has to be all of them). The
-	# docker volumes are NOT touched: their mount options are fixed at create time, so create_box
-	# removes and recreates each one anyway — a stale volume cannot outlive this.
-	targets = [os.path.join(box_dir, "upper"), os.path.join(box_dir, "work")]
-	for d in sorted(os.listdir(box_dir)):
-		if d.startswith("ovl-"):
-			targets += [os.path.join(box_dir, d, "upper"), os.path.join(box_dir, d, "work")]
-	freed = 0
-	for d in targets:
-		if os.path.isdir(d):
-			freed += dir_size(d)
-			shutil.rmtree(d, ignore_errors=True)
+	freed = _remove_all(box_layer_dirs(box_dir))
 	with open(os.path.join(box_dir, "golden"), "w") as fh:
 		fh.write(gid)
-	return {"box": name, "golden": gid, "freed": freed}
+	return {"box": name, "golden": gid, "freed": sum(freed.values())}
 
 
 def purge_box(name):
@@ -2111,6 +2180,17 @@ class Handler(BaseHTTPRequestHandler):
 					return self._reply(400, {"error": bad})
 				try:
 					return self._reply(200, rebase_retired_golden(rname))
+				except RuntimeError as e:
+					return self._reply(409, {"error": str(e)})
+			# Take a RETIRED box's disk back but keep the box — layers and caches go, session stays.
+			# Same "no container" rule as /rebase-golden above, and for the same reason.
+			if path.startswith("/box/") and path.endswith("/reclaim"):
+				rname = path[len("/box/"):-len("/reclaim")]
+				bad = name_problem(rname)
+				if bad:
+					return self._reply(400, {"error": bad})
+				try:
+					return self._reply(200, reclaim_box(rname))
 				except RuntimeError as e:
 					return self._reply(409, {"error": str(e)})
 			if path.startswith("/box/") and "/migrate/" in path:

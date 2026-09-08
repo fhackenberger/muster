@@ -893,6 +893,105 @@ test_migrate_discards_retired_boxes_without_starting_them() {
 	kill "$pid" 2>/dev/null
 }
 
+# THE MIDDLE GROUND BETWEEN kill AND purge. `kill` frees the container and none of the disk — the
+# upper layer is where the gigabytes are, and it is kept on purpose. `purge` frees all of it and ends
+# the box, session included. So "I need the space, I want this box back later" had no command, and the
+# answer people reached for was purge: the one thing that cannot be rebuilt went, for disk that could.
+test_reclaim_keeps_the_box() {
+	local port pid
+	port=$(( STUB_PORT + 22 ))
+	STUB_LOG="$FIX/stub22.log" GOLDEN_DIR="$FIX/golden" GOLDEN_STAGING="$FIX/golden-staging" \
+		STUB_PORT="$port" python3 "$HERE/stub-broker.py" & pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null "http://127.0.0.1:$port/box" && break; sleep 0.2; done
+	export BROKER_URL="http://127.0.0.1:$port"
+
+	cbx box parked >/dev/null 2>&1
+	cbx box busy   >/dev/null 2>&1
+	cbx kill parked >/dev/null 2>&1          # retired: a directory with no container
+
+	# A LIVE BOX IS REFUSED, and told which command it needs. Reclaiming under a running agent would
+	# pull the mounts out from under it, and killing it as a side effect of asking for disk is not
+	# this command's call to make.
+	cbx reclaim busy -y; notok
+	has "still up"
+	has "kill busy"
+	grep -q '"/box/busy/reclaim' "$FIX/stub22.log" && fail "a running box was reclaimed"
+
+	# A name that is neither live nor retired is a typo, not an empty job.
+	cbx reclaim nosuchbox -y; notok; has "no retired box"
+
+	cbx reclaim parked -y; ok
+	has "session kept"
+	grep -q '"/box/parked/reclaim' "$FIX/stub22.log" || fail "the retired box was not reclaimed"
+	# ITEMISED: "2.0M freed" does not say which 2 MB, and the answer decides what to look at next.
+	has "parked/upper"
+	has "parked/cow-gradle"
+	# …and the box is still there afterwards. That is the entire point: purge is the other command.
+	cbx ls; ok; has "parked"
+
+	# WITHOUT -y IT ASKS. There is no tty in the suite, so the prompt is skipped and the work is done;
+	# what must hold is that the cost is printed BEFORE anything is called, and in the right words.
+	cbx kill parked >/dev/null 2>&1
+	cbx reclaim --all
+	ok
+	has "GOES:"
+	has "STAYS:"
+	has "claude session"
+
+	kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+	unset BROKER_URL
+}
+
+# …and the half the hub cannot check: what is actually left on disk afterwards. The command is only
+# worth having if the session survives it, so that is asserted against the files, not against a
+# message. The caches go too — a `cow-keep` row is a whole gradle home per box, and it is a copy of
+# the hub's, so it is the cheapest thing in the box directory to rebuild and often the largest.
+test_broker_reclaim_layers_not_identity() {
+	fixture
+	local b="$FIX/boxes/parked"
+	mkdir -p "$b/upper/deep" "$b/work" "$b/ovl-gradle/upper" "$b/ovl-gradle/work" \
+		"$b/cow-npm" "$b/keep" "$FIX/golden/g-2" "$FIX/bin"
+	head -c 4096 /dev/zero > "$b/upper/deep/build-output"
+	head -c 2048 /dev/zero > "$b/cow-npm/cache-entry"
+	echo "the-session" > "$b/session-id"
+	echo "a note to myself" > "$b/keep/notes.md"
+	echo "g-1" > "$b/golden"
+	ln -sfn "$FIX/golden/g-2" "$FIX/golden/current"
+	# retired_box_dir asks docker whether a container exists; here nothing is running.
+	printf '#!/bin/sh\nexit 0\n' > "$FIX/bin/docker"; chmod +x "$FIX/bin/docker"
+
+	OUT="$(PATH="$FIX/bin:$PATH" BOXROOT="$FIX/boxes" GOLDEN_DIR="$FIX/golden" \
+		python3 - "$BROKER_PY" "$b" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+d = sys.argv[2]
+res = b.reclaim_box("parked")
+
+# GONE: every upper layer (the checkout's and each overlay row's) and the private caches.
+for p in ("upper", "work", "ovl-gradle/upper", "ovl-gradle/work", "cow-npm"):
+    assert not os.path.exists(os.path.join(d, p)), f"{p} survived"
+
+# KEPT: the two things that make this a reclaim and not a purge.
+assert open(os.path.join(d, "session-id")).read().strip() == "the-session", "the session was lost"
+assert open(os.path.join(d, "keep/notes.md")).read().strip() == "a note to myself", "~/keep was lost"
+assert os.path.isdir(d), "the box directory itself went"
+
+# With no layer left, the box is coherent on ANY golden — so it is pointed at the current one rather
+# than left claiming one that `golden reap` may delete under it.
+assert open(os.path.join(d, "golden")).read().strip() == "g-2", open(os.path.join(d, "golden")).read()
+
+# Itemised, and the numbers are real: 4096 of build output + 2048 of cache.
+assert res["freed"] >= 6144, res
+assert any(k.endswith("upper") for k in res["items"]), res["items"]
+assert any("cow-npm" in k for k in res["items"]), res["items"]
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+}
+
 # A BOX THAT IS NOT RUNNING ANSWERS NOTHING, AND NOTHING IS NOT "CLEAN".
 #
 # The broker's box_dirty execs into the container; when that fails it still replies 200, with
@@ -4904,6 +5003,8 @@ run "pinchtab: the broker hands boxes that token"  test_broker_pinchtab_token
 run "broker: box prompt fills in and base64s"      test_broker_box_prompt
 run "kill: reaps the box's pinchtab tabs"          test_kill_reaps_the_boxs_tabs
 run "kill: says when nothing was killed"           test_kill_says_when_nothing_was_killed
+run "reclaim: frees the disk, keeps the box"      test_reclaim_keeps_the_box
+run "reclaim: layers go, the identity stays"      test_broker_reclaim_layers_not_identity
 run "tabs: sweeps sessions whose box is gone"      test_tabs_sweeps_sessions_whose_box_is_gone
 run "service: down kills the process tree"         test_service_down_kills_the_process_tree
 run "service: up reaps what the last run left"     test_service_up_reaps_what_the_last_run_left
