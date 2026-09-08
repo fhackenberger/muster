@@ -2915,10 +2915,16 @@ merge_edit_msg() {
 	# --cleanup=strip semantics, done here because nothing is committed yet: drop comment lines and
 	# leading/trailing blank lines.
 	body="$(grep -v '^#' "$f" | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac)"
-	[ -n "${body//[[:space:]]/}" ] || return 1
+	# EMPTY MEANS EMPTY OF YOUR WRITING. The buffer is seeded with the trailer (see merge()), so a
+	# message you cleared still has that one line in it — and cancelling by deleting the text is how
+	# people cancel. Without this, "select all, delete, save" would land a merge whose entire message
+	# is `Cbx-Box: <box>`, which is worse than either outcome anyone intended.
+	local human; human="$(printf '%s\n' "$body" | grep -v "^Cbx-Box: $box\$" || true)"
+	[ -n "${human//[[:space:]]/}" ] || return 1
 	printf '%s\n' "$body" > "$f"
-	# The trailer is what `$SELF merge --undo` finds the merge by, so it is re-appended rather than
-	# trusted to survive the editor.
+	# The trailer is what `$SELF merge --undo` finds the merge by. It is seeded into the buffer before
+	# the editor opens so you can see it, and re-appended here when it did not survive the edit — the
+	# same bytes either way, so the two cannot produce different messages.
 	grep -q "^Cbx-Box: $box\$" "$f" || printf '\nCbx-Box: %s\n' "$box" >> "$f"
 }
 
@@ -3128,7 +3134,13 @@ merge() {
 		else
 			printf '%s\n' "$msg" > "$msgf"
 		fi
-		printf '\n#\n# Lines starting with %s are dropped. An EMPTY message CANCELS the merge, and\n# nothing is touched — %s is left exactly as it is now.\n' "'#'" "$DEV" >> "$msgf"
+		# THE TRAILER, WHERE YOU CAN SEE IT. `merge --undo` finds the merge by this line, and it used to
+		# be added only after the editor closed — so the buffer you were asked to approve never showed
+		# the one line the command depends on, and it looked like it had gone missing. Seeded here;
+		# merge_edit_msg re-appends it if you delete it, and treats a buffer that is nothing but this
+		# line as the empty message it plainly is.
+		printf '\nCbx-Box: %s\n' "$box" >> "$msgf"
+		printf '\n#\n# Lines starting with %s are dropped, but the Cbx-Box trailer above is kept — it is\n# how %s merge --undo finds this merge again. An EMPTY message CANCELS the merge, and\n# nothing is touched — %s is left exactly as it is now.\n' "'#'" "$SELF" "$DEV" >> "$msgf"
 		merge_edit_msg "$msgf" "$box" \
 			|| { rm -f "$msgf"; die "empty message — nothing was merged and $DEV is untouched; run the same command again when you have one"; }
 	fi

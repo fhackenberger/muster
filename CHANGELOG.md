@@ -138,6 +138,18 @@ releases and are not listed here.
   offers nothing, which is the right answer for a flag that takes prose.
 
 ### Fixed
+- **`merge --edit` did not show the `Cbx-Box:` trailer it was going to add.** The buffer was seeded
+  with the agent's message alone and the trailer was appended after the editor closed, so the one line
+  `merge --undo` finds a merge by was invisible in the message you were asked to approve — and the only
+  way to establish it would be there at all was to complete a merge and look. It read as a missing
+  trailer, on a merge that had not happened. It *was* in the buffer originally; the refactor that moved
+  this into `merge_edit_msg` kept the re-append and dropped the seeding.
+
+  Seeded again now, with a line in the instruction block saying what it is for, and re-appended exactly
+  as before when an edit removes it — the same bytes either way. `merge_edit_msg` no longer counts that
+  seeded line as a message: clearing the text and leaving the trailer cancels the merge, as it must,
+  rather than landing one whose entire message is `Cbx-Box: <box>`.
+
 - **A box left idle for a month came back remembering nothing.** claude prunes its transcript
   directory at startup against `cleanupPeriodDays` — 30 days by default, and it prunes the *whole*
   directory, not just the session it is opening. That directory is the one `~/.claude` the hub and

@@ -1642,6 +1642,59 @@ EOF
 	done
 }
 
+# THE ONE LINE THE COMMAND DEPENDS ON, IN THE BUFFER YOU ARE ASKED TO APPROVE. `merge --undo` finds a
+# merge by its `Cbx-Box:` trailer, and for a while that trailer was added only after the editor closed:
+# the message you wrote never showed it, so it read as missing — reported as "a fresh box that doesn't
+# have a Cbx-Box in the merge commit" — and the only way to find out otherwise was to complete a merge.
+# It was in the buffer originally; a refactor into merge_edit_msg dropped the seeding and kept only the
+# re-append.
+test_merge_edit_buffer_shows_the_trailer() {
+	local before
+	# An editor that copies the buffer aside, then writes a message of its own.
+	cat > "$TMP/ed-peek.sh" <<'EOF'
+#!/bin/bash
+cp "$1" "$MUSTER_TEST_BUFFER"
+printf 'my own wording\n' > "$1"
+EOF
+	# …and one that clears everything a person would clear, leaving only the seeded trailer behind.
+	cat > "$TMP/ed-clear-text.sh" <<'EOF'
+#!/bin/bash
+grep '^Cbx-Box: ' "$1" > "$1.keep" || true
+mv "$1.keep" "$1"
+EOF
+	chmod +x "$TMP/ed-peek.sh" "$TMP/ed-clear-text.sh"
+
+	handoff work1 2 >/dev/null; box_up work1
+	MUSTER_TEST_BUFFER="$FIX/buffer.txt" EDITOR="$TMP/ed-peek.sh" cbx merge work1 --edit
+	ok
+	# THE BUFFER ITSELF, not the resulting commit.
+	OUT="$(cat "$FIX/buffer.txt")"
+	has "Cbx-Box: work1"
+	has "merge --undo"                      # …and what it is for, since a bare trailer invites deletion
+	OUT="$(git_ log -1 --format=%B dev)"
+	has "my own wording"
+	has "Cbx-Box: work1"
+	# Seeded and re-appended must be the SAME bytes, or a message would differ by how it was edited.
+	eq "$(git_ log -1 --format=%B dev | grep -c '^Cbx-Box: work1$')" "1" "the trailer must appear once"
+
+	# CLEARING THE TEXT STILL CANCELS. The seeded line is not a message, and "select all, delete, save"
+	# is how a merge gets called off — landing `Cbx-Box: work1` as the whole message would be worse
+	# than either outcome anyone intended.
+	# By hand, not `handoff`: its commits are deterministic, so work2's first would BE work1's first,
+	# and work1 has just been merged — the branch would already be contained in dev. Same reason the
+	# empty-message test above builds this one itself.
+	local solo; solo="$(commit_on dev - "agent: a second change" second.txt "second")"
+	git_ update-ref refs/agents/work2 "$solo"
+	git_ notes --ref=cbx add -f -m "work from work2" "$solo"
+	box_up work2
+	before="$(at dev)"
+	EDITOR="$TMP/ed-clear-text.sh" cbx merge work2 --edit
+	notok
+	has "empty message"
+	eq "$(at dev)" "$before" "dev must not move when only the trailer is left"
+	ne "$(at refs/agents/work2)" "" "the branch must stay in the queue"
+}
+
 # The safety net for every other way a merge can be written but not committed — here a commit-msg
 # hook that says no. Nothing is conflicted, so there is nothing to resolve: roll it back rather than
 # report "NOTHING was merged" over a fully staged merge.
@@ -4633,6 +4686,7 @@ run "merge: a conflict leaves a way out"           test_merge_conflict_leaves_a_
 run "merge: refuses over dirty files it would overwrite" test_merge_refuses_over_dirty_files
 run "merge: a failed merge is not always a conflict" test_merge_failure_is_not_always_a_conflict
 run "merge: --edit with an empty message changes nothing" test_merge_edit_empty_message_touches_nothing
+run "merge: --edit shows the Cbx-Box trailer"      test_merge_edit_buffer_shows_the_trailer
 run "merge: an uncommittable merge is rolled back" test_merge_uncommittable_merge_is_rolled_back
 run "merge: refuses an uncommitted merge"          test_merge_refuses_an_uncommitted_merge
 run "merge: a conflict asks before touching dev"   test_merge_conflict_asks_first
