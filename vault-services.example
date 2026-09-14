@@ -1,0 +1,72 @@
+# vault-services.example — WHICH hosts this stack's agents may reach through agent-vault, and how a
+# credential from `vault-credentials` is attached to each one. The rules, not the secrets.
+#
+#     cp vault-services.example vault-services
+#     $EDITOR vault-services
+#     ./vault-sync.sh
+#
+# Unlike vault-credentials this file holds nothing secret — it names credential KEYS, never values —
+# so it can be committed by a project that wants its egress policy under review. It is still listed
+# in .gitignore here, because THIS directory is also a live stack dir; a project templating it from
+# Ansible should render it world-readable, the same call as for `mounts`.
+#
+# It is agent-vault's own services YAML, passed to `agent-vault vault service set -f` verbatim, so
+# https://docs.agent-vault.dev/learn/services is the reference and stays the reference. `set` REPLACES
+# the whole list: a host that disappears from this file loses its rule on the next sync, which is what
+# makes the file the single source of truth for egress. (Credentials are the opposite — see the note
+# in vault-credentials.example about why.)
+#
+# HOW A REQUEST IS MATCHED. Exact host beats `*.wildcard`; within a tier, a rule with a port beats one
+# without; then the longest literal path prefix wins; ties fall to the order in this file. A host with
+# no rule is FORWARDED UNCHANGED by default (no credential attached) — flip the vault to strict deny
+# if you want a 403 instead:
+#     docker compose exec agent-vault agent-vault owner config set unmatched_host_policy deny
+#
+# THE PLACEHOLDER IS THE CONTRACT. For anything that is not a plain auth header, the agent writes a
+# dummy string and the broker swaps in the real value — but ONLY in the surfaces `in:` lists. Keep
+# that list as narrow as the API allows: a secret declared `in: [body]` cannot be exfiltrated by an
+# agent that echoes the placeholder into a query string, because the broker will not substitute there.
+# Placeholders must contain `__` (or another non-word character) and use only [A-Za-z0-9_-.~].
+
+services:
+  # ---- bearer: the common case ----------------------------------------------------------------
+  # `token` names a key in vault-credentials. The broker sets `Authorization: Bearer <value>` and
+  # drops whatever the agent sent in that header.
+  #- name: grafana-api
+  #  host: grafana.example.com/api/*
+  #  auth:
+  #    type: bearer
+  #    token: GRAFANA_SA_TOKEN
+
+  # ---- basic: two keys, one header ------------------------------------------------------------
+  # Same host, different path, so the two rules cannot collide: /api/* above is the longer literal
+  # prefix and wins for API calls, this one catches the rest (the login page).
+  #- name: grafana-web
+  #  host: grafana.example.com
+  #  auth:
+  #    type: basic
+  #    username: GRAFANA_HTTP_USER
+  #    password: GRAFANA_HTTP_PASS
+
+  # ---- passthrough + body substitution: an OAuth client_secret_post flow -----------------------
+  # The token exchange sends the secret as a POST form field, not a header, so there is no auth type
+  # for it: allowlist the host with `passthrough` and let a substitution do the work. The agent POSTs
+  # client_secret=__asana_client_secret__ and the broker rewrites the body (URL-encoding the value,
+  # because the content type is x-www-form-urlencoded) on the way out.
+  #- name: asana-oauth
+  #  host: app.asana.com/-/oauth_token
+  #  auth:
+  #    type: passthrough
+  #  substitutions:
+  #    - key: ASANA_CLIENT_SECRET
+  #      placeholder: __asana_client_secret__
+  #      in: [body]
+
+  # ---- passthrough: allowlist without brokering ------------------------------------------------
+  # Use this when the agent legitimately holds its own credential (an OAuth access token it just
+  # obtained, say) and you only want the host on the list, with the request logging and TLS
+  # interception that come with it. `passthrough` rejects every credential field by design.
+  #- name: asana-api
+  #  host: app.asana.com/api/*
+  #  auth:
+  #    type: passthrough

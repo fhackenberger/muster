@@ -40,6 +40,10 @@ claude_box_env_file: claude-box.conf
 #   claude          the ONE claude config dir shared by the hub and every box (CLAUDE_CONFIG_DIR).
 #   boxes           per-box state: session id, port-forward slot, and the box's overlay upper layer.
 #   pinchtab        the pinchtab server's config/state for the hub.
+#   agent-vault     the credential broker's encrypted store (agent-vault/data, the container's /data)
+#                   plus the env file vault-sync.sh generates with this stack's agent token. Created
+#                   whether or not the stack runs the broker: an empty directory costs nothing, and
+#                   the alternative is a deploy that has to change before COMPOSE_PROFILES can be set.
 claude_box_data_dirs:
   - repo
   - golden
@@ -47,6 +51,8 @@ claude_box_data_dirs:
   - claude
   - boxes
   - pinchtab
+  - agent-vault
+  - agent-vault/data
 
 # Project config files templated into the stack dir. One entry per file:
 #   { src: <ABSOLUTE path to a Jinja template>, dest: <path relative to claude_box_dir>,

@@ -1,6 +1,15 @@
 # muster — the LEAN, project-agnostic agent base: debian:trixie-slim + common-setup.sh (node,
 # pinchtab, git, socat, …) + Claude + the clipboard proxy. No JDK/gradle — YOUR project's build
 # toolchain layers on top via Dockerfile.addon (-> muster-<project>, what the broker spawns).
+
+# The agent-vault CLI, lifted out of the published server image — one binary is both halves, so the
+# client is not installed or versioned separately. `agent-vault run -- claude` is what puts a box
+# behind the credential broker (MUSTER_CLAUDE_LAUNCHER in muster-box.sh); a stack running no broker
+# never calls it. The published tags drop the leading 'v' from the git tag (v0.39.3 -> 0.39.3); keep
+# this close to the server version the stacks run.
+ARG AGENT_VAULT_IMAGE=infisical/agent-vault:0.39.3
+FROM ${AGENT_VAULT_IMAGE} AS agent-vault-cli
+
 FROM debian:trixie-slim
 
 # WHICH MUSTER THIS IS. Baked in so the pieces can check they agree at runtime: the hub, the broker
@@ -130,6 +139,12 @@ RUN chmod 0755 /usr/local/bin/muster-box-init /usr/local/bin/handoff /usr/local/
 # to bake the CLI, or a bind mount of the stack's login, into its own application image.
 COPY ask/muster-ask /usr/local/bin/muster-ask
 RUN chmod 0755 /usr/local/bin/muster-ask
+
+# The credential-broker client (stage above). Static Go binary, so it needs nothing from the image it
+# came from. Present in EVERY box whether or not the stack runs a broker — which is what lets
+# vault-sync.sh switch the whole stack on by writing one env file, with no image rebuild behind it.
+COPY --from=agent-vault-cli /usr/local/bin/agent-vault /usr/local/bin/agent-vault
+RUN chmod 0755 /usr/local/bin/agent-vault && /usr/local/bin/agent-vault --version
 
 # /home/dev owned by the runtime uid. A BOX gets its home as a bind mount and its user from the
 # entrypoint below, so this never mattered; muster-ask skips that entrypoint (it is not a box) and

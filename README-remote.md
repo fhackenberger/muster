@@ -1296,6 +1296,99 @@ pre-creates those parents for boxes (and re-owns existing ones, so `cbx recreate
 hub image ships the XDG bases, and the hub warns at boot about any parent it cannot write.
 
 
+## The credential broker (`agent-vault`)
+
+`service-env` hands its values to the agents. That is exactly right for a database URL and exactly
+wrong for an API token: anything a box can read, a prompt-injected agent can be talked into pasting
+somewhere. [agent-vault](https://github.com/Infisical/agent-vault) answers that half — an optional
+container that **holds the token instead of the box** and injects it into outbound requests at a
+proxy every box routes through. The agent spends a credential it never sees.
+
+```
+box  ── HTTPS_PROXY ──▶  agent-vault:14322  ── real token attached ──▶  api.example.com
+  GRAFANA_TOKEN=__grafana_sa_token__             (14321 = admin API/UI, stack network only)
+```
+
+It is **off unless a stack asks for it** (`COMPOSE_PROFILES=agent-vault` in `.env`). Nothing depends
+on it, and a stack without the generated env file below comes up exactly as it did before.
+
+### Two files and one command
+
+The same shape as `mounts` + `gen-hub-mounts.sh`: files are the source of truth and a script applies
+them, because agent-vault keeps its state in a database and cannot read a file at boot.
+
+| File | Holds | Mode |
+|---|---|---|
+| `vault-credentials` | the secrets, as `KEY=VALUE` (the same grammar as `service-env`) | 0600 |
+| `vault-services` | which host gets which credential, and where it is injected | world-readable — it names credential KEYS, never values |
+| `./vault-sync.sh` | applies both, mints this stack's agent token | — |
+
+```sh
+cp vault-credentials.example vault-credentials && chmod 0600 vault-credentials
+cp vault-services.example vault-services
+docker compose up -d agent-vault
+./vault-sync.sh          # registers the owner, creates the vault, pushes both files, mints the token
+cbx recreate all         # env is fixed at container creation
+```
+
+`vault-sync.sh` writes `data/agent-vault/vault-env` — the token, the vault name, the address and
+`MUSTER_CLAUDE_LAUNCHER`. The broker reads that as `VAULT_ENV_FILE` and applies it to every box
+**between `service-env` and `box-env`**, so a project can still override any of it, and unsetting
+`MUSTER_CLAUDE_LAUNCHER` in `box-env` takes a stack back out of the proxy without touching anything
+else.
+
+**Services are replaced wholesale; credentials are only ever set.** A host dropped from
+`vault-services` loses its rule on the next sync — that file is the whole egress policy. A key
+dropped from `vault-credentials` keeps its old value until someone deletes it by hand, because a
+templating slip that renders that file empty must not strip a live stack of everything it brokers.
+
+**The token is not rotated unless you ask** (`./vault-sync.sh --rotate-token`). Rotation invalidates
+the old token immediately, so every running box is talking to the proxy with a dead credential until
+it is recreated.
+
+### How a box ends up behind it
+
+`muster-box.sh` prefixes the detached claude with `MUSTER_CLAUDE_LAUNCHER`, which `vault-sync.sh`
+sets to `agent-vault run --`. That command execs claude with `HTTPS_PROXY`, `HTTP_PROXY` and the
+CA-trust variables (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, …)
+already set, so claude and everything it starts are proxied without any of them being configured one
+by one. The CLI is in the box image; the hub does not run claude and is not proxied.
+
+Three consequences worth knowing before turning it on:
+
+- **`NO_PROXY` is not yours to set.** `agent-vault run` strips the inherited value and writes its own
+  (`localhost,127.0.0.1,<broker host>`) — deliberately, since a stale proxy variable from a parent
+  shell would otherwise win under POSIX `getenv` and silently bypass the broker. You cannot exclude
+  hosts that way.
+- **Which makes the private-range allowlist the real lever.** Every HTTP call a box makes now goes
+  through agent-vault, including `hub:9867` (pinchtab) and anything else on the stack network — and
+  agent-vault refuses to forward to RFC-1918 addresses unless they are listed in
+  `AGENT_VAULT_NETWORK_ALLOWLIST`. Leave it at the default (the usual docker ranges) or narrow it to
+  this stack's subnet; empty it and the internal services start answering 403 in a way that reads
+  exactly like they are down.
+- **Java and Gradle are unaffected**, for better and worse: the JVM does not read `HTTPS_PROXY`, so a
+  build is neither routed through the broker nor exposed to its TLS interception. A credential a
+  *build* needs still belongs in `service-env`.
+
+A host with no rule is forwarded unchanged, with no credential attached — so turning the broker on
+does not break egress while the rules are still being written. Flip the vault to strict deny once
+they are:
+
+```sh
+docker compose exec agent-vault agent-vault owner config set unmatched_host_policy deny
+```
+
+### Where it runs
+
+Upstream recommends a separate machine from the agents, and this is a container on the same host —
+worth being explicit about the trade. A box holds no docker socket (only the broker does) and reaches
+agent-vault over the stack network like any other client, so the shortest path from a box to a
+credential is still the proxy. What co-location gives up is the defence against a container escape:
+root on the host can read the data volume. That is the same root that can already read `service-env`
+and the vault password, so for the threat this is actually built against — a prompt-injected agent,
+not a compromised host — it is not the thing to optimise.
+
+
 ## The stack's claude settings (`claude-settings.json`)
 
 A statusLine, a model, a permissions policy — which claude settings a stack wants is project policy,

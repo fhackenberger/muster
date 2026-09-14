@@ -21,6 +21,11 @@ mounts
 port-forwards
 hub-services/
 compose.project.yml
+# agent-vault's pair. vault-credentials IS the secrets. vault-services holds none — it names
+# credential keys, never values — but it is a live stack's egress policy; a project that wants it
+# reviewed should keep it in its OWN repo and template it onto the server, as it does with `mounts`.
+vault-credentials
+vault-services
 # Rendered from `mounts` by gen-hub-mounts.sh, on the host it runs on.
 compose.override.yml
 

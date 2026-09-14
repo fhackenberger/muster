@@ -57,6 +57,8 @@ set -euo pipefail
 #   MUSTER_DEV_URL                the dev-server URL to expose to the box
 #   MUSTER_CLAUDE_ARGS            extra args appended to the detached `claude` (e.g. --resume <id>)
 #   MUSTER_CLAUDE_PROMPT_B64      base64 opening prompt, decoded and passed as claude's first message
+#   MUSTER_CLAUDE_LAUNCHER        command prefixed to the detached `claude` (read INSIDE the box, so
+#                                 it comes from the box's environment, not this script's)
 #   MUSTER_EXTRA_MOUNTS           newline-separated src:dst[:ro] binds (broker-validated)
 
 # Settings live in one simple shell file shared with build.sh, so the clip UID (which must
@@ -416,7 +418,14 @@ fi
 # here) so its output is visible when you attach, and so a failure leaves a usable shell rather than a
 # box that never starts. `;` not `&&`: a bootstrap that fails must not stop claude from launching.
 if [ "$DETACH" = 1 ]; then
-	_claude="claude${MUSTER_CLAUDE_ARGS:+ ${MUSTER_CLAUDE_ARGS}}"
+	# A command claude is run UNDER, not one this script knows anything about: `agent-vault run --`
+	# is what fills it (see the credential broker in README-remote.md), and any wrapper that needs
+	# claude's whole process tree fits the same slot.
+	#
+	# `\\\$` for the same reason as the prompt below — expanded by the shell tmux starts, the third
+	# to handle this string — because the value lives in the BOX's environment, not this script's.
+	# Expanded here it would be empty on every spawn. Unset, `:-` leaves a harmless leading space.
+	_claude="\\\${MUSTER_CLAUDE_LAUNCHER:-} claude${MUSTER_CLAUDE_ARGS:+ ${MUSTER_CLAUDE_ARGS}}"
 	# An opening prompt for the box (broker: MUSTER_BOX_PROMPT). It arrives base64-encoded and is
 	# decoded HERE, in the innermost shell, precisely because the line below is built by one shell,
 	# re-parsed by tmux and run by another: a prompt is free text and will contain quotes, $ and
@@ -432,7 +441,10 @@ if [ "$DETACH" = 1 ]; then
 	[ -n "${MUSTER_CLAUDE_PROMPT_B64:-}" ] && \
 		_claude="$_claude \\\"\\\$(printf %s ${MUSTER_CLAUDE_PROMPT_B64} | base64 -d)\\\""
 	_init="${MUSTER_INIT_CMD:+${MUSTER_INIT_CMD}; }"
-	RUN_CMD=(bash -lc "tmux new-session -d -s main -n claude \"${_init}${_claude}; echo; echo claude exited - type claude to relaunch; exec bash -l\"; exec sleep infinity")
+	# The relaunch hint repeats the launcher rather than saying `claude`: with one configured, a bare
+	# `claude` comes up OUTSIDE the credential broker — it works, it just silently holds no brokered
+	# access — and the line telling you what to type is the only place that is ever noticed.
+	RUN_CMD=(bash -lc "tmux new-session -d -s main -n claude \"${_init}${_claude}; echo; echo claude exited - type\\\${MUSTER_CLAUDE_LAUNCHER:+ \\\${MUSTER_CLAUDE_LAUNCHER}} claude to relaunch; exec bash -l\"; exec sleep infinity")
 fi
 
 # Single cleanup on any exit (normal or signal): revoke the X-server grant (laptop only) and tear

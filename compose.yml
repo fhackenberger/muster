@@ -118,6 +118,13 @@ services:
       # on the hub and wrong in a box (a `localhost` URL is the standard case). Optional; the broker
       # ignores a missing file. See box-env.example.
       BOX_ENV_FILE: ${STACK_DIR}/${MUSTER_CONF_DIR:+${MUSTER_CONF_DIR}/}box-env
+      # GENERATED, not templated — the one env file no config-management tool can write, because its
+      # contents do not exist until the vault has been asked for them. ./vault-sync.sh mints this
+      # stack's agent token and writes it here, together with the launcher that puts every box behind
+      # the proxy. Applied between service-env and box-env, so a project can still override it.
+      # Optional: no agent-vault, no file, and the broker behaves exactly as it did without one.
+      # It lives under ./data (state, not configuration) and so does NOT move with MUSTER_CONF_DIR.
+      VAULT_ENV_FILE: ${STACK_DIR}/data/agent-vault/vault-env
       PORT_FORWARDS_FILE: ${STACK_DIR}/${MUSTER_CONF_DIR:+${MUSTER_CONF_DIR}/}port-forwards
       PORT_FORWARD_SLOTS: ${PORT_FORWARD_SLOTS:-16}
     volumes:
@@ -259,6 +266,58 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+    restart: unless-stopped
+
+  # THE CREDENTIAL BROKER. Holds this stack's API tokens so the agents never do: boxes get a
+  # placeholder like __grafana_sa_token__, route their outbound requests through this container's
+  # MITM proxy, and the real value is attached here, on the way out. A prompt-injected agent can
+  # spend a credential it cannot read, and cannot copy one out.
+  #
+  # OFF BY DEFAULT — `profiles:` keeps it out of `up`, `ps` and `pull` until a stack opts in with
+  # COMPOSE_PROFILES=agent-vault in .env. Nothing else in the stack depends on it, and a box whose
+  # VAULT_ENV_FILE does not exist comes up exactly as it did before this service existed.
+  #
+  # Configure it with the two files beside `mounts`: vault-credentials (the secrets) and
+  # vault-services (which host gets which one, and where it is injected). ./vault-sync.sh applies
+  # both and mints the boxes' token. See vault-credentials.example.
+  agent-vault:
+    profiles: [agent-vault]
+    image: ${AGENT_VAULT_IMAGE:-infisical/agent-vault:latest}
+    pull_policy: ${COMPOSE_PULL_POLICY:-missing}
+    # uid 1000, like the hub and every box — NOT the image's own 65532. The data directory is a bind
+    # mount, so the ownership that decides whether the server can write is the HOST's, and every
+    # other data dir in this stack is already 1000 (Ansible chowns them, `cbx` expects them). One
+    # exception would mean one more uid for a deploy to get right, discovered as a container that
+    # restarts forever with a permission error about a path inside itself.
+    user: "${AGENT_VAULT_UID:-1000}:${AGENT_VAULT_GID:-1000}"
+    environment:
+      # Derives the key that wraps the data encryption key. Unset it and the DEK is stored
+      # unwrapped, which is a decision, not a default — so there is no fallback value here.
+      AGENT_VAULT_MASTER_PASSWORD: ${AGENT_VAULT_MASTER_PASSWORD:?set AGENT_VAULT_MASTER_PASSWORD in .env}
+      # The address as the BOXES resolve it, not as the host does. It is also the hostname added as a
+      # SubjectAltName on the MITM leaf certificates, so it has to be the name the clients dial.
+      AGENT_VAULT_ADDR: ${AGENT_VAULT_ADDR:-http://agent-vault:14321}
+      # agent-vault refuses to forward to RFC-1918 addresses unless they are listed — and every box's
+      # HTTP traffic comes through here, hub:9867 included. Empty this and the internal services
+      # start answering 403 in a way that reads exactly like they are down.
+      AGENT_VAULT_NETWORK_ALLOWLIST: ${AGENT_VAULT_NETWORK_ALLOWLIST:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+      # `debug` logs one line per proxied request (no secret values) — worth it while the service
+      # rules are being written, when a missed substitution is just a 401 from an upstream.
+      AGENT_VAULT_LOG_LEVEL: ${AGENT_VAULT_LOG_LEVEL:-info}
+    volumes:
+      # The credential store, the MITM CA and vault-sync.sh's logged-in session. Losing it means
+      # re-registering the owner and re-running ./vault-sync.sh — the two source files rebuild the
+      # rest, which is the point of keeping them files.
+      - ./data/agent-vault/data:/data
+    # NO `ports:`. 14322 is where credentials are injected and 14321 is the admin API; both stay on
+    # the stack network, reachable by name from the hub and the boxes and from nowhere else. To
+    # reach the UI, tunnel to it (cbxtun) rather than publishing it.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:14321/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   # ------------------------------------------------------------------ build-only

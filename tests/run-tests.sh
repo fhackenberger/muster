@@ -165,12 +165,21 @@ test_no_project_defaults() {
 	local bad=""
 	# Every per-stack file that carries credentials or project wiring ships as an .example; the real
 	# one is written by hand or by Ansible and is gitignored. A tracked real file = a leak waiting.
-	for f in mounts port-forwards service-env box-env compose.project.yml build-setup.sh .env; do
+	for f in mounts port-forwards service-env box-env vault-credentials vault-services \
+	         compose.project.yml build-setup.sh .env; do
 		[ -e "$ROOT/$f.example" ] || [ "$f" = .env ] || fail "missing example: $f.example"
 	done
 	exists "$ROOT/.env.example"
 	exists "$ROOT/service-env.example"
 	exists "$ROOT/box-env.example"
+	# agent-vault's pair, and the tool that applies them. vault-credentials is the one file in a stack
+	# whose values are meant never to reach an agent at all, so a real one left in the source tree is
+	# a worse leak than any of the others here.
+	exists "$ROOT/vault-credentials.example"
+	exists "$ROOT/vault-services.example"
+	exists "$ROOT/vault-sync.sh"
+	absent "$ROOT/vault-credentials"
+	absent "$ROOT/vault-services"
 	# The working pinchtab server config: the browser half of the stack is muster's to ship, not
 	# something every consumer should have to reconstruct from its laptop's copy.
 	exists "$ROOT/pinchtab-config.json.example"
@@ -3310,10 +3319,14 @@ test_box_init_ordinary_box() {
 # whatever is in $FIX/image-listing, so a test can say "that path is not empty inside the image".
 box_sh_fixture() {
 	mkdir -p "$FIX/bin" "$FIX/anchor"
-	: > "$FIX/docker.log"; : > "$FIX/image-listing"
+	: > "$FIX/docker.log"; : > "$FIX/image-listing"; : > "$FIX/docker.argv"
 	cat > "$FIX/bin/docker" <<EOF
 #!/bin/bash
 printf '%s\n' "\$*" >> "$FIX/docker.log"
+# …and again with the argument BOUNDARIES intact. docker.log is flattened with spaces, which is all
+# most assertions need; the detached command is one argument containing a whole shell script, and the
+# only way to get it back out unmangled is NUL-separated.
+printf '%s\0' "\$@" >> "$FIX/docker.argv"
 case "\$1" in
 	info|image) exit 0 ;;
 	run) for a in "\$@"; do [ "\$a" = --entrypoint ] && { cat "$FIX/image-listing"; exit 0; }; done ;;
@@ -3342,6 +3355,61 @@ box_sh() {                               # box_sh [env…] — run muster-box.sh
 		MUSTER_SHARED="$FIX/anchor" MUSTER_USER=dev MUSTER_TEST_CODE_DIR=/home/dev/proj \
 		"$@" bash "$ROOT/muster-box.sh" --shell </dev/null 2>&1)"; RC=$?
 	return 0
+}
+
+# WHAT CLAUDE IS RUN UNDER — `agent-vault run -- claude` is the whole of the credential broker's box
+# side. The value lives in the BOX's environment and the command using it is assembled here, by a
+# shell that must not expand it: three shells handle that string before the one that should. Getting
+# it wrong does not fail — it yields a box that starts claude perfectly well, outside the proxy,
+# holding no brokered access and saying nothing about it.
+test_box_sh_claude_launcher() {
+	box_sh_fixture
+	# Set in the LAUNCHER's own environment on purpose. If this value appears anywhere in the command,
+	# the expansion happened one process too early and every box would share one stack's launcher.
+	box_sh MUSTER_DETACH=1 MUSTER_CLAUDE_LAUNCHER=expanded-too-early
+	OUT="$(cat "$FIX/docker.log")"
+	hasnt "expanded-too-early"
+	has 'MUSTER_CLAUDE_LAUNCHER:-'
+
+	# Now run it the way the box does. The detached command is a single argument holding a whole
+	# shell script, so it comes back out of the NUL-separated argv log rather than the flattened one.
+	local script
+	script="$(python3 - "$FIX/docker.argv" <<'PYEOF'
+import sys
+args = open(sys.argv[1], "rb").read().split(b"\0")
+sys.stdout.buffer.write(args[args.index(b"-lc") + 1])
+PYEOF
+)"
+	# A tmux that RUNS the window command it was handed rather than reporting it. Reporting would read
+	# the string one shell too early — it still holds `${MUSTER_CLAUDE_LAUNCHER:-}` at that point, and
+	# a test that asserted on the unexpanded text would pass just as happily on an escaping that never
+	# expands at all. `/bin/bash` by absolute path: the PATH here has a bash stub in it, for the
+	# `exec bash -l` the window command ends with.
+	printf '#!/bin/bash\nfor a; do :; done; /bin/bash -c "$a"\n' > "$FIX/bin/tmux"
+	printf '#!/bin/bash\nprintf "agent-vault %%s\\n" "$*"\n'     > "$FIX/bin/agent-vault"
+	printf '#!/bin/bash\nprintf "claude %%s\\n" "$*"\n'          > "$FIX/bin/claude"
+	printf '#!/bin/bash\nexit 0\n'                               > "$FIX/bin/sleep"
+	printf '#!/bin/bash\nexit 0\n'                               > "$FIX/bin/bash"
+	chmod +x "$FIX/bin/tmux" "$FIX/bin/agent-vault" "$FIX/bin/claude" "$FIX/bin/sleep" "$FIX/bin/bash"
+	# `bash -c`, not `-lc` as the real one uses: a login shell sources the profile, which on most
+	# systems rewrites PATH and takes the stubs with it. The login part is not what is under test.
+	OUT="$(PATH="$FIX/bin:$PATH" HOME="$FIX" MUSTER_CLAUDE_LAUNCHER='agent-vault run --' \
+		/bin/bash -c "$script" 2>&1)"; RC=$?
+	ok
+	# claude was not the command — agent-vault was, with claude as its argument.
+	has "agent-vault run -- claude"
+	# The relaunch hint has to carry it too. A bare `claude` typed after a crash comes up outside the
+	# broker — it works, it just quietly brokers nothing — and this line is the only place anyone
+	# looks to find out what to type.
+	has "type agent-vault run -- claude to relaunch"
+
+	# …and with no launcher the command is claude, exactly as it was before any of this existed.
+	OUT="$(PATH="$FIX/bin:$PATH" HOME="$FIX" /bin/bash -c "$script" 2>&1)"; RC=$?
+	ok
+	hasnt "agent-vault"
+	has "type claude to relaunch"
+	# claude itself was still started — an empty launcher must vanish, not leave a broken command.
+	has "claude"
 }
 
 # A BIND MOUNT SHADOWS WHAT IS UNDER IT. If the repo's mount point already has content inside the
@@ -4101,6 +4169,67 @@ PYEOF
 	ok; has ok
 }
 
+# THE CREDENTIAL BROKER'S HALF. vault-sync.sh mints this stack's agent token and writes it to a file
+# the broker reads — generated, not templated, because the token does not exist until the vault has
+# been asked for it. It sits BETWEEN service-env and box-env: after service-env because it is the
+# more specific fact, before box-env because box-env is the project's last word and a project must be
+# able to take a box back out of the proxy by unsetting the launcher.
+test_broker_vault_env() {
+	fixture
+	cat > "$FIX/vault-env" <<-'EOF'
+		# generated by vault-sync.sh
+		AGENT_VAULT_ADDR=http://agent-vault:14321
+		AGENT_VAULT_VAULT=myapp
+		AGENT_VAULT_TOKEN=av_tok_secret
+		MUSTER_CLAUDE_LAUNCHER=agent-vault run --
+	EOF
+	printf 'SERVER_PORT=8091\nAGENT_VAULT_VAULT=from-service-env\n' > "$FIX/service-env"
+	printf 'MUSTER_CLAUDE_LAUNCHER=\n' > "$FIX/box-env"
+	OUT="$(VAULT_ENV_FILE="$FIX/vault-env" SERVICE_ENV_FILE="$FIX/service-env" BOX_ENV_FILE="$FIX/box-env" \
+		python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+vault = b.parse_vault_env()
+assert "AGENT_VAULT_TOKEN=av_tok_secret" in vault, vault
+# The launcher travels as an ordinary environment entry. It is muster-box.sh that acts on it, inside
+# the box — nothing here knows what agent-vault is.
+assert "MUSTER_CLAUDE_LAUNCHER=agent-vault run --" in vault, vault
+# THE LAYERING, in the order spawn_box builds it.
+merged = b.last_wins(b.parse_service_env() + vault + b.expand_box_env(b.parse_box_env(), {}))
+assert "AGENT_VAULT_VAULT=myapp" in merged, merged          # vault-env beats service-env
+assert "SERVER_PORT=8091" in merged, merged                 # and leaves the rest alone
+assert "MUSTER_CLAUDE_LAUNCHER=" in merged, merged          # box-env still has the last word:
+assert "MUSTER_CLAUDE_LAUNCHER=agent-vault run --" not in merged, merged   # …the box opts out
+# A stack with no broker has no such file, and must behave exactly as it did before there was one.
+b.VAULT_ENV_FILE = "/nonexistent"
+assert b.parse_vault_env() == [], b.parse_vault_env()
+b.VAULT_ENV_FILE = ""
+assert b.parse_vault_env() == [], b.parse_vault_env()
+print("ok")
+PYEOF
+)"; RC=$?
+	ok; has ok
+	# A malformed line names the file it came from. By the time a bad key reaches a box the message is
+	# the only clue left, and "bad service-env key" pointing at a generated file sends you to the
+	# wrong one entirely.
+	printf 'not an env line\n' > "$FIX/vault-env"
+	OUT="$(VAULT_ENV_FILE="$FIX/vault-env" python3 - "$BROKER_PY" <<'PYEOF' 2>&1
+import importlib.util, os, sys
+os.environ.setdefault("BROKER_TOKEN", "t")
+spec = importlib.util.spec_from_file_location("b", sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+try:
+    b.parse_vault_env()
+except ValueError as e:
+    print(e); sys.exit(0)
+sys.exit("a malformed vault-env line was accepted")
+PYEOF
+)"; RC=$?
+	ok; has "vault-env"
+}
+
 # The memo goes in the ONE ~/.claude every box mounts, so it must be identical for every box: it names
 # the environment VARIABLES, never their values. It is also the only channel an agent reads without
 # being told to — which is why the ports and the "localhost is this box" rule live there and not in a
@@ -4848,6 +4977,7 @@ run "minto: --accept guards"                         test_minto_land_guards
 run "box-init: a minto box opens on the conflict"  test_box_init_minto_sets_up_the_conflict
 run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 run "box.sh: refuses to shadow a non-empty mount point" test_box_sh_refuses_a_nonempty_mount_target
+run "box.sh: claude runs under the launcher"       test_box_sh_claude_launcher
 run "box.sh: asks the image outside the box home"  test_box_sh_asks_the_image_outside_the_home
 run "box.sh: an empty mount point still launches"  test_box_sh_mounts_an_empty_target
 
@@ -4874,6 +5004,7 @@ run "broker: the mounts table grammar"             test_broker_parse_mounts
 run "broker: cow — a private reflinked copy"       test_broker_cow_copy
 run "broker: --fresh clears every upper layer"     test_broker_fresh_clears_shared_uppers
 run "broker: box-env, expanded per box"            test_broker_box_env
+run "broker: vault-env layers under box-env"       test_broker_vault_env
 run "broker: the box memo in shared ~/.claude"     test_broker_box_memo
 # THE BROWSER PROFILE IS REAPED ON EVERY HUB BOOT, and only the profile. It lives in the bind-mounted
 # ~/.pinchtab, so it is the one browser state that survives a recreate and nothing else prunes it: on
