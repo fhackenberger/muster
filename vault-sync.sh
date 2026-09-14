@@ -32,6 +32,14 @@ set -euo pipefail
 # immediately — every running box is then talking to the proxy with a dead token until it is
 # recreated, so it is a thing you choose, not a side effect of editing a credential.
 #
+# `--shred-credentials` DELETES vault-credentials once everything above has succeeded. agent-vault
+# never reads that file — only this script does, once — so after a sync the copy on disk is a
+# duplicate that LOOKS like the source of the values and is not: edit it without re-running this and
+# the vault serves the old value forever. For a stack whose vault-credentials is generated (Ansible
+# templates it from a secret store), the generator is the source of truth and the server's copy is
+# a transient artifact worth removing. For a stack where the file IS hand-maintained, deleting it
+# would destroy the only copy — hence a flag and not a default.
+#
 # Config comes from .env (see .env.example):
 #   AGENT_VAULT_VAULT            the vault name (default: $PROJECT_NAME)
 #   AGENT_VAULT_OWNER_EMAIL      the instance owner, created on first run
@@ -41,7 +49,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 ROTATE=0
-[ "${1:-}" = "--rotate-token" ] && ROTATE=1
+SHRED=0
+for arg in "$@"; do
+	case "$arg" in
+		--rotate-token)      ROTATE=1 ;;
+		--shred-credentials) SHRED=1 ;;
+		*) echo "vault-sync: unknown option '$arg' (--rotate-token, --shred-credentials)" >&2; exit 1 ;;
+	esac
+done
 
 # .env is not sourced — it may hold quoted values and this script must not execute it. Same reader as
 # gen-hub-mounts.sh uses for MUSTER_CONF_DIR, for the same reason.
@@ -71,7 +86,12 @@ OUT="$OUT_DIR/vault-env"
 [ -n "$VAULT" ] || { echo "vault-sync: no vault name (set AGENT_VAULT_VAULT or PROJECT_NAME in .env)" >&2; exit 1; }
 [ -n "$OWNER_EMAIL" ] && [ -n "$OWNER_PASS" ] || {
 	echo "vault-sync: AGENT_VAULT_OWNER_EMAIL and AGENT_VAULT_OWNER_PASSWORD must be set in .env" >&2; exit 1; }
-[ -f "$CREDS" ] || { echo "vault-sync: no $CREDS here (cp vault-credentials.example $CREDS)" >&2; exit 1; }
+# A missing one is also what --shred-credentials leaves behind, and "copy the example" would be the
+# wrong advice for the stack that just shredded a generated file — say both.
+[ -f "$CREDS" ] || { echo "vault-sync: no $CREDS here." >&2
+	echo "            Hand-managed stack: cp vault-credentials.example $CREDS" >&2
+	echo "            Generated stack: re-run whatever templates it (--shred-credentials removes it after each sync)" >&2
+	exit 1; }
 [ -f "$SERVICES" ] || { echo "vault-sync: no $SERVICES here (cp vault-services.example $SERVICES)" >&2; exit 1; }
 
 # Everything runs as the CLI half of the same binary, inside the server's own container: it is the
@@ -180,3 +200,20 @@ chmod 0600 "$tmp"
 mv "$tmp" "$OUT"
 
 echo "vault-sync: wrote $OUT — run 'cbx recreate all' to put the boxes on it"
+
+# ---- 6. the plaintext copy, once it is no longer needed ------------------------------------------
+# LAST, and only on success. Everything above can fail and be retried; a file deleted before the
+# retry would take the values with it. By here the vault holds them and this copy answers no
+# question — agent-vault reads its own store, not this.
+#
+# `shred` is best-effort on a journalling filesystem (it cannot reach a block the fs has already
+# copied elsewhere), so this is about closing the obvious window, not about defeating forensics.
+# The real protection was always the 0600 and the absence of a mount into any container.
+if [ "$SHRED" = 1 ]; then
+	if command -v shred >/dev/null 2>&1; then
+		shred -u "$CREDS"
+	else
+		rm -f "$CREDS"
+	fi
+	echo "vault-sync: removed $CREDS — the vault is the source of these values now"
+fi

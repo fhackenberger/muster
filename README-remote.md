@@ -1342,6 +1342,15 @@ else.
 dropped from `vault-credentials` keeps its old value until someone deletes it by hand, because a
 templating slip that renders that file empty must not strip a live stack of everything it brokers.
 
+**`--shred-credentials` deletes `vault-credentials` once the sync succeeds.** agent-vault never reads
+that file — this script reads it once, and the server answers from its own encrypted store
+afterwards — so a copy left on disk is a duplicate that reads like the source of the values and
+isn't: edit it without re-running the sync and the vault keeps serving the old one. Pass the flag
+when the file is *generated* (Ansible templating it from a secret store, which is then the real
+source of truth) and the copy on the server is a transient artifact. Leave it off when the file is
+hand-maintained, where deleting it would destroy the only copy. It runs last and only on success, so
+a failed sync leaves the file for the retry.
+
 **The token is not rotated unless you ask** (`./vault-sync.sh --rotate-token`). Rotation invalidates
 the old token immediately, so every running box is talking to the proxy with a dead credential until
 it is recreated.

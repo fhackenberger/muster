@@ -3357,6 +3357,89 @@ box_sh() {                               # box_sh [env…] — run muster-box.sh
 	return 0
 }
 
+# vault-sync.sh against a stubbed agent-vault. The script talks to nothing but `docker compose exec`,
+# so the harness is one stub that answers as a fresh instance would and records what was pushed.
+vault_sync_fixture() {
+	VS="$FIX/vaultsync"
+	rm -rf "$VS"; mkdir -p "$VS/conf" "$VS/bin"
+	cp "$ROOT/vault-sync.sh" "$VS/"
+	cat > "$VS/.env" <<-'EOF'
+		PROJECT_NAME=myapp
+		MUSTER_CONF_DIR=conf
+		AGENT_VAULT_OWNER_EMAIL=ops@example.com
+		AGENT_VAULT_OWNER_PASSWORD=hunter2hunter2
+	EOF
+	printf 'GRAFANA_SA_TOKEN=glsa_real_secret\nASANA_CLIENT_SECRET=asana_real_secret\n' > "$VS/conf/vault-credentials"
+	printf 'services:\n  - name: grafana\n    host: grafana.example.com\n    auth:\n      type: bearer\n      token: GRAFANA_SA_TOKEN\n' > "$VS/conf/vault-services"
+	# A fresh instance: no vaults, no agents, and `agent create` hands back a token. FAIL_ON lets a
+	# test make one step fail without the stub knowing anything about which step matters.
+	cat > "$VS/bin/docker" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$VS/docker.log"
+[ -n "\${FAIL_ON:-}" ] && case "\$*" in *"\$FAIL_ON"*) exit 1 ;; esac
+case "\$*" in
+	*"ps --status running --services"*) echo agent-vault ;;
+	*"credential set"*) printf '%s\n' "\$*" >> "$VS/creds.log" ;;
+	*"service set"*)    cat > "$VS/services.pushed" ;;
+	*"agent create"*)   printf 'av_tok_TESTTOKEN' ;;
+esac
+exit 0
+EOF
+	chmod +x "$VS/bin/docker"
+}
+
+vault_sync() {                           # vault_sync [args…] — run it against the stubs
+	OUT="$(cd "$VS" && env PATH="$VS/bin:$PATH" ./vault-sync.sh "$@" 2>&1)"; RC=$?
+	return 0
+}
+
+# THE FILE IS NOT THE SOURCE OF THE VALUES ONCE THEY ARE IN THE VAULT. agent-vault reads its own
+# encrypted store; nothing reads conf/vault-credentials but this script, once. A copy left on disk
+# afterwards therefore reads like the source and is not — edit it, skip the sync, and the vault keeps
+# serving the old value. `--shred-credentials` is for the stacks that GENERATE the file, where the
+# generator is the truth; without the flag the file is hand-maintained and the only copy there is.
+test_vault_sync_shreds_only_when_asked() {
+	fixture
+	vault_sync_fixture
+
+	vault_sync
+	ok
+	OUT="$(cat "$VS/creds.log")"; has "GRAFANA_SA_TOKEN=glsa_real_secret"
+	OUT="$(cat "$VS/services.pushed")"; has "host: grafana.example.com"
+	# The generated env file: the token the boxes authenticate with, and the launcher that puts them
+	# behind the proxy at all.
+	OUT="$(cat "$VS/data/agent-vault/vault-env")"
+	has "AGENT_VAULT_TOKEN=av_tok_TESTTOKEN"
+	has "AGENT_VAULT_VAULT=myapp"
+	has "MUSTER_CLAUDE_LAUNCHER=agent-vault run --"
+	eq "$(stat -c %a "$VS/data/agent-vault/vault-env")" "600" "the token file must not be world-readable"
+	# Default: kept. Deleting a hand-written file would destroy the only copy of these secrets.
+	exists "$VS/conf/vault-credentials"
+
+	vault_sync --shred-credentials
+	ok
+	has "removed conf/vault-credentials"
+	absent "$VS/conf/vault-credentials"
+	# …and only that file. The token is generated state and has to survive, or every box loses access
+	# on the next recreate.
+	exists "$VS/data/agent-vault/vault-env"
+
+	# A SYNC THAT FAILS KEEPS THE FILE. The shred runs last and only on success precisely so a retry
+	# still has something to push — a file deleted before the retry takes the values with it.
+	vault_sync_fixture
+	OUT="$(cd "$VS" && env PATH="$VS/bin:$PATH" FAIL_ON="service set" ./vault-sync.sh --shred-credentials 2>&1)"; RC=$?
+	notok
+	exists "$VS/conf/vault-credentials"
+
+	# A typo'd flag is refused rather than silently ignored — "--shred-credential" must not read as
+	# "sync and keep", which is the one outcome nobody would check for.
+	vault_sync_fixture
+	vault_sync --shred-credential
+	notok
+	has "unknown option"
+	exists "$VS/conf/vault-credentials"
+}
+
 # WHAT CLAUDE IS RUN UNDER — `agent-vault run -- claude` is the whole of the credential broker's box
 # side. The value lives in the BOX's environment and the command using it is assembled here, by a
 # shell that must not expand it: three shells handle that string before the one that should. Getting
@@ -4978,6 +5061,7 @@ run "box-init: a minto box opens on the conflict"  test_box_init_minto_sets_up_t
 run "box-init: an ordinary box is unchanged"       test_box_init_ordinary_box
 run "box.sh: refuses to shadow a non-empty mount point" test_box_sh_refuses_a_nonempty_mount_target
 run "box.sh: claude runs under the launcher"       test_box_sh_claude_launcher
+run "vault-sync: shreds the plaintext only when asked" test_vault_sync_shreds_only_when_asked
 run "box.sh: asks the image outside the box home"  test_box_sh_asks_the_image_outside_the_home
 run "box.sh: an empty mount point still launches"  test_box_sh_mounts_an_empty_target
 
