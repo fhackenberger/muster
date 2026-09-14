@@ -274,6 +274,12 @@ _muster_hub() {
 _muster_run() {
 	local args='' live='' self="${_MUSTER_SELF:-muster}"
 	[ "$#" -gt 0 ] && printf -v args ' %q' "$@"
+	# What you just worked on, for the completion order (see _muster_names). `purge` is deliberately
+	# absent: a box you are removing is not one to offer first next time.
+	case "${1:-}" in
+		box|kill|reclaim|recreate|review|fix|prereview|say|peek|point|hold|release|merge|drop|export|import|rebase|job)
+			_muster_mru_touch "${2:-}" ;;
+	esac
 	case "${1:-}" in
 		# `logs <svc>` ATTACHES a tmux window — long-lived and interactive, so it honours the transport.
 		# `logs <svc> --tail|--file` PRINTS and exits, so it must go over ssh like every other one-shot:
@@ -987,7 +993,50 @@ _muster_complete_cache() {
 	cat "$f" 2>/dev/null
 }
 
-_muster_names() { _muster_complete_cache | awk -v k="$1" '$1==k {print $2}' | sort -u; }
+# Keys whose names come back most-recently-used first; everything else (services, branches, flags)
+# stays alphabetical, where a stable position beats recency. The recency is the LAPTOP's — which names
+# you typed — not the server's idea of when a container last started: it survives the cache being
+# refetched, which a server-side order would not.
+_MUSTER_MRU_KEYS=" box rbox mbox "
+_muster_mru_file() { printf '%s.mru' "$(_muster_cache_file)"; }
+
+# Recorded BEFORE the command runs, not on success: `box work1` on a name that does not exist yet is
+# still you saying which box you care about.
+_muster_mru_touch() {
+	local name="$1" f tmp
+	case "$name" in ''|-*|*[!-A-Za-z0-9_]*) return 0 ;; esac
+	f="$(_muster_mru_file)"
+	tmp="$f.$$"
+	{ printf '%s\n' "$name"; grep -v -x -F "$name" "$f" 2>/dev/null | head -49; } > "$tmp" 2>/dev/null \
+		&& mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+	return 0
+}
+
+_muster_mru_forget() {
+	local name="$1" f tmp
+	f="$(_muster_mru_file)"; tmp="$f.$$"
+	[ -f "$f" ] || return 0
+	grep -v -x -F "$name" "$f" > "$tmp" 2>/dev/null || : > "$tmp"
+	mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+	return 0
+}
+
+_muster_names() {
+	local k="$1" all
+	all="$(_muster_complete_cache | awk -v k="$k" '$1==k {print $2}' | sort -u)"
+	case "$_MUSTER_MRU_KEYS" in *" $k "*) ;; *) printf '%s' "${all:+$all$'\n'}"; return 0 ;; esac
+	# The MRU decides ORDER, never membership: it holds names that have since been purged and lacks
+	# ones you have never typed, so the cache stays the authority on what is offered.
+	printf '%s\n' "$all" | awk -v mru="$(cat "$(_muster_mru_file)" 2>/dev/null)" '
+		BEGIN { n = split(mru, recent, "\n") }
+		{ all[NR] = $0; cached[$0] = 1 }
+		END {
+			for (i = 1; i <= n; i++)
+				if (recent[i] != "" && cached[recent[i]] && !shown[recent[i]]++) print recent[i]
+			for (i = 1; i <= NR; i++)
+				if (all[i] != "" && !shown[all[i]]++) print all[i]
+		}'
+}
 # Flags are cached as `flag <cmd> <--flag>`, so they need the extra column.
 _muster_flags() { _muster_complete_cache | awk -v c="$1" '$1=="flag" && $2==c {print $3}' | sort -u; }
 # Same shape for the subcommands of a command that dispatches again (`golden <sub>`).
@@ -1020,7 +1069,9 @@ _muster_cache_box() {
 	case "$what" in
 		spawned) _muster_cache_set box "$name" 1; _muster_cache_set rbox "$name" 0 ;;
 		killed)  _muster_cache_set box "$name" 0; _muster_cache_set rbox "$name" 1 ;;
-		purged)  _muster_cache_set box "$name" 0; _muster_cache_set rbox "$name" 0 ;;
+		# …and out of the recency list with it: a name that no longer exists must not sit at the top of
+		# what Tab offers, and it would stay there until 50 other boxes had pushed it off the end.
+		purged)  _muster_cache_set box "$name" 0; _muster_cache_set rbox "$name" 0; _muster_mru_forget "$name" ;;
 	esac
 }
 
@@ -1269,12 +1320,22 @@ muster_define() {
 	}"
 }
 
+# READLINE SORTS THE CANDIDATES unless the completion is registered with `-o nosort` — without this
+# the MRU order in _muster_names is computed and then thrown away on the way to the screen. bash gained
+# the option in 4.4; older ones reject the whole `complete` call and would be left with no completion
+# at all, hence the probe.
+_MUSTER_NOSORT=()
+if [ -n "${BASH_VERSION:-}" ] && complete -o nosort -F : _muster_nosort_probe 2>/dev/null; then
+	_MUSTER_NOSORT=(-o nosort)
+	complete -r _muster_nosort_probe 2>/dev/null
+fi
+
 # muster_complete_for <prefix> <suffix> <completion-function> — same, for Tab completion.
 muster_complete_for() {
 	[ -n "${BASH_VERSION:-}" ] || return 0
 	local p="$1" sfx="$2" fn="$3" name="$1$2"
 	_MUSTER_COMP_PREFIX["$name"]="$p"; _MUSTER_COMP_FN["$name"]="$fn"
-	complete -F _muster_complete_dispatch "$name"
+	complete ${_MUSTER_NOSORT[@]+"${_MUSTER_NOSORT[@]}"} -F _muster_complete_dispatch "$name"
 }
 
 # Every generated command completes through here: look up which stack the word belongs to, put that

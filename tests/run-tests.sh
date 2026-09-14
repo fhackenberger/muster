@@ -2843,6 +2843,53 @@ test_aliases_completion() {
 	has "LIVE: work1"
 }
 
+# THE BOX YOU MEAN IS USUALLY THE LAST ONE YOU MEANT. Alphabetically it sits thirty names down a list
+# that only grows, and Tab stops being quicker than typing the name — so box names come back
+# most-recently-used first, by which names YOU typed rather than by anything the server knows.
+test_aliases_completion_recent_boxes_first() {
+	alias_fixture
+	cat > "$FIX/complete-cache" <<-'EOF'
+		svc backend
+		box alpha
+		box bravo
+		box charlie
+		branch dev
+		branch release/2025
+		rbox oldbox
+	EOF
+	# The recency list lives beside the completion cache in TMPDIR, which outlives a single test — so
+	# it is redirected into the fixture. Without this the second run of this test starts warm and the
+	# COLD assertion below is asserting yesterday's typing.
+	al "_muster_complete_cache() { cat '$FIX/complete-cache'; };
+	    _muster_mru_file() { printf '%s' '$FIX/mru'; };
+	    try() { local w=(\$1); COMP_WORDS=(\"\${w[@]}\" \"\$3\"); COMP_CWORD=\${#w[@]};
+	            _muster_complete; echo \"\$2: \${COMPREPLY[*]}\"; };
+	    try 'cbx kill' COLD '';
+	    _muster_mru_touch charlie; _muster_mru_touch alpha;
+	    try 'cbx kill' WARM '';
+	    try 'cbx minto' BRANCHES '';
+	    _muster_mru_touch bravo;
+	    try 'cbx kill' WARMER '';
+	    _muster_cache_box purged bravo;
+	    try 'cbx kill' AFTERPURGE ''"
+	# Nothing used yet: alphabetical, as before.
+	has "COLD: alpha bravo charlie"
+	# Used charlie, then alpha — most recent first, and the untouched one keeps its place behind them.
+	has "WARM: alpha charlie bravo"
+	# BRANCHES ARE NOT BOXES: a list you read rather than pick from keeps its stable position.
+	has "BRANCHES: dev release/2025"
+	has "WARMER: bravo alpha charlie"
+	# A PURGED BOX LEAVES THE RECENCY LIST, or it would go on being offered first until 50 other boxes
+	# pushed it off the end. It falls back to alphabetical here rather than vanishing, because this test
+	# stubs the cache and only the real one stops listing it.
+	has "AFTERPURGE: alpha charlie bravo"
+
+	# THE ORDER HAS TO SURVIVE READLINE, which sorts the candidates for display unless the completion is
+	# registered with -o nosort — without which all of the above is computed and then thrown away.
+	al "complete -p cbx"
+	has "-o nosort"
+}
+
 # THE LAPTOP LEARNS SUBCOMMANDS FROM THE HUB'S --help, and that scrape lives in a heredoc that is
 # only ever executed on the server — so nothing else in this suite runs it. Run it here, for real,
 # against the CLI's own --help output: it is the single step that turns a new `golden <sub>` into a
@@ -4776,6 +4823,7 @@ run "aliases: refuse an unconfigured stack"        test_aliases_refuse_without_a
 run "aliases: cbxcp argument checking"             test_aliases_cbxcp_argument_checking
 run "aliases: completion (cmds, flags, branches)"   test_aliases_completion
 run "aliases: completion learns subcommands"        test_aliases_completion_learns_subcommands
+run "aliases: recently used boxes complete first"   test_aliases_completion_recent_boxes_first
 run "aliases: the cache follows box changes"       test_aliases_cache_follows_boxes
 run "aliases: project helpers"                     test_aliases_project_helpers
 run "aliases: two stacks side by side"             test_aliases_two_stacks_side_by_side

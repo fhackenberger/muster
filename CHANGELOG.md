@@ -26,6 +26,19 @@ releases and are not listed here.
   mismatch is otherwise silent, because docker creates a missing bind-mount source as an empty
   directory and the hub simply comes up with no mounts, no service manifests and no git identity.
 
+- **Box names complete most-recently-used first.** Alphabetical order puts the box you were in five
+  minutes ago thirty names down a list that only grows, and by the third month of a stack Tab stops
+  being quicker than typing the name. The recency is the LAPTOP's — which names you typed, recorded
+  when a command takes a box name — so it survives the completion cache being refetched, and it means
+  "the box I was working on" rather than "the container the daemon started last". A purged box leaves
+  the list with it. Only box-ish keys are reordered (`box`, `rbox`, `mbox`); services, branches and
+  flags stay alphabetical, where a stable position beats recency.
+
+  Registered with `complete -o nosort`, without which readline sorts the candidates for display and
+  the whole thing is computed and then thrown away — with no symptom except appearing not to work.
+  Probed once at load: bash below 4.4 rejects the option and would otherwise be left with no
+  completion at all, so it falls back to the alphabetical list.
+
 - **`muster reclaim <box>|--all [-y]`** — take a retired box's disk back and keep the box. `kill`
   frees the container and none of the disk (the upper layer is the point of keeping it), `purge` frees
   everything and ends the box — so the ordinary case, *this one is finished for now and I want it back

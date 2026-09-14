@@ -558,6 +558,15 @@ refresh. A killed box moves to a *retired* key instead of disappearing — `cbx 
 exactly those, the names that can be brought back (its directory and upper layer are still there),
 while `kill`, `review`, `merge` and friends keep offering the ones that are running.
 
+**Box names complete most-recently-used first.** Alphabetically, the box you were in five minutes ago
+sits thirty names down a list that only grows. The recency is the laptop's — which names *you* typed,
+recorded whenever a command takes a box name — so it survives the cache being refetched, and it says
+"the box I was working on" rather than "the container the daemon happened to start last". Purging a
+box drops it from that list with it. Only box-ish names are ordered this way (`box`, `rbox`, the minto
+ones); services, branches and flags stay alphabetical, where a stable position is worth more. The
+completions are registered with `-o nosort`, without which readline would sort the order away again
+(bash 4.4+; older shells silently keep the alphabetical list).
+
 **Tab completion, on both sides.** On the laptop the alias family completes subcommands, flags, box
 names, service names and branches from a cache it refreshes in the background over ssh. The
 subcommands and flags are parsed from the **deployed hub's own `muster --help`**, not from a list in
