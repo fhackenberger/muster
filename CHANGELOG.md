@@ -38,9 +38,11 @@ releases and are not listed here.
   to `refs/agents/<box>`. `muster box <name>` then brings the same agent back on the current golden,
   still remembering, with `muster-box-init` restoring `agent/<box>` from the hub.
 
-  Retired boxes only — a live one has those layers mounted into a container, and it says `kill it
-  first` rather than stopping an agent as a side effect of a request for disk. `--all` does every
-  retired box, biggest first; both print what they would free, in itemised form, and ask first.
+  Retired boxes only — a live one has those layers mounted into a container. It offers to kill it
+  first rather than either refusing (one intention, two commands) or doing it quietly (stopping an
+  agent should not be a side effect of a request for disk); `-y` answers that question yes, and with
+  no tty it refuses instead of assuming. `--all` does every retired box, biggest first, and never
+  reaches a live one; both print what they would free, itemised, and ask before deleting anything.
 
 - **`golden migrate --discard-retired`** — move **killed** boxes onto the current golden without
   starting anything. A box is an overlay whose mount options are fixed when its container is created,

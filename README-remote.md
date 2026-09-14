@@ -448,10 +448,12 @@ That gives you:
   | the private `cow`/`cow-keep` caches — copies of the hub's, re-made on the next spawn | `~/keep`, the name, the port slot, and everything pushed to `refs/agents/<box>` |
 
   `cbx box <name>` afterwards brings the same agent back on the current golden, with `muster-box-init`
-  restoring `agent/<box>` from the hub. Retired boxes only: a live one still has those layers mounted
-  into a container, so it says `kill it first` rather than stopping someone's agent as a side effect of
-  a disk request. `--all` takes every retired box, biggest first; both list what they would free and
-  ask, and `-y` skips the question.
+  restoring `agent/<box>` from the hub. Retired boxes only — a live one still has those layers mounted
+  into a container — so a box that is still up is **offered a kill first** rather than refused: one
+  intention, one command, and answering no leaves everything as it was. `-y` answers yes; with no tty
+  it refuses instead of assuming, so a script cannot stop an agent because nobody was there to ask.
+  `--all` takes every retired box, biggest first (it never reaches a live one); both list what they
+  would free and ask before deleting anything.
 
 - **`cbx golden retire <id>`** — free a golden that boxes are still overlaid on. `reap` skips those on
   purpose (a golden is the lowerdir of every box on it), so the question is what happens to its boxes,

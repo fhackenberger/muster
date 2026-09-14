@@ -31,6 +31,9 @@ set -euo pipefail
 #                                           #   uncommitted files and commits never handed off.
 #                                           #   --all does every retired box, biggest first. Lists
 #                                           #   what it would free and asks; -y skips the question.
+#                                           #   A box that is still UP is offered a kill first (its
+#                                           #   layers are mounted into the container) — -y answers
+#                                           #   yes, and with no tty it refuses instead of assuming.
 #   $SELF recreate <name>|all [--fresh]       # pull newest image + respawn (--fresh = drop its
 #                                             # upper layers: the checkout AND every overlay row)
 #   $SELF ls                                  # list services + boxes (broker)
@@ -1042,8 +1045,9 @@ human_size() {
 # refs/agents/<box>. `$SELF box <name>` afterwards brings the agent back on the current golden,
 # remembering the conversation, with muster-box-init restoring agent/<box> from the hub.
 #
-# Retired boxes only — a live one has a container holding those very mounts open. It says `kill` rather
-# than killing anything itself: stopping someone's agent is not a side effect of asking for disk.
+# Retired boxes only — a live one has a container holding those very mounts open — so a live box is
+# offered a kill first: stopping someone's agent is not a side effect of asking for disk, but refusing
+# outright made one intention into two commands.
 box_reclaim() {
 	argsort "" "$@"; set -- ${ARGV[@]+"${ARGV[@]}"}
 	local all=0 force=0 arg
@@ -1072,10 +1076,24 @@ box_reclaim() {
 		local live retired_names
 		live="$(printf '%s' "$rows" | jqr '.boxes[]?.box')"
 		retired_names="$(printf '%s' "$rows" | jqr '.retired[]?.box')"
-		# A name that is LIVE is not a name that is wrong: say which it is, and what to type.
+		# A LIVE NAME IS NOT A WRONG NAME: reclaiming would pull the disk out from under the agent, so
+		# the box has to go first — but "kill it and try again" is two commands for one intention. So it
+		# asks, and -y answers yes. WITH NO TTY IT REFUSES rather than assuming: a script must not stop
+		# an agent because nobody was there to be asked.
 		if grep -qx -- "$box" <<< "$live"; then
-			echo "$SELF: '$box' is still up — reclaiming would pull the disk out from under a running agent." >&2
-			die "kill it first ('$SELF kill $box'), then '$SELF reclaim $box'"
+			echo "$SELF: '$box' is still up — its layers are mounted into a running container." >&2
+			if [ "$force" = 0 ]; then
+				[ -t 0 ] || die "kill it first ('$SELF kill $box'), then '$SELF reclaim $box' (-y kills it for you)"
+				tty_flush
+				printf "%s: kill it first, then reclaim its disk? [y/N] " "$SELF" > /dev/tty
+				local answer=""; read -r answer < /dev/tty || answer=n
+				case "$answer" in y|Y|yes|YES) ;; *) die "not killed, nothing reclaimed" ;; esac
+			fi
+			box_kill "$box"
+			# Re-read: the box is retired now, and the kill took the `cow` rows' scratch copies with it,
+			# so the sizes below measure what is actually left to reclaim.
+			rows="$(box_list)" || die "the broker did not answer"
+			retired_names="$(printf '%s' "$rows" | jqr '.retired[]?.box')"
 		fi
 		grep -qx -- "$box" <<< "$retired_names" \
 			|| die "no retired box '$box' ('$SELF ls' lists them; a live box must be killed first)"

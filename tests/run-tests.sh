@@ -909,13 +909,20 @@ test_reclaim_keeps_the_box() {
 	cbx box busy   >/dev/null 2>&1
 	cbx kill parked >/dev/null 2>&1          # retired: a directory with no container
 
-	# A LIVE BOX IS REFUSED, and told which command it needs. Reclaiming under a running agent would
-	# pull the mounts out from under it, and killing it as a side effect of asking for disk is not
-	# this command's call to make.
-	cbx reclaim busy -y; notok
+	# A LIVE BOX WITH NOBODY TO ASK IS REFUSED — the suite has no tty, which is exactly the case that
+	# must not assume: a script must not stop an agent because no one was there to answer.
+	cbx reclaim busy; notok
 	has "still up"
-	has "kill busy"
-	grep -q '"/box/busy/reclaim' "$FIX/stub22.log" && fail "a running box was reclaimed"
+	has "kill it first"
+	grep -q '"/box/busy/reclaim' "$FIX/stub22.log" && fail "a running box was reclaimed unasked"
+	grep -q '"method": "DELETE", "path": "/box/busy"' "$FIX/stub22.log" && fail "a running box was killed unasked"
+
+	# …but -y IS the answer to that question. One intention, one command.
+	cbx reclaim busy -y; ok
+	has "killed box 'busy'"
+	has "session kept"
+	grep -q '"method": "DELETE", "path": "/box/busy"' "$FIX/stub22.log" || fail "-y did not kill it first"
+	grep -q '"/box/busy/reclaim' "$FIX/stub22.log" || fail "-y killed it but did not reclaim it"
 
 	# A name that is neither live nor retired is a typo, not an empty job.
 	cbx reclaim nosuchbox -y; notok; has "no retired box"
